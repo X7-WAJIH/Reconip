@@ -70,6 +70,34 @@ phase_m:
   tokens: []
   rate_limit_per_min: 60
   max_batch: 100
+# Public DNS resolvers that should not be treated as normal targets
+public_resolvers:
+  - 8.8.8.8
+  - 8.8.4.4
+  - 1.1.1.1
+  - 9.9.9.9
+
+# ASNs that are known to use anycast
+anycast_asns:
+  - 15169   # Google
+  - 13335   # Cloudflare
+
+# Network timeouts and retries
+timeouts:
+  default: 10
+  dns: 5
+  http: 10
+
+retries:
+  max_attempts: 3
+  backoff_factor: 2
+
+# Logging configuration
+logging:
+  level: INFO
+  file: reconip.log
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
 phase_n: {allow_private_targets: false, max_batch: 100, subprocess_timeout: 6.0}
 phase_p2:
   subdomain_enum:

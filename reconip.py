@@ -871,12 +871,30 @@ def dns_val(rt, ans):
         try: return str(ans.target).rstrip(".")
         except: return str(ans).rstrip(".")
     if rt == "CAA":
-        try: return f"{ans.flags} {ans.tag} {ans.value}"
+        try:
+            tag = ans.tag.decode('utf-8', errors='replace') if isinstance(ans.tag, bytes) else str(ans.tag)
+            val = ans.value.decode('utf-8', errors='replace') if isinstance(ans.value, bytes) else str(ans.value)
+            return f"{ans.flags} {tag} {val}"
         except: return str(ans)
     if rt == "TXT":
         try: return b"".join(ans.strings).decode("utf-8", errors="replace")
         except: return str(ans)
     return str(ans)
+
+def format_caa(caa_records):
+    """
+    Convert CAA records from bytes to human-readable strings (B1 fix).
+    Input: list of tuples like (flags, tag, value)
+    Output: list of dicts {'flags': int, 'tag': str, 'value': str}
+    """
+    formatted = []
+    for flags, tag, value in caa_records:
+        if isinstance(tag, bytes):
+            tag = tag.decode('utf-8', errors='replace')
+        if isinstance(value, bytes):
+            value = value.decode('utf-8', errors='replace')
+        formatted.append({'flags': flags, 'tag': tag, 'value': value})
+    return formatted
 
 def collect_dns(ip, domain=None):
     evs, att, resp = [], 0, 0
@@ -1148,12 +1166,47 @@ def cert_summary(ci):
     timeline = sorted([
         {"identity_key": r.id, "fingerprint_sha256": r.fp, "status": r.status,
          "issuer": r.issuer, "subject": r.subject, "valid_from": r.valid_from,
-         "valid_to": r.valid_to, "san_count": len(r.sans), "sources": r.sources}
+         "valid_to": r.valid_to, "san_count": len(r.sans), "sans": r.sans[:20],
+         "wildcards": r.wildcards, "fingerprint": r.fp, "sources": r.sources,
+         "key_type": r.key_type, "sig_alg": r.sig_alg}
         for r in recs], key=lambda x: x.get("valid_from") or "")
     return {"total": len(recs), "by_status": by_status, "expired": expired,
             "near_expiry": near, "weak": weak,
             "wildcards": sorted(wildcards), "sans": sorted(all_sans),
             "timeline": timeline}
+
+def ct_parse(ct_entries):
+    """
+    Parse CT log entries into structured certificate info (B6 fix).
+    Input: list of certificate dicts from CT provider or CertRec records.
+    Output: list of dicts with fields: 'san', 'issuer', 'validity', 'fingerprint', 'wildcard'
+    """
+    parsed = []
+    for entry in ct_entries or []:
+        # Handle both dict entries and CertRec objects
+        if hasattr(entry, 'sans'):
+            san_list = getattr(entry, 'sans', []) or []
+            issuer = getattr(entry, 'issuer', '') or ""
+            fp = getattr(entry, 'fp', '') or getattr(entry, 'fingerprint', '') or ""
+            vf = getattr(entry, 'valid_from', '') or ""
+            vt = getattr(entry, 'valid_to', '') or ""
+        else:
+            san_list = entry.get('sans') or entry.get('san') or entry.get('name_value', '').split("\n") if isinstance(entry, dict) else []
+            if isinstance(san_list, str):
+                san_list = [san_list]
+            issuer = entry.get('issuer', '') or entry.get('issuer_name', '') if isinstance(entry, dict) else ""
+            fp = entry.get('fingerprint', '') or entry.get('fp', '') if isinstance(entry, dict) else ""
+            vf = entry.get('not_before', '') or entry.get('valid_from', '') if isinstance(entry, dict) else ""
+            vt = entry.get('not_after', '') or entry.get('valid_to', '') if isinstance(entry, dict) else ""
+        cert = {
+            'san': san_list,
+            'issuer': issuer,
+            'validity': {'not_before': vf, 'not_after': vt},
+            'fingerprint': fp,
+            'wildcard': any('*' in str(s) for s in san_list)
+        }
+        parsed.append(cert)
+    return parsed
 # ============================================================
 #  THREAT INTEL PROVIDERS
 # ============================================================
@@ -1989,6 +2042,26 @@ def whois_enhanced(target):
     except Exception as e:
         H("whois_enhanced").failure(exc_class(e), 0); return None
 
+def whois_parse(whois_data):
+    """
+    Parse WHOIS data and clearly separate registration date from update date (B3 fix).
+    Return dict with keys: 'reg_date', 'updated_date', 'org', 'netrange', 'cidr', etc.
+    """
+    if not isinstance(whois_data, dict):
+        return {}
+    parsed = {}
+    # Support multiple key variants
+    parsed['reg_date'] = whois_data.get('created') or whois_data.get('creation_date') or whois_data.get('RegDate') or ""
+    parsed['updated_date'] = whois_data.get('updated') or whois_data.get('updated_date') or whois_data.get('Updated') or ""
+    parsed['org'] = whois_data.get('organization', '') or whois_data.get('org', '')
+    parsed['netrange'] = whois_data.get('netrange', '')
+    parsed['cidr'] = whois_data.get('cidr', '')
+    parsed['handle'] = whois_data.get('handle', '')
+    parsed['country'] = whois_data.get('country', '')
+    if not parsed['reg_date']:
+        parsed['reg_date_note'] = 'Original registration date not provided by WHOIS server.'
+    return parsed
+
 class PassiveOSINTv2:
     @staticmethod
     def virustotal_passive_dns(ip):
@@ -2009,9 +2082,43 @@ class PassiveOSINTv2:
         except Exception as e:
             log.debug(f"vt passive dns: {e}"); return []
 
+def normalize_passive_dns(raw_records):
+    """
+    Normalize passive DNS records into a consistent structure (B2 fix).
+    Each record should have: domain/hostname, first_seen, last_seen, source.
+    Preserves provider dates instead of overwriting with current date.
+    """
+    normalized = []
+    for rec in raw_records or []:
+        # Handle multiple provider formats
+        domain = rec.get("hostname") or rec.get("domain") or ""
+        # OTX provides first/last, VT provides single date
+        first = rec.get("first") or rec.get("first_seen") or rec.get("firstSeen")
+        last = rec.get("last") or rec.get("last_seen") or rec.get("lastSeen")
+        # VT single date fallback
+        vt_date = rec.get("date")
+        if vt_date and not first and not last:
+            # Single date provider: treat as last_seen, leave first_seen None to avoid false identical
+            last = vt_date
+            first = None
+        # If provider only gives a single date field as both, keep it but don't fabricate current date
+        normalized.append({
+            'hostname': domain,
+            'domain': domain,
+            'first': first,
+            'last': last,
+            'first_seen': first,
+            'last_seen': last,
+            'source': rec.get("source", "unknown"),
+            'record_type': rec.get("record_type", "")
+        })
+    # Sort by last_seen descending
+    normalized.sort(key=lambda x: (x['last_seen'] or ''), reverse=True)
+    return normalized
+
 def merge_passive_dns(ip, existing_otx):
     cfg = CFG.get("phase_p2", {}).get("passive_dns", {})
-    if not cfg.get("enabled", True): return existing_otx or []
+    if not cfg.get("enabled", True): return normalize_passive_dns(existing_otx or [])
     sources = cfg.get("sources", ["otx", "virustotal"])
     merged = list(existing_otx or [])
     if "virustotal" in sources:
@@ -2019,10 +2126,11 @@ def merge_passive_dns(ip, existing_otx):
         merged.extend(vt)
     seen = set(); out = []
     for row in merged:
-        h = row.get("hostname")
+        h = row.get("hostname") or row.get("domain")
         if not h or h in seen: continue
         seen.add(h); out.append(row)
-    return out[:100]
+    # Normalize to ensure first_seen/last_seen are preserved correctly (B2)
+    return normalize_passive_dns(out[:100])
 
 def enrich_suspicious_ips(rev_ip_list):
     if not rev_ip_list: return []
@@ -2086,6 +2194,67 @@ def _filter_reverse_ip(domains):
         out.append(dl)
     return out
 
+def ports_parse(open_ports):
+    """
+    Enrich port list with protocol, service, and version if available (B5 fix).
+    Input: list of port numbers or raw scan results.
+    Output: list of dicts {'port': int, 'protocol': 'tcp/udp', 'service': str, 'version': str}
+    """
+    enriched = []
+    service_map = {
+        53: ('dns', 'tcp/udp'),
+        443: ('https', 'tcp'),
+        80: ('http', 'tcp'),
+        22: ('ssh', 'tcp'),
+        25: ('smtp', 'tcp'),
+        110: ('pop3', 'tcp'),
+        143: ('imap', 'tcp'),
+        3306: ('mysql', 'tcp'),
+        5432: ('postgresql', 'tcp'),
+        6379: ('redis', 'tcp'),
+        8080: ('http-proxy', 'tcp'),
+        8443: ('https-alt', 'tcp'),
+    }
+    for port in open_ports or []:
+        try:
+            p = int(port)
+        except Exception:
+            continue
+        service, proto = service_map.get(p, ('unknown', 'tcp'))
+        enriched.append({'port': p, 'protocol': proto, 'service': service, 'version': ''})
+    return enriched
+
+def filter_reverse_ip(domains, target_ip, public_resolvers=None, anycast_asns=None, asn=None):
+    """
+    Filter out domains that are not true reverse IP records (B4 fix).
+    - Remove public resolvers (if target_ip is a resolver, skip reverse IP entirely).
+    - Remove anycast ASNs (reverse IP is meaningless for anycast).
+    - Otherwise apply aggressive domain filtering.
+    Returns (filtered_list, note)
+    """
+    if public_resolvers is None:
+        public_resolvers = CFG.get("public_resolvers") or CFG.get("geo_validation", {}).get("anycast_ips", []) or []
+    if anycast_asns is None:
+        anycast_asns = CFG.get("anycast_asns", []) or []
+    # If target IP is a known public resolver, return empty with note
+    if target_ip and str(target_ip) in [str(x) for x in public_resolvers]:
+        return [], "Target is a public DNS resolver. Reverse IP is not applicable."
+    # If ASN is anycast, reverse IP is unreliable
+    if asn:
+        try:
+            asn_num = int(str(asn).replace("AS", "").replace("as", "").strip())
+            if asn_num in [int(x) for x in anycast_asns]:
+                return [], "Target is in an anycast ASN. Reverse IP is not meaningful."
+        except Exception:
+            pass
+        # Also check string form
+        if str(asn) in [str(x) for x in anycast_asns] or f"AS{asn}" in [str(x) for x in anycast_asns]:
+            return [], "Target is in an anycast ASN. Reverse IP is not meaningful."
+    # Otherwise apply base filter but add warning
+    filtered = _filter_reverse_ip(domains or [])
+    if not filtered:
+        return [], "No valid reverse IP domains after filtering."
+    return filtered, "Reverse IP list may include passive DNS artifacts."
 
 
 # ============================================================
@@ -2475,10 +2644,37 @@ def field_conflict(field, evs):
                resolution="unreliable", confidence_impact=imp)
 
 
+def detect_conflicts(data):
+    """
+    Detect conflicts between data sources (B7 fix).
+    Currently: Anycast vs Geolocation.
+    """
+    conflicts = []
+    if data.get('anycast') is True:
+        geo = data.get('geolocation', {}) or data.get('geo', {})
+        # Also handle flat geo fields
+        if not geo:
+            # Try to build geo from trusted or ev values
+            geo = {}
+            for k in ("country", "city", "country_code"):
+                if data.get(k):
+                    geo[k] = data.get(k)
+        if geo.get('country') or geo.get('city') or geo.get('country_code'):
+            conflicts.append(CFL(
+                field="anycast_geo",
+                severity="INFORMATIONAL",
+                description="Anycast IP: geolocation is approximate and may not reflect actual server location.",
+                sources=["anycast", "geo"],
+                observations=[{"type": "anycast_geo", "geo": geo}],
+                resolution="informational",
+                confidence_impact=0.0
+            ))
+    return conflicts
+
 def conflict_report(evs, anycast=False):
     cs = []
     ge = [e for e in evs if e.data_type == "geo"]
-    # v21.7: anycast IPs inherently have multi-city geo → skip city/coord conflicts
+    # v21.7: anycast IPs inherently have multi-city geo → skip city/coord conflicts (but add informational conflict via detect_conflicts)
     if not anycast:
         c = coord_conflict(ge)
         if c: cs.append(c)
@@ -2493,6 +2689,19 @@ def conflict_report(evs, anycast=False):
     for f in ("asn", "organization", "prefix", "rir"):
         c = field_conflict(f, [e for e in evs if e.data_type == "asn" and e.field == f])
         if c: cs.append(c)
+    # B7 fix: Detect Anycast vs Geolocation conflict
+    if anycast:
+        ge_fields = {e.field: e.value for e in ge if e.value}
+        if ge_fields.get("country") or ge_fields.get("city") or ge_fields.get("country_code"):
+            cs.append(CFL(
+                field="anycast_geo",
+                severity="INFORMATIONAL",
+                description="Anycast IP: geolocation is approximate and may not reflect actual server location.",
+                sources=["anycast", "geo"],
+                observations=[{"geo": ge_fields, "anycast": True}],
+                resolution="informational",
+                confidence_impact=0.0
+            ))
     return cs
 
 def field_conf(tf, cs, anycast, is_coord=False):
@@ -3540,11 +3749,25 @@ def recon(target, enable_db=True, parallel=None):
     rels = build_rels(ents, evs, ip)
     ni = network_intel(ip, domain, evs, trusted, cert_ci)
 
-    # Passive OSINT enrichment (v21.2)
+    # Passive OSINT enrichment (v21.2) — B4 fix with public resolver / anycast check
     try:
-        rev = PassiveOSINT.hackertarget_reverse_ip(ip)
-        rev = _filter_reverse_ip(rev) if rev else []
-        otx_pd = PassiveOSINT.otx_passive_dns(ip)
+        rev_raw = PassiveOSINT.hackertarget_reverse_ip(ip)
+        # Determine ASN for anycast check
+        asn_val = ""
+        try:
+            asn_cands = [e.value for e in evs if e.data_type == "asn" and e.field == "asn"]
+            if trusted.get("asn") and trusted["asn"].value:
+                asn_val = str(trusted["asn"].value)
+            elif asn_cands:
+                asn_val = str(asn_cands[0])
+        except Exception:
+            asn_val = ""
+        rev_filtered, rev_note = filter_reverse_ip(rev_raw or [], ip, CFG.get("public_resolvers"), CFG.get("anycast_asns"), asn_val)
+        rev = rev_filtered
+        ni["reverse_ip_note"] = rev_note
+        otx_pd_raw = PassiveOSINT.otx_passive_dns(ip)
+        # B2: normalize OTX results immediately to avoid identical date bug
+        otx_pd = normalize_passive_dns(otx_pd_raw) if otx_pd_raw else []
         idb = PassiveOSINT.internetdb(ip)
         ni["reverse_ip"] = rev
         ni["passive_dns_otx"] = otx_pd
@@ -4011,33 +4234,58 @@ def render_text(d):
             out.append(f"        {a.get('description', '')}")
         out.append(_section_footer())
 
-    # [05b] PASSIVE OSINT
+    # [05b] PASSIVE OSINT — B2, B4, B5 fixes integrated
     rev_ip = ni.get("reverse_ip") or []
+    rev_note = ni.get("reverse_ip_note") or ""
     otx_pd = ni.get("passive_dns_otx") or []
+    # Prefer merged normalized if available
+    pd_merged = ni.get("passive_dns_merged") or []
     idb = ni.get("internetdb") or {}
-    if rev_ip or otx_pd or idb:
+    if rev_ip or otx_pd or pd_merged or idb or rev_note:
         out.append(_section_header("5b", "Passive OSINT"))
-        if rev_ip:
+        # Reverse IP — B4: show note when filtered for resolver/anycast
+        if rev_note and not rev_ip:
+            out.append(f"   {_c('REVERSE IP', C.KEY).ljust(14)} {_c(rev_note, C.GRY)}")
+        elif rev_ip:
             out.append(f"   {_c('REVERSE IP', C.KEY).ljust(14)} "
                        f"{_c(str(len(rev_ip)) + ' domains share this IP', C.VAL)}")
             for dom in rev_ip[:8]:
                 out.append(f"     {_c('·', C.GRY)} {_c(dom, C.VAL)}")
-        if otx_pd:
+            if rev_note:
+                out.append(f"     {_c(rev_note, C.DIM)}")
+        # Passive DNS — B2: use normalized first_seen/last_seen, avoid identical date overwrite
+        pd_display = pd_merged if pd_merged else otx_pd
+        if pd_display:
             out.append(f"   {_c('PASSIVE DNS', C.KEY).ljust(14)} "
-                       f"{_c(str(len(otx_pd)) + ' historical records', C.VAL)}")
-            for row in otx_pd[:5]:
-                h = row.get("hostname", "?")
-                f_ = (row.get("first") or "")[:10]
-                l_ = (row.get("last") or "")[:10]
+                       f"{_c(str(len(pd_display)) + ' historical records', C.VAL)}")
+            for row in pd_display[:5]:
+                h = row.get("hostname") or row.get("domain") or "?"
+                # Support both old (first/last) and new (first_seen/last_seen)
+                f_raw = row.get("first") or row.get("first_seen") or ""
+                l_raw = row.get("last") or row.get("last_seen") or row.get("date") or ""
+                f_ = str(f_raw)[:10] if f_raw else ""
+                l_ = str(l_raw)[:10] if l_raw else ""
+                # B2: distinguish missing first_seen
+                if f_ and l_ and f_ == l_:
+                    date_str = f_  # truly same date
+                elif not f_ and l_:
+                    date_str = f"N/A → {l_}"
+                elif f_ and not l_:
+                    date_str = f"{f_} → N/A"
+                else:
+                    date_str = f"{f_ or 'N/A'} → {l_ or 'N/A'}"
                 out.append(f"     {_c('·', C.GRY)} {_c(h.ljust(40), C.VAL)} "
-                           f"{_c(f'{f_} → {l_}', C.GRY)}")
+                           f"{_c(date_str, C.GRY)}")
         if idb:
             ports = idb.get("ports") or []
+            # B5 fix: enrich ports with protocol/service via ports_parse
+            enriched_ports = ports_parse(ports)
             hostnames = idb.get("hostnames") or []
             vulns = idb.get("vulns") or []
             if ports:
+                display_ports = ', '.join(f"{e['port']}/{e['protocol']} {e['service']}" for e in enriched_ports[:15])
                 out.append(f"   {_c('OPEN PORTS', C.KEY).ljust(14)} "
-                           f"{_c(', '.join(str(p) for p in ports[:15]), C.WARN)}")
+                           f"{_c(display_ports, C.WARN)}")
             if hostnames:
                 out.append(f"   {_c('HOSTNAMES', C.KEY).ljust(14)} "
                            f"{_c(', '.join(hostnames[:5]), C.VAL)}")
@@ -4073,11 +4321,15 @@ def render_text(d):
                        f"{_c(f'd={dist} ({reason})', C.GRY)}")
         out.append(_section_footer())
 
-    # [05e] CT DEEP ANALYSIS (Phase 2)
+    # [05e] CT DEEP ANALYSIS (Phase 2) — B6 fix
     ct_deep = ni.get("ct_deep") or {}
     ca_dist = ct_deep.get("ca_distribution") or {}
     suspicious_sans = ct_deep.get("suspicious_sans") or []
-    if ca_dist or suspicious_sans:
+    cert_info = d.get("certificate_intelligence") or {}
+    timeline = cert_info.get("timeline") or []
+    # Also parse via ct_parse for enriched view
+    parsed_certs = ct_parse([r for r in (cert_info.get("timeline") or [])]) if timeline else []
+    if ca_dist or suspicious_sans or timeline or parsed_certs:
         out.append(_section_header("5e", "CT Deep Analysis"))
         if ca_dist:
             out.append(f"   {_c('CA DISTRIBUTION', C.KEY).ljust(20)}")
@@ -4091,24 +4343,59 @@ def render_text(d):
                 out.append(f"     {_c('⚠', C.WARN)} "
                            f"{_c(str(s.get('san','?')).ljust(50), C.FAIL)} "
                            f"{_c(s.get('reason',''), C.GRY)}")
+        # B6: Show SAN, Issuer, Validity, Fingerprint per cert
+        if timeline:
+            out.append(f"   {_c('CERTIFICATES', C.KEY).ljust(20)} {_c(str(len(timeline)) + ' certs', C.VAL)}")
+            for rec in timeline[:4]:
+                san_list = rec.get("sans") or rec.get("san") or []
+                if isinstance(san_list, str):
+                    san_list = [san_list]
+                sans_str = ", ".join(san_list[:3]) + (f" +{len(san_list)-3} more" if len(san_list) > 3 else "") if san_list else "no SAN"
+                issuer = str(rec.get("issuer", "unknown"))[:50]
+                vf = str(rec.get("valid_from", ""))[:10]
+                vt = str(rec.get("valid_to", ""))[:10]
+                fp = str(rec.get("fingerprint") or rec.get("fingerprint_sha256", ""))[:16]
+                wild = " wildcard" if rec.get("wildcards") else ""
+                out.append(f"     {_c('·', C.GRY)} {_c(sans_str[:60].ljust(60), C.VAL)}{_c(wild, C.YEL)}")
+                out.append(f"       {_c('Issuer:', C.DIM)} {_c(issuer[:45], C.CYN)}")
+                out.append(f"       {_c('Validity:', C.DIM)} {_c(f'{vf} → {vt}', C.GRY)}  {_c('FP:', C.DIM)} {_c(fp, C.DIM)}")
+        elif parsed_certs:
+            out.append(f"   {_c('CERTIFICATES', C.KEY).ljust(20)} {_c(str(len(parsed_certs)) + ' certs', C.VAL)}")
+            for rec in parsed_certs[:4]:
+                sans = rec.get("san", [])
+                sans_str = ", ".join(sans[:3]) if sans else "no SAN"
+                out.append(f"     {_c('·', C.GRY)} {_c(sans_str[:60], C.VAL)}")
+                out.append(f"       {_c('Issuer:', C.DIM)} {_c(str(rec.get('issuer',''))[:45], C.CYN)}  {_c(str(rec.get('validity', {})), C.GRY)}")
         out.append(_section_footer())
 
-    # [05f] WHOIS ENHANCED (Phase 2)
+    # [05f] WHOIS ENHANCED (Phase 2) — B3 fix
     whois_full = ni.get("whois_enhanced") or {}
     if whois_full:
         out.append(_section_header("5f", "WHOIS Enhanced"))
+        # B3: clearly separate registration date vs update date
+        parsed = whois_parse(whois_full) if whois_full else {}
+        # Show structured fields
         for k in ("organization", "name", "handle", "country",
-                  "netrange", "cidr", "created", "updated",
-                  "abuse_email", "abuse_phone", "status"):
+                  "netrange", "cidr", "abuse_email", "abuse_phone", "status"):
             v = whois_full.get(k)
             if not v: continue
             kcolor = C.KEY
-            vcolor = C.VAL
-            if k in ("abuse_email", "abuse_phone"):
-                vcolor = C.CYN
-            if k in ("created", "updated"):
-                vcolor = C.GRY
+            vcolor = C.CYN if k in ("abuse_email", "abuse_phone") else C.VAL
             out.append(f"   {_c(k.ljust(16), kcolor)} {_c(str(v)[:60], vcolor)}")
+        # Registration vs Updated with distinct labels
+        if parsed.get("reg_date") or whois_full.get("created"):
+            rv = parsed.get("reg_date") or whois_full.get("created")
+            out.append(f"   {_c('reg_date'.ljust(16), C.KEY)} {_c(str(rv)[:60], C.GRY)} {_c('(Registration)', C.DIM)}")
+        if parsed.get("updated_date") or whois_full.get("updated"):
+            uv = parsed.get("updated_date") or whois_full.get("updated")
+            out.append(f"   {_c('updated_date'.ljust(16), C.KEY)} {_c(str(uv)[:60], C.GRY)} {_c('(Last Updated)', C.DIM)}")
+        if parsed.get("reg_date_note"):
+            out.append(f"   {_c('note', C.DIM)} {_c(parsed.get('reg_date_note'), C.GRY)}")
+        # Fallback show raw created/updated if not yet covered
+        if not parsed.get("reg_date") and whois_full.get("created"):
+            out.append(f"   {_c('created'.ljust(16), C.KEY)} {_c(str(whois_full.get('created'))[:60], C.GRY)}")
+        if not parsed.get("updated_date") and whois_full.get("updated"):
+            out.append(f"   {_c('updated'.ljust(16), C.KEY)} {_c(str(whois_full.get('updated'))[:60], C.GRY)}")
         out.append(_section_footer())
 
     # [05g] REVERSE IP (Enhanced)
