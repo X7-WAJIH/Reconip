@@ -55,6 +55,23 @@ evidence:
     ct: 0.9
     threat: 0.5
     passive_dns: 0.6
+threat_intelligence:
+  min_coverage: 0.5
+  max_stale_seconds: 86400     # 24 hours
+  agreement_bonus: 0.1
+  disagreement_penalty: 0.2
+  score_range: [0, 100]
+  provider_weights:
+    abuseipdb: 1.0
+    virustotal: 1.0
+    alienvault: 0.8
+    greynoise: 0.7
+    spamhaus_drop: 0.9
+    threatfox: 0.9
+    urlhaus: 0.8
+    feodo: 0.7
+    sslbl: 0.7
+    cins: 0.6
 providers:
   abuseipdb:
     enabled: true

@@ -212,7 +212,10 @@ DEFAULTS = {
                 "subprocess_timeout": 6.0, "max_body_bytes": 1000000},
     "evidence": {"freshness_ttl": {"dns": 3600, "whois": 86400, "threat": 1800, "ct": 86400, "passive_dns": 3600},
                  "default_ttl": 3600,
-                 "confidence_defaults": {"dns": 0.95, "whois": 0.85, "ct": 0.9, "threat": 0.5, "passive_dns": 0.6}}
+                 "confidence_defaults": {"dns": 0.95, "whois": 0.85, "ct": 0.9, "threat": 0.5, "passive_dns": 0.6}},
+    "threat_intelligence": {"min_coverage": 0.5, "max_stale_seconds": 86400, "agreement_bonus": 0.1,
+                            "disagreement_penalty": 0.2, "score_range": [0, 100],
+                            "provider_weights": {"abuseipdb": 1.0, "virustotal": 1.0, "alienvault": 0.8, "greynoise": 0.7, "spamhaus_drop": 0.9, "threatfox": 0.9, "urlhaus": 0.8, "feodo": 0.7, "sslbl": 0.7, "cins": 0.6}}
 }
 
 def deep_merge(a, b):
@@ -2449,6 +2452,179 @@ def threat_evs(ip, obs_list):
     return evs
 
 # ============================================================
+#  THREAT INTELLIGENCE ENGINE 2.0 — v32.1 (Stage 4)
+# ============================================================
+def normalize_result(source: str, raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Normalize a provider's raw result into a standard structure (Stage 4).
+    Output: {source, threat_score 0-1, raw_score, tags, first_seen, last_seen, evidence, status, confidence, reliability, weight, latency, freshness}
+    """
+    if raw is None:
+        return {
+            "source": source,
+            "threat_score": 0.0,
+            "raw_score": None,
+            "tags": [],
+            "first_seen": None,
+            "last_seen": None,
+            "evidence": "",
+            "status": "FAILED",
+            "confidence": 0.0,
+            "reliability": 0.0,
+            "weight": 0.0,
+            "latency": None,
+            "freshness": "UNKNOWN"
+        }
+    # Preserve status from raw if present (Stage 4 — never treat failure as OK)
+    raw_status = raw.get("status") if isinstance(raw.get("status"), str) else None
+    status = raw_status if raw_status in ("OK", "FAILED", "NOT_CONFIGURED") else "OK"
+    # If raw indicates failure via explicit status, propagate
+    if raw_status in ("FAILED", "NOT_CONFIGURED"):
+        status = raw_status
+    raw_score = raw.get("threat_score")
+    normalized = 0.0
+    try:
+        if raw_score is not None and status == "OK":
+            val = float(raw_score)
+            if val > 1.0:
+                val = val / 100.0
+            normalized = max(0.0, min(1.0, val))
+        elif status != "OK":
+            normalized = 0.0
+    except (TypeError, ValueError):
+        normalized = 0.0
+    return {
+        "source": source,
+        "threat_score": round(normalized, 4),
+        "raw_score": raw_score,
+        "tags": raw.get("tags", []) or [],
+        "first_seen": raw.get("first_seen"),
+        "last_seen": raw.get("last_seen"),
+        "evidence": raw.get("evidence", "") or "",
+        "status": status,
+        "confidence": raw.get("confidence", 0.5) if status == "OK" else 0.0,
+        "reliability": raw.get("reliability", 0.5) if status == "OK" else 0.0,
+        "weight": raw.get("weight", 1.0) if status == "OK" else 0.0,
+        "latency": raw.get("latency"),
+        "freshness": raw.get("freshness", "UNKNOWN") if status == "OK" else "UNKNOWN"
+    }
+
+def detect_provider_failure(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Identify which providers failed or were not configured (Stage 4).
+    Never treat failure as 'no threat'.
+    """
+    failed = [r["source"] for r in results if r.get("status") == "FAILED"]
+    not_configured = [r["source"] for r in results if r.get("status") == "NOT_CONFIGURED"]
+    ok = [r["source"] for r in results if r.get("status") == "OK"]
+    return {
+        "failed": failed,
+        "not_configured": not_configured,
+        "ok": ok,
+        "failure_count": len(failed),
+        "not_configured_count": len(not_configured),
+        "ok_count": len(ok),
+        "warning": (
+            "Some providers failed. Their absence does NOT indicate absence of threat."
+            if failed or not_configured else None
+        )
+    }
+
+def threat_confidence(normalized_results: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute threat confidence and related metrics (Stage 4).
+    Returns {observed_threat_score 0-100, evidence_coverage 0-1, provider_agreement 0-1, data_freshness 0-1, threat_confidence 0-1, provider_count, ok_count, failed_count, not_configured_count}
+    """
+    ti_cfg = config.get("threat_intelligence", {}) if isinstance(config, dict) else {}
+    min_coverage = float(ti_cfg.get("min_coverage", 0.5))
+    agreement_bonus = float(ti_cfg.get("agreement_bonus", 0.1))
+    disagreement_penalty = float(ti_cfg.get("disagreement_penalty", 0.2))
+    total = len(normalized_results)
+    ok_results = [r for r in normalized_results if r.get("status") == "OK"]
+    failed = [r for r in normalized_results if r.get("status") == "FAILED"]
+    not_configured = [r for r in normalized_results if r.get("status") == "NOT_CONFIGURED"]
+    coverage = (len(ok_results) / total) if total > 0 else 0.0
+    if ok_results:
+        weighted_sum = sum(r.get("threat_score", 0) * r.get("weight", 1.0) * r.get("confidence", 0.5) for r in ok_results)
+        weight_sum = sum(r.get("weight", 1.0) * r.get("confidence", 0.5) for r in ok_results)
+        observed = (weighted_sum / weight_sum) if weight_sum > 0 else 0.0
+    else:
+        observed = 0.0
+    observed_score = round(observed * 100, 2)
+    if len(ok_results) > 1:
+        scores = [r.get("threat_score", 0) for r in ok_results]
+        mean = sum(scores) / len(scores)
+        variance = sum((s - mean) ** 2 for s in scores) / len(scores)
+        normalized_variance = min(variance / 0.25, 1.0)
+        agreement = 1.0 - normalized_variance
+    elif len(ok_results) == 1:
+        agreement = 0.5
+    else:
+        agreement = 0.0
+    agreement = round(agreement, 4)
+    freshness_map = {"FRESH": 1.0, "STALE": 0.5, "EXPIRED": 0.1, "UNKNOWN": 0.0}
+    if ok_results:
+        freshness_avg = sum(freshness_map.get(r.get("freshness", "UNKNOWN"), 0.0) for r in ok_results) / len(ok_results)
+    else:
+        freshness_avg = 0.0
+    data_freshness = round(freshness_avg, 4)
+    base = observed * coverage * data_freshness
+    if agreement > 0.75:
+        base += agreement_bonus
+    elif agreement < 0.4 and len(ok_results) > 1:
+        base -= disagreement_penalty
+    if coverage < min_coverage:
+        base *= 0.5
+    threat_conf = max(0.0, min(1.0, round(base, 4)))
+    return {
+        "observed_threat_score": observed_score,
+        "evidence_coverage": round(coverage, 4),
+        "provider_agreement": agreement,
+        "data_freshness": data_freshness,
+        "threat_confidence": threat_conf,
+        "provider_count": total,
+        "ok_count": len(ok_results),
+        "failed_count": len(failed),
+        "not_configured_count": len(not_configured)
+    }
+
+def aggregate(raw_results: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Full Threat Intelligence aggregation pipeline (Stage 4).
+    Input: raw_results list of dicts with source + raw fields
+    Output: {normalized, failures, metrics, summary}
+    """
+    normalized = [normalize_result(r.get("source", "unknown"), r) for r in raw_results]
+    failures = detect_provider_failure(normalized)
+    metrics = threat_confidence(normalized, config)
+    summary_parts = []
+    summary_parts.append(f"Observed Threat Score: {metrics['observed_threat_score']}/100")
+    summary_parts.append(f"Coverage: {metrics['evidence_coverage'] * 100:.1f}%")
+    summary_parts.append(f"Agreement: {metrics['provider_agreement'] * 100:.1f}%")
+    summary_parts.append(f"Threat Confidence: {metrics['threat_confidence'] * 100:.1f}%")
+    if failures.get("warning"):
+        summary_parts.append(f"⚠ {failures['warning']}")
+    return {
+        "normalized": normalized,
+        "failures": failures,
+        "metrics": metrics,
+        "summary": " | ".join(summary_parts)
+    }
+
+def data_confidence_evidence(evidences: List[Evidence]) -> float:
+    """
+    Data confidence from Evidence objects (Stage 4, separate from threat confidence).
+    """
+    if not evidences:
+        return 0.0
+    ok = [e for e in evidences if getattr(e, 'status', '') == "OK"]
+    if not ok:
+        return 0.0
+    avg_conf = sum(float(getattr(e, 'confidence', 0)) for e in ok) / len(ok)
+    coverage = len(ok) / len(evidences)
+    return round(avg_conf * coverage, 4)
+
+# ============================================================
 #  PHASE 2 — SUBDOMAIN ENUM + TYPOSQUATTING + CT DEEP + WHOIS
 # ============================================================
 
@@ -4365,6 +4541,94 @@ def recon(target, enable_db=True, parallel=None):
         stage3_threat_evs = []
         out["stage3_threat_evidences"] = []
 
+    # Stage 4: Threat Intelligence Engine 2.0 — normalize, detect failures, compute confidence (v32.1)
+    try:
+        # Deduplicate by source — prefer OK over FAILED/NOT_CONFIGURED (Stage 4)
+        raw_map: Dict[str, Dict[str, Any]] = {}
+        for o in threat_obs:
+            src = getattr(o, 'provider', 'unknown')
+            st = getattr(o, 'status', 'FAILED')
+            # Stage 4: map Obs freshness — OK with recent success = FRESH
+            fresh = "FRESH" if st in (TS2.POSITIVE, TS.NO_THREAT.value, TS.NO_DATA.value) else "UNKNOWN"
+            raw_map[src] = {
+                "source": src,
+                "threat_score": getattr(o, 'score', None),
+                "tags": getattr(o, 'categories', []),
+                "first_seen": getattr(o, 'first_seen', None),
+                "last_seen": getattr(o, 'last_seen', None),
+                "evidence": str(getattr(o, 'error', '') or ''),
+                "status": st,
+                "confidence": (getattr(o, 'confidence', 50) / 100.0) if getattr(o, 'confidence', None) else 0.5,
+                "reliability": getattr(o, 'reliability', 0.5),
+                "weight": getattr(o, 'weight', 1.0),
+                "latency": None,
+                "freshness": fresh
+            }
+        for ev in stage3_threat_evs:
+            d = ev.to_dict()
+            meta = d.get("metadata", {}) or {}
+            src = d.get("source", "unknown")
+            new_entry = {
+                "source": src,
+                "threat_score": d.get("value"),
+                "tags": meta.get("tags", []),
+                "first_seen": meta.get("first_seen"),
+                "last_seen": meta.get("last_seen"),
+                "evidence": meta.get("evidence", ""),
+                "status": d.get("status", "FAILED"),
+                "confidence": d.get("confidence", 0.5),
+                "reliability": meta.get("reliability", 0.5),
+                "weight": meta.get("weight", 1.0),
+                "latency": meta.get("latency"),
+                "freshness": d.get("freshness", "UNKNOWN")
+            }
+            # Prefer OK over non-OK; if both same status, keep higher confidence
+            existing = raw_map.get(src)
+            if existing is None:
+                raw_map[src] = new_entry
+            else:
+                # Prefer OK
+                if existing.get("status") != "OK" and new_entry.get("status") == "OK":
+                    raw_map[src] = new_entry
+                elif existing.get("status") == "OK" and new_entry.get("status") != "OK":
+                    pass  # keep existing OK
+                else:
+                    # Both same status, keep higher confidence
+                    if new_entry.get("confidence", 0) > existing.get("confidence", 0):
+                        raw_map[src] = new_entry
+        raw_results = list(raw_map.values())
+        threat_aggregate = aggregate(raw_results, CFG)
+        out["threat_intelligence"] = {
+            "observed_threat_score": threat_aggregate["metrics"]["observed_threat_score"],
+            "evidence_coverage": threat_aggregate["metrics"]["evidence_coverage"],
+            "provider_agreement": threat_aggregate["metrics"]["provider_agreement"],
+            "data_freshness": threat_aggregate["metrics"]["data_freshness"],
+            "threat_confidence": threat_aggregate["metrics"]["threat_confidence"],
+            "provider_count": threat_aggregate["metrics"]["provider_count"],
+            "ok_count": threat_aggregate["metrics"]["ok_count"],
+            "failed_count": threat_aggregate["metrics"]["failed_count"],
+            "not_configured_count": threat_aggregate["metrics"]["not_configured_count"],
+            "failures": threat_aggregate["failures"],
+            "normalized": threat_aggregate["normalized"],
+            "summary": threat_aggregate["summary"]
+        }
+        # Data confidence separate (from Evidence) — Stage 4
+        try:
+            all_evidences: List[Evidence] = []
+            for e in evs:
+                if isinstance(e, Evidence):
+                    all_evidences.append(e)
+                elif isinstance(e, Ev):
+                    all_evidences.append(ev_to_evidence(e))
+            all_evidences.extend(stage3_threat_evs)
+            out["data_confidence"] = data_confidence_evidence(all_evidences)
+        except Exception:
+            out["data_confidence"] = 0.0
+    except Exception as e:
+        log.debug(f"stage4 aggregate: {e}")
+        out["threat_intelligence"] = {}
+        out["data_confidence"] = 0.0
+
     out["scan_status"] = agg_scan_status(out["module_statuses"])
     anycast = ip in CFG["geo_validation"]["anycast_ips"]
     cs = conflict_report(evs, anycast=anycast)
@@ -4893,6 +5157,31 @@ def render_text(d):
             for dis in pi["disagreements"][:3]:
                 out.append(f"   {_c('⚠', C.WARN)} "
                            f"{_c(dis.get('explanation', ''), C.WARN)}")
+        out.append(_section_footer())
+
+    # [03b] THREAT INTELLIGENCE ENGINE 2.0 (Stage 4) — separate Threat vs Data Confidence
+    ti = d.get("threat_intelligence") or {}
+    if ti:
+        out.append(_section_header("03b", "Threat Intelligence Engine 2.0"))
+        out.append(f"   {_c('OBSERVED THREAT', C.KEY).ljust(28)} {_c(str(ti.get('observed_threat_score', 0)) + '/100', C.VAL)}")
+        cov = ti.get('evidence_coverage', 0) * 100
+        agr = ti.get('provider_agreement', 0) * 100
+        fresh = ti.get('data_freshness', 0) * 100
+        tconf = ti.get('threat_confidence', 0) * 100
+        out.append(f"   {_c('EVIDENCE COVERAGE', C.KEY).ljust(28)} {_c(f'{cov:.1f}%', C.VAL)}")
+        out.append(f"   {_c('PROVIDER AGREEMENT', C.KEY).ljust(28)} {_c(f'{agr:.1f}%', C.VAL)}")
+        out.append(f"   {_c('DATA FRESHNESS', C.KEY).ljust(28)} {_c(f'{fresh:.1f}%', C.VAL)}")
+        out.append(f"   {_c('THREAT CONFIDENCE', C.KEY).ljust(28)} {_c(f'{tconf:.1f}%', C.VAL)}")
+        out.append(f"   {_c('DATA CONFIDENCE', C.KEY).ljust(28)} {_c(str(d.get('data_confidence', 0)), C.VAL)}")
+        fails = ti.get("failures", {}) or {}
+        if fails.get("failed") or fails.get("not_configured"):
+            out.append(f"   {_c('FAILURES', C.WARN).ljust(28)} {_c('failed=' + str(fails.get('failed', [])), C.WARN)}")
+            out.append(f"   {_c('', C.WARN).ljust(28)} {_c('not_configured=' + str(fails.get('not_configured', [])), C.GRY)}")
+            if fails.get("warning"):
+                out.append(f"   {_c('⚠', C.WARN)} {_c(fails.get('warning'), C.WARN)}")
+        # Show summary
+        if ti.get("summary"):
+            out.append(f"   {_c('SUMMARY', C.DIM).ljust(28)} {_c(ti.get('summary', '')[:80], C.GRY)}")
         out.append(_section_footer())
 
     # [04] CONFLICTS
