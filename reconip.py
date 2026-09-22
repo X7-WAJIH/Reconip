@@ -15,7 +15,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from abc import ABC, abstractmethod
 
-import yaml, requests, dns.resolver, dns.reversename, dns.exception
+import yaml, requests, dns.resolver, dns.reversename, dns.exception, dns.rdatatype
 try: import geoip2.database; GEOIP2 = True
 except ImportError: geoip2 = None; GEOIP2 = False
 try:
@@ -215,7 +215,9 @@ DEFAULTS = {
                  "confidence_defaults": {"dns": 0.95, "whois": 0.85, "ct": 0.9, "threat": 0.5, "passive_dns": 0.6}},
     "threat_intelligence": {"min_coverage": 0.5, "max_stale_seconds": 86400, "agreement_bonus": 0.1,
                             "disagreement_penalty": 0.2, "score_range": [0, 100],
-                            "provider_weights": {"abuseipdb": 1.0, "virustotal": 1.0, "alienvault": 0.8, "greynoise": 0.7, "spamhaus_drop": 0.9, "threatfox": 0.9, "urlhaus": 0.8, "feodo": 0.7, "sslbl": 0.7, "cins": 0.6}}
+                            "provider_weights": {"abuseipdb": 1.0, "virustotal": 1.0, "alienvault": 0.8, "greynoise": 0.7, "spamhaus_drop": 0.9, "threatfox": 0.9, "urlhaus": 0.8, "feodo": 0.7, "sslbl": 0.7, "cins": 0.6}},
+    "dns": {"records": ["A", "AAAA", "PTR", "NS", "MX", "TXT", "CAA", "SOA", "CNAME"], "ttl_analysis": True, "mail_analysis": True, "consistency_checks": True, "security_checks": True, "cname_chain_max_hops": 5, "low_ttl_threshold": 60, "high_ttl_threshold": 86400,
+           "known_mail_providers": {"google": ["google.com", "googlemail.com", "gmail.com"], "microsoft": ["outlook.com", "office365.com", "protection.outlook.com"], "cloudflare": ["cloudflare.net", "cloudflare.com"], "amazon": ["amazonaws.com", "ses.amazonaws.com"], "proofpoint": ["pphosted.com", "proofpoint.com"], "mimecast": ["mimecast.com"], "zoho": ["zoho.com"], "yandex": ["yandex.net", "yandex.ru"]}}
 }
 
 def deep_merge(a, b):
@@ -1547,6 +1549,419 @@ def collect_dns(ip, domain=None):
         except Exception as e:
             H(f"dns:{ns}").failure(exc_class(e), 0)
     return evs, module_status(att, resp)
+
+# ============================================================
+#  DNS INTELLIGENCE ENGINE — v33 (Stage 5)
+# ============================================================
+DNS_RECORD_TYPES = ["A", "AAAA", "PTR", "NS", "MX", "TXT", "CAA", "SOA", "CNAME"]
+
+def _normalize_dns_record(rtype: str, raw: str) -> str:
+    """Normalize DNS record value for consistent comparison (Stage 5)."""
+    raw = raw.strip()
+    if rtype in ("A", "AAAA"):
+        return raw.lower()
+    if rtype in ("NS", "CNAME", "PTR"):
+        return raw.rstrip(".").lower()
+    if rtype == "MX":
+        parts = raw.split()
+        if len(parts) == 2:
+            return f"{parts[0]} {parts[1].rstrip('.').lower()}"
+        return raw.lower()
+    if rtype == "TXT":
+        return raw.strip('"')
+    if rtype == "CAA":
+        return re.sub(r'\s+', ' ', raw.strip('"')).strip()
+    if rtype == "SOA":
+        return re.sub(r'\s+', ' ', raw).strip()
+    return raw
+
+def dns_collect(target: str, config: Dict[str, Any]) -> List[Evidence]:
+    """
+    Collect DNS records for a target and return them as Evidence objects (Stage 5).
+    Handles both IP targets (PTR) and domain targets (A, AAAA, NS, MX, TXT, CAA, SOA, CNAME).
+    """
+    evidences: List[Evidence] = []
+    # Support both new top-level dns config and legacy sources.dns
+    dns_cfg = config.get("dns", {}) or {}
+    if not dns_cfg.get("records"):
+        # Fallback to legacy
+        dns_cfg = config.get("sources", {}).get("dns", {}) or dns_cfg
+    record_types = dns_cfg.get("records", DNS_RECORD_TYPES)
+    # Also check for legacy record_types key
+    if not record_types:
+        record_types = DNS_RECORD_TYPES
+    timeout = 5
+    try:
+        timeout = int(config.get("timeouts", {}).get("dns", 5))
+    except Exception:
+        timeout = 5
+    # Also check phase_g or other
+    if timeout == 5 and config.get("phase_g", {}).get("dns", {}).get("timeout"):
+        try:
+            timeout = int(config["phase_g"]["dns"]["timeout"])
+        except Exception:
+            pass
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = timeout
+    resolver.lifetime = timeout
+    # Detect if target is an IP
+    is_ip = False
+    try:
+        ipaddress.ip_address(target)
+        is_ip = True
+    except ValueError:
+        is_ip = False
+    # For IP targets, only PTR makes sense
+    if is_ip:
+        record_types = ["PTR"]
+    else:
+        record_types = [rt for rt in record_types if rt != "PTR"]
+    for rtype in record_types:
+        try:
+            answers = resolver.resolve(target, rtype, raise_on_no_answer=False)
+            if answers is None or answers.rrset is None:
+                evidences.append(make_evidence(
+                    source="dns", value=None, normalized_value=None,
+                    confidence=0.0, status="PARTIAL", ttl_key="dns",
+                    metadata={"record_type": rtype, "reason": "no_answer", "data_type": "dns", "field": rtype, "target": target}
+                ))
+                continue
+            ttl = answers.rrset.ttl
+            for rdata in answers:
+                raw = rdata.to_text()
+                normalized = _normalize_dns_record(rtype, raw)
+                evidences.append(make_evidence(
+                    source="dns",
+                    value=raw,
+                    normalized_value=normalized,
+                    confidence=0.95,
+                    status="OK",
+                    ttl_key="dns",
+                    metadata={"record_type": rtype, "ttl": ttl, "data_type": "dns", "field": rtype, "target": target, "raw_value": raw}
+                ))
+        except dns.resolver.NXDOMAIN:
+            evidences.append(make_evidence(
+                source="dns", value=None, normalized_value=None,
+                confidence=0.0, status="PARTIAL", ttl_key="dns",
+                metadata={"record_type": rtype, "reason": "NXDOMAIN", "data_type": "dns", "field": rtype, "target": target}
+            ))
+        except dns.resolver.NoNameservers:
+            evidences.append(make_evidence(
+                source="dns", value=None, normalized_value=None,
+                confidence=0.0, status="FAILED", ttl_key="dns",
+                metadata={"record_type": rtype, "reason": "no_nameservers", "data_type": "dns", "field": rtype, "target": target}
+            ))
+        except dns.exception.Timeout:
+            evidences.append(make_evidence(
+                source="dns", value=None, normalized_value=None,
+                confidence=0.0, status="FAILED", ttl_key="dns",
+                metadata={"record_type": rtype, "reason": "timeout", "data_type": "dns", "field": rtype, "target": target}
+            ))
+        except Exception as e:
+            evidences.append(make_evidence(
+                source="dns", value=None, normalized_value=None,
+                confidence=0.0, status="FAILED", ttl_key="dns",
+                metadata={"record_type": rtype, "reason": str(e), "data_type": "dns", "field": rtype, "target": target}
+            ))
+    return evidences
+
+def _dns_consistency(by_type: Dict[str, List[Evidence]]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "a_vs_ptr": None,
+        "ns_vs_soa": None,
+        "cname_chain": [],
+        "duplicate_records": []
+    }
+    a_records = {ev.normalized_value for ev in by_type.get("A", []) if ev.normalized_value}
+    ptr_records = {ev.normalized_value for ev in by_type.get("PTR", []) if ev.normalized_value}
+    if a_records or ptr_records:
+        result["a_vs_ptr"] = {
+            "a_count": len(a_records),
+            "ptr_count": len(ptr_records),
+            "consistent": len(a_records) == len(ptr_records) if a_records and ptr_records else None
+        }
+    ns = {ev.normalized_value for ev in by_type.get("NS", []) if ev.normalized_value}
+    soa = [ev.normalized_value for ev in by_type.get("SOA", []) if ev.normalized_value]
+    if ns or soa:
+        soa_primary = None
+        if soa:
+            parts = soa[0].split()
+            if parts:
+                soa_primary = parts[0].rstrip(".").lower()
+        result["ns_vs_soa"] = {
+            "ns_count": len(ns),
+            "soa_primary": soa_primary,
+            "consistent": (soa_primary in ns) if soa_primary else None
+        }
+    for rtype, evs in by_type.items():
+        values = [ev.normalized_value for ev in evs if ev.normalized_value]
+        seen: set = set()
+        dupes: set = set()
+        for v in values:
+            if v in seen:
+                dupes.add(v)
+            seen.add(v)
+        if dupes:
+            result["duplicate_records"].append({
+                "record_type": rtype,
+                "duplicates": sorted(dupes)
+            })
+    return result
+
+def _dns_ttl_analysis(by_type: Dict[str, List[Evidence]]) -> Dict[str, Any]:
+    ttls: List[int] = []
+    per_type: Dict[str, Any] = {}
+    for rtype, evs in by_type.items():
+        type_ttls = [ev.metadata.get("ttl") for ev in evs if ev.metadata.get("ttl") is not None]
+        if type_ttls:
+            per_type[rtype] = {
+                "min": min(type_ttls),
+                "max": max(type_ttls),
+                "avg": round(sum(type_ttls) / len(type_ttls), 2)
+            }
+            ttls.extend(type_ttls)
+    low_ttl = [t for t in ttls if t < 60]
+    high_ttl = [t for t in ttls if t > 86400]
+    return {
+        "per_type": per_type,
+        "overall_min": min(ttls) if ttls else None,
+        "overall_max": max(ttls) if ttls else None,
+        "overall_avg": round(sum(ttls) / len(ttls), 2) if ttls else None,
+        "low_ttl_count": len(low_ttl),
+        "high_ttl_count": len(high_ttl),
+        "low_ttl_warning": len(low_ttl) > 0,
+        "high_ttl_warning": len(high_ttl) > 0
+    }
+
+def _identify_mail_provider(host: str) -> str:
+    """Map MX host patterns to known providers (Stage 5)."""
+    # Try config first
+    try:
+        cfg = CFG.get("dns", {}).get("known_mail_providers", {}) or {}
+        if not cfg:
+            cfg = CFG.get("sources", {}).get("dns", {}).get("known_mail_providers", {}) or {}
+    except Exception:
+        cfg = {}
+    if not cfg:
+        cfg = {
+            "google": ["google.com", "googlemail.com", "gmail.com"],
+            "microsoft": ["outlook.com", "office365.com", "protection.outlook.com"],
+            "cloudflare": ["cloudflare.net", "cloudflare.com"],
+            "amazon": ["amazonaws.com", "ses.amazonaws.com"],
+            "proofpoint": ["pphosted.com", "proofpoint.com"],
+            "mimecast": ["mimecast.com"],
+            "zoho": ["zoho.com"],
+            "yandex": ["yandex.net", "yandex.ru"],
+        }
+    host = host.lower()
+    for provider, suffixes in cfg.items():
+        if any(host.endswith(s) for s in suffixes):
+            return provider
+    # Fallback hardcoded
+    patterns = {
+        "google": ["google.com", "googlemail.com", "gmail.com"],
+        "microsoft": ["outlook.com", "office365.com", "protection.outlook.com"],
+        "cloudflare": ["cloudflare.net", "cloudflare.com"],
+        "amazon": ["amazonaws.com", "ses.amazonaws.com"],
+        "proofpoint": ["pphosted.com", "proofpoint.com"],
+        "mimecast": ["mimecast.com"],
+        "zoho": ["zoho.com"],
+        "yandex": ["yandex.net", "yandex.ru"],
+    }
+    for provider, suffixes in patterns.items():
+        if any(host.endswith(s) for s in suffixes):
+            return provider
+    return "unknown"
+
+def _dns_mail_analysis(by_type: Dict[str, List[Evidence]]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "mx_records": [],
+        "mx_providers": [],
+        "spf": None,
+        "dmarc": None,
+        "dkim_indicators": []
+    }
+    for ev in by_type.get("MX", []):
+        if not ev.normalized_value:
+            continue
+        parts = ev.normalized_value.split()
+        if len(parts) == 2:
+            try:
+                priority = int(parts[0])
+            except Exception:
+                priority = 0
+            host = parts[1]
+            result["mx_records"].append({"priority": priority, "host": host})
+            result["mx_providers"].append(_identify_mail_provider(host))
+    for ev in by_type.get("TXT", []):
+        if not ev.normalized_value:
+            continue
+        txt = ev.normalized_value
+        if txt.startswith("v=spf1"):
+            result["spf"] = txt
+        elif txt.startswith("v=DMARC1"):
+            result["dmarc"] = txt
+        elif "v=DKIM1" in txt or "k=rsa" in txt:
+            result["dkim_indicators"].append(txt[:120])
+    result["mx_providers"] = sorted(set(result["mx_providers"]))
+    return result
+
+def _dns_security_analysis(by_type: Dict[str, List[Evidence]]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "spf_present": False,
+        "spf_valid": False,
+        "dmarc_present": False,
+        "dmarc_policy": None,
+        "caa_present": False,
+        "caa_records": []
+    }
+    for ev in by_type.get("TXT", []):
+        if not ev.normalized_value:
+            continue
+        txt = ev.normalized_value
+        if txt.startswith("v=spf1"):
+            result["spf_present"] = True
+            result["spf_valid"] = any(txt.endswith(s) for s in ["-all", "~all", "?all"])
+        elif txt.startswith("v=DMARC1"):
+            result["dmarc_present"] = True
+            for part in txt.split(";"):
+                part = part.strip()
+                if part.startswith("p="):
+                    result["dmarc_policy"] = part.split("=")[1].strip()
+    for ev in by_type.get("CAA", []):
+        if ev.normalized_value:
+            result["caa_present"] = True
+            result["caa_records"].append(ev.normalized_value)
+    return result
+
+def dns_relationships(by_type: Dict[str, List[Evidence]]) -> Dict[str, Any]:
+    """
+    Build DNS relationships: domain → NS, domain → MX, domain → CNAME → target, MX → provider (Stage 5).
+    """
+    relationships: Dict[str, Any] = {
+        "nameservers": [],
+        "mail_servers": [],
+        "cname_chains": [],
+        "cname_loops": []
+    }
+    for ev in by_type.get("NS", []):
+        if ev.normalized_value:
+            relationships["nameservers"].append(ev.normalized_value)
+    for ev in by_type.get("MX", []):
+        if ev.normalized_value:
+            parts = ev.normalized_value.split()
+            if len(parts) == 2:
+                relationships["mail_servers"].append(parts[1])
+    cname_targets = {ev.normalized_value for ev in by_type.get("CNAME", []) if ev.normalized_value}
+    for target in cname_targets:
+        chain = [target]
+        seen = {target}
+        current = target
+        for _ in range(5):
+            try:
+                answers = dns.resolver.resolve(current, "CNAME", raise_on_no_answer=False)
+                if answers and answers.rrset:
+                    next_target = answers[0].to_text().rstrip(".").lower()
+                    if next_target in seen:
+                        relationships["cname_loops"].append(chain + [next_target])
+                        break
+                    seen.add(next_target)
+                    chain.append(next_target)
+                    current = next_target
+                else:
+                    break
+            except Exception:
+                break
+        if len(chain) > 1:
+            relationships["cname_chains"].append(chain)
+    return relationships
+
+def _dns_anomalies(by_type: Dict[str, List[Evidence]], analysis: Dict[str, Any], is_ip: bool = False) -> List[Dict[str, Any]]:
+    anomalies: List[Dict[str, Any]] = []
+    if "A" not in by_type and "AAAA" not in by_type:
+        if not is_ip:
+            anomalies.append({
+                "type": "missing_ip_records",
+                "severity": "low",
+                "message": "No A or AAAA records found."
+            })
+    if "NS" not in by_type:
+        anomalies.append({
+            "type": "missing_ns",
+            "severity": "moderate",
+            "message": "No NS records found. Delegation may be misconfigured."
+        })
+    if not is_ip:
+        if analysis.get("security", {}).get("spf_present") is False:
+            anomalies.append({
+                "type": "missing_spf",
+                "severity": "moderate",
+                "message": "No SPF record found."
+            })
+        if analysis.get("security", {}).get("dmarc_present") is False:
+            anomalies.append({
+                "type": "missing_dmarc",
+                "severity": "moderate",
+                "message": "No DMARC record found."
+            })
+    if analysis.get("relationships", {}).get("cname_loops"):
+        anomalies.append({
+            "type": "cname_loop",
+            "severity": "high",
+            "message": f"CNAME loop detected: {analysis['relationships']['cname_loops']}"
+        })
+    if analysis.get("ttl", {}).get("low_ttl_warning"):
+        anomalies.append({
+            "type": "low_ttl",
+            "severity": "informational",
+            "message": f"{analysis['ttl']['low_ttl_count']} records with TTL < 60s."
+        })
+    nsoa = analysis.get("consistency", {}).get("ns_vs_soa")
+    if nsoa and nsoa.get("consistent") is False:
+        anomalies.append({
+            "type": "ns_soa_mismatch",
+            "severity": "moderate",
+            "message": "SOA primary is not in NS records."
+        })
+    return anomalies
+
+def dns_analyze(evidences: List[Evidence], config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Analyze DNS Evidence and produce DNS intelligence (Stage 5).
+    """
+    dns_cfg = config.get("dns", {}) or {}
+    # Fallback to legacy
+    if not dns_cfg:
+        dns_cfg = config.get("sources", {}).get("dns", {}) or {}
+    ttl_analysis = dns_cfg.get("ttl_analysis", True)
+    mail_analysis = dns_cfg.get("mail_analysis", True)
+    # Detect is_ip via PTR presence or explicit flag
+    is_ip = any(ev.metadata.get("record_type") == "PTR" for ev in evidences if ev.status == "OK")
+    by_type: Dict[str, List[Evidence]] = {}
+    for ev in evidences:
+        if ev.status != "OK":
+            continue
+        rtype = ev.metadata.get("record_type", "UNKNOWN")
+        by_type.setdefault(rtype, []).append(ev)
+    analysis: Dict[str, Any] = {
+        "record_types_present": sorted(by_type.keys()),
+        "record_counts": {rt: len(evs) for rt, evs in by_type.items()},
+        "consistency": {},
+        "ttl": {},
+        "mail": {},
+        "security": {},
+        "relationships": {},
+        "anomalies": []
+    }
+    analysis["consistency"] = _dns_consistency(by_type)
+    if ttl_analysis:
+        analysis["ttl"] = _dns_ttl_analysis(by_type)
+    if mail_analysis:
+        analysis["mail"] = _dns_mail_analysis(by_type)
+    analysis["security"] = _dns_security_analysis(by_type)
+    analysis["relationships"] = dns_relationships(by_type)
+    analysis["anomalies"] = _dns_anomalies(by_type, analysis, is_ip=is_ip)
+    return analysis
 
 # ============================================================
 #  CERTIFICATE INTELLIGENCE
@@ -3828,11 +4243,21 @@ def final_assess(threat, infra, dc, cov, ac, cs, anycast):
 def dns_evs(evs, field=None, direction=None, name=None):
     out = []
     for e in evs:
-        if e.data_type != "dns": continue
-        if field is not None and e.field != field: continue
-        rv = e.raw_value or {}
-        if direction is not None and rv.get("direction") != direction: continue
-        if name is not None and rv.get("name") != name: continue
+        if getattr(e, 'data_type', '') != "dns": continue
+        if field is not None and getattr(e, 'field', '') != field: continue
+        # Stage 5 compat: handle both Ev (raw_value dict) and Evidence (metadata)
+        rv = getattr(e, 'raw_value', None)
+        meta = getattr(e, 'metadata', {}) or {}
+        # Try raw_value dict
+        rv_dict = {}
+        if isinstance(rv, dict):
+            rv_dict = rv
+        elif isinstance(meta.get("raw_value"), dict):
+            rv_dict = meta["raw_value"]
+        else:
+            rv_dict = meta
+        if direction is not None and rv_dict.get("direction") != direction: continue
+        if name is not None and rv_dict.get("name") != name: continue
         out.append(e)
     return out
 
@@ -3842,16 +4267,29 @@ def anomaly_conf(ids):
 
 def detect_anomalies(ip, domain, evs):
     a = []; sm = PG["anomaly_severity"]
+    # Helper for raw extraction (Stage 5 compat)
+    def _raw_get(ev, key):
+        rv = getattr(ev, 'raw_value', None)
+        if isinstance(rv, dict):
+            v = rv.get(key)
+            if v is not None:
+                return v
+        meta = getattr(ev, 'metadata', {}) or {}
+        if isinstance(meta.get("raw_value"), dict):
+            v = meta["raw_value"].get(key)
+            if v is not None:
+                return v
+        return meta.get(key)
     ptrs = dns_evs(evs, field="PTR", direction="reverse")
-    hosts = sorted({e.value for e in ptrs})
+    hosts = sorted({getattr(e, 'value', None) for e in ptrs if getattr(e, 'value', None) is not None})
     peids = defaultdict(list)
-    for e in ptrs: peids[e.value].append(e.id)
-    fwd = [e for e in evs if e.data_type == "dns" and e.field in ("A", "AAAA")
-           and (e.raw_value or {}).get("direction") == "forward_from_ptr"]
+    for e in ptrs: peids[getattr(e, 'value', None)].append(getattr(e, 'id', ''))
+    fwd = [e for e in evs if getattr(e, 'data_type', '') == "dns" and getattr(e, 'field', '') in ("A", "AAAA")
+           and _raw_get(e, "direction") == "forward_from_ptr"]
     fbyhost = defaultdict(list)
     for e in fwd:
-        h = (e.raw_value or {}).get("name")
-        if h: fbyhost[h].append((e.value, e.id))
+        h = _raw_get(e, "name")
+        if h: fbyhost[h].append((getattr(e, 'value', None), getattr(e, 'id', '')))
     for h in hosts:
         fw = fbyhost.get(h, []); fips = sorted({v for v, _ in fw})
         if fips and ip not in fips:
@@ -3949,16 +4387,29 @@ def network_intel(ip, domain, evs, trusted, cert_ci=None):
     dns_recs = {}
     for rt in PG["dns"]["record_types"]:
         dns_recs[rt] = sorted({e.value for e in evs
-                                if e.data_type == "dns" and e.field == rt})
-    ptrs = [e for e in evs if e.data_type == "dns" and e.field == "PTR"
-            and (e.raw_value or {}).get("direction") == "reverse"]
-    hosts = sorted({e.value for e in ptrs})
+                                if e.data_type == "dns" and e.field == rt and e.value is not None})
+    def _raw_get(ev, key):
+        rv = getattr(ev, 'raw_value', None)
+        if isinstance(rv, dict):
+            v = rv.get(key)
+            if v is not None:
+                return v
+        meta = getattr(ev, 'metadata', {}) or {}
+        if isinstance(meta.get("raw_value"), dict):
+            v = meta["raw_value"].get(key)
+            if v is not None:
+                return v
+        return meta.get(key)
+    ptrs = [e for e in evs if getattr(e, 'data_type', '') == "dns" and getattr(e, 'field', '') == "PTR"
+            and _raw_get(e, "direction") == "reverse"]
+    hosts = sorted({getattr(e, 'value', None) for e in ptrs if getattr(e, 'value', None) is not None})
     cons = []
     for h in hosts:
-        fwd = [e.value for e in evs if e.data_type == "dns"
-               and e.field in ("A", "AAAA")
-               and (e.raw_value or {}).get("name") == h
-               and (e.raw_value or {}).get("direction") == "forward_from_ptr"]
+        fwd = [getattr(e, 'value', None) for e in evs if getattr(e, 'data_type', '') == "dns"
+               and getattr(e, 'field', '') in ("A", "AAAA")
+               and _raw_get(e, "name") == h
+               and _raw_get(e, "direction") == "forward_from_ptr"
+               and getattr(e, 'value', None) is not None]
         if fwd:
             cons.append({"ptr": h, "forward_ips": sorted(set(fwd)),
                          "forward_includes_target": ip in fwd,
@@ -4514,6 +4965,33 @@ def recon(target, enable_db=True, parallel=None):
     out["module_statuses"]["asn"] = asn_st
     out["module_statuses"]["rdap"] = rdap_st
     out["module_statuses"]["dns"] = dns_st
+
+    # Stage 5: DNS Intelligence Engine — v33
+    try:
+        # Use dns_collect (new) and merge with existing dns_evs for comprehensive analysis
+        dns_evidences_v5 = dns_collect(target, CFG)
+        # Merge with existing dns_evs (deduplicate by record_type+normalized_value)
+        combined_dns_evs = list(dns_evs)
+        existing_keys = {(getattr(e, 'metadata', {}).get("record_type"), getattr(e, 'normalized_value', None)) for e in dns_evs if hasattr(e, 'metadata')}
+        for ev in dns_evidences_v5:
+            key = (ev.metadata.get("record_type"), ev.normalized_value)
+            if key not in existing_keys:
+                combined_dns_evs.append(ev)
+                existing_keys.add(key)
+        dns_intel = dns_analyze(combined_dns_evs, CFG)
+        out["dns_intelligence"] = {
+            "evidence": [ev.to_dict() for ev in combined_dns_evs],
+            "analysis": dns_intel
+        }
+        out["dns_collect_evidence"] = [ev.to_dict() for ev in dns_evidences_v5]
+        # Also extend evs with any new DNS evidences for downstream scoring
+        for ev in dns_evidences_v5:
+            if ev not in evs:
+                evs.append(ev)
+    except Exception as e:
+        log.debug(f"dns intelligence: {e}")
+        out["dns_intelligence"] = {"evidence": [], "analysis": {}}
+        out["dns_collect_evidence"] = []
 
     cert_evs, cert_st, cert_ci = cert_res if len(cert_res) == 3 \
         else ([], MS.SKIPPED.value, {"records": {}})
@@ -5232,6 +5710,86 @@ def render_text(d):
                        f"{_c('conf=' + f'{conf_pct:.0f}' + '%', C.GRY)}")
             out.append(f"        {a.get('description', '')}")
         out.append(_section_footer())
+
+    # [05a] DNS INTELLIGENCE ENGINE — v33 (Stage 5)
+    dns_intel = d.get("dns_intelligence") or {}
+    if dns_intel:
+        analysis = dns_intel.get("analysis") or {}
+        evidences = dns_intel.get("evidence") or []
+        if analysis or evidences:
+            out.append(_section_header("05a", "DNS Intelligence Engine"))
+            # Records
+            rt_present = analysis.get("record_types_present", [])
+            rc = analysis.get("record_counts", {})
+            if rt_present:
+                out.append(f"   {_c('RECORDS', C.KEY).ljust(14)} {_c(', '.join(rt_present), C.VAL)}")
+                for rt in rt_present:
+                    cnt = rc.get(rt, 0)
+                    vals = [e.get("normalized_value") or e.get("value") for e in evidences if e.get("metadata", {}).get("record_type") == rt and e.get("status") == "OK"]
+                    vals = [v for v in vals if v][:3]
+                    if vals:
+                        out.append(f"     {_c(rt.ljust(6), C.DIM)} → {_c(', '.join(str(v) for v in vals[:3]), C.GRY)} {C.DIM}({cnt}){C.RST}")
+            # Relationships
+            rel = analysis.get("relationships", {}) or {}
+            if rel.get("nameservers") or rel.get("mail_servers") or rel.get("cname_chains"):
+                out.append(f"   {_c('RELATIONSHIPS', C.KEY).ljust(14)}")
+                if rel.get("nameservers"):
+                    out.append(f"     {_c('NS', C.DIM)} → {_c(', '.join(rel['nameservers'][:3]), C.VAL)}")
+                if rel.get("mail_servers"):
+                    out.append(f"     {_c('MX', C.DIM)} → {_c(', '.join(rel['mail_servers'][:3]), C.VAL)}")
+                if rel.get("cname_chains"):
+                    for ch in rel["cname_chains"][:2]:
+                        out.append(f"     {_c('CNAME', C.DIM)} → {_c(' → '.join(ch), C.VAL)}")
+                if rel.get("cname_loops"):
+                    out.append(f"     {_c('LOOP', C.FAIL)} {_c(str(rel['cname_loops'][:1]), C.WARN)}")
+            # Consistency
+            cons = analysis.get("consistency", {}) or {}
+            if cons.get("a_vs_ptr") or cons.get("ns_vs_soa") or cons.get("duplicate_records"):
+                out.append(f"   {_c('CONSISTENCY', C.KEY).ljust(14)}")
+                if cons.get("a_vs_ptr"):
+                    avp = cons["a_vs_ptr"]
+                    out.append(f"     {_c('A vs PTR', C.DIM)} a={avp.get('a_count')} ptr={avp.get('ptr_count')} consistent={avp.get('consistent')}")
+                if cons.get("ns_vs_soa"):
+                    nss = cons["ns_vs_soa"]
+                    out.append(f"     {_c('NS vs SOA', C.DIM)} ns={nss.get('ns_count')} soa={nss.get('soa_primary')} consistent={nss.get('consistent')}")
+                for dup in cons.get("duplicate_records", [])[:2]:
+                    out.append(f"     {_c('DUP', C.WARN)} {dup.get('record_type')}: {', '.join(dup.get('duplicates', [])[:2])}")
+            # TTL
+            ttl = analysis.get("ttl", {}) or {}
+            if ttl.get("per_type"):
+                out.append(f"   {_c('TTL', C.KEY).ljust(14)} min={ttl.get('overall_min')} max={ttl.get('overall_max')} avg={ttl.get('overall_avg')}")
+                for rt, v in list(ttl.get("per_type", {}).items())[:3]:
+                    out.append(f"     {_c(rt, C.DIM)} min={v.get('min')} max={v.get('max')} avg={v.get('avg')}")
+                if ttl.get("low_ttl_warning"):
+                    out.append(f"     {_c('LOW TTL', C.WARN)} {ttl.get('low_ttl_count')} <60s")
+                if ttl.get("high_ttl_warning"):
+                    out.append(f"     {_c('HIGH TTL', C.WARN)} {ttl.get('high_ttl_count')} >86400s")
+            # Mail
+            mail = analysis.get("mail", {}) or {}
+            if mail.get("mx_records") or mail.get("spf") or mail.get("dmarc"):
+                out.append(f"   {_c('MAIL', C.KEY).ljust(14)}")
+                if mail.get("mx_records"):
+                    for mx in mail["mx_records"][:2]:
+                        out.append(f"     {_c('MX', C.DIM)} {mx.get('priority')} {mx.get('host')} ({_identify_mail_provider(mx.get('host',''))})")
+                if mail.get("spf"):
+                    out.append(f"     {_c('SPF', C.DIM)} {_c(mail['spf'][:60], C.VAL)}")
+                if mail.get("dmarc"):
+                    out.append(f"     {_c('DMARC', C.DIM)} {_c(mail['dmarc'][:60], C.VAL)}")
+                if mail.get("mx_providers"):
+                    out.append(f"     {_c('PROVIDERS', C.DIM)} {_c(', '.join(mail['mx_providers']), C.VAL)}")
+            # Security
+            sec = analysis.get("security", {}) or {}
+            if sec:
+                out.append(f"   {_c('SECURITY', C.KEY).ljust(14)} SPF={'✓' if sec.get('spf_present') else '✗'} DMARC={'✓' if sec.get('dmarc_present') else '✗'} CAA={'✓' if sec.get('caa_present') else '✗'}")
+                if sec.get("caa_records"):
+                    out.append(f"     {_c('CAA', C.DIM)} {_c(', '.join(sec['caa_records'][:2]), C.VAL)}")
+            # Anomalies
+            anomalies = analysis.get("anomalies", []) or []
+            if anomalies:
+                out.append(f"   {_c('ANOMALIES', C.WARN).ljust(14)} {len(anomalies)}")
+                for an in anomalies[:3]:
+                    out.append(f"     {_c('['+an.get('severity','')+']', _severity_color(an.get('severity','')))} {an.get('type')} - {an.get('message')[:60]}")
+            out.append(_section_footer())
 
     # [05b] PASSIVE OSINT — B2, B4, B5 fixes integrated
     rev_ip = ni.get("reverse_ip") or []

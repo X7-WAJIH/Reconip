@@ -72,6 +72,24 @@ threat_intelligence:
     feodo: 0.7
     sslbl: 0.7
     cins: 0.6
+dns:
+  records: [A, AAAA, PTR, NS, MX, TXT, CAA, SOA, CNAME]
+  ttl_analysis: true
+  mail_analysis: true
+  consistency_checks: true
+  security_checks: true
+  cname_chain_max_hops: 5
+  low_ttl_threshold: 60
+  high_ttl_threshold: 86400
+  known_mail_providers:
+    google: ["google.com", "googlemail.com", "gmail.com"]
+    microsoft: ["outlook.com", "office365.com", "protection.outlook.com"]
+    cloudflare: ["cloudflare.net", "cloudflare.com"]
+    amazon: ["amazonaws.com", "ses.amazonaws.com"]
+    proofpoint: ["pphosted.com", "proofpoint.com"]
+    mimecast: ["mimecast.com"]
+    zoho: ["zoho.com"]
+    yandex: ["yandex.net", "yandex.ru"]
 providers:
   abuseipdb:
     enabled: true
