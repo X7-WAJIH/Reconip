@@ -1,0 +1,99 @@
+general: {timeout: 5, max_retries: 2, user_agent: "ReconIP/21.2", proxy: ""}
+api_keys: {ipinfo: "", abuseipdb: "", virustotal: "", alienvault: "", greynoise: ""}
+geo_validation:
+  anycast_ips: ["8.8.8.8","8.8.4.4","1.1.1.1","1.0.0.1","9.9.9.9",
+                "149.112.112.112","208.67.222.222","208.67.220.220"]
+validation: {min_sources_for_trusted: 2, min_agreement_for_trusted: 60.0,
+             geo_conflict_km: {low: 25, moderate: 100, high: 500},
+             geo_precision_km: {tight: 50, moderate: 250, loose: 1000}}
+sources:
+  geo: {enabled: [ip_api, ipinfo, freegeoip, maxmind_local],
+        maxmind_db_path: "/usr/share/GeoIP/GeoLite2-City.mmdb"}
+  network: {asn_sources: [ripe, bgpview, bgp_he, whois]}
+  dns: {nameservers: ["1.1.1.1","9.9.9.9","208.67.222.222"],
+        record_types: [PTR, CNAME, MX, NS, TXT], max_dns_records: 20}
+  certificate: {ports: [443, 8443], max_historical_certs: 30}
+  threat_intel: {sources: [abuseipdb, virustotal, alienvault, urlhaus, threatfox,
+                            feodo, sslbl, greynoise, cins, spamhaus_drop]}
+source_reliability:
+  ip_api: {reliability: 0.75}
+  ipinfo: {reliability: 0.85}
+  freegeoip: {reliability: 0.60}
+  maxmind_local: {reliability: 0.92}
+  ripe: {reliability: 0.92}
+  bgpview: {reliability: 0.88}
+  bgp_he: {reliability: 0.85}
+  whois: {reliability: 0.80}
+  rdap: {reliability: 0.90}
+  dns_resolver: {reliability: 0.95}
+  crtsh: {reliability: 0.85}
+  direct_tls: {reliability: 0.95}
+  abuseipdb: {reliability: 0.85}
+  virustotal: {reliability: 0.90}
+  alienvault: {reliability: 0.70}
+  urlhaus: {reliability: 0.75}
+  threatfox: {reliability: 0.85}
+  feodo: {reliability: 0.90}
+  sslbl: {reliability: 0.80}
+  greynoise: {reliability: 0.80}
+  cins: {reliability: 0.70}
+  spamhaus_drop: {reliability: 0.85}
+freshness:
+  thresholds: {fresh: 300, recent: 3600, aging: 86400, stale: 604800}
+  weights: {fresh: 1.0, recent: 0.9, aging: 0.7, stale: 0.4, unknown: 0.5}
+phase_d:
+  workers: 8
+  cache: {enabled: true, db_path: ./reconip_cache.db,
+          ttl: {geo: 7200, asn: 3600, rdap: 7200, dns: 600, cert: 3600, threat: 900}}
+phase_e: {enabled: true, db_path: ./reconip.db, retention: {evidence_days: 180}}
+phase_i:
+  providers:
+    abuseipdb: {enabled: true, weight: 1.0, reliability: 0.85, env_var: ABUSEIPDB_API_KEY, config_key: abuseipdb}
+    virustotal: {enabled: true, weight: 1.0, reliability: 0.90, env_var: VIRUSTOTAL_API_KEY, config_key: virustotal}
+    alienvault: {enabled: true, weight: 0.7, reliability: 0.70, env_var: ALIENVAULT_API_KEY, config_key: alienvault}
+    urlhaus: {enabled: true, weight: 0.8, reliability: 0.75}
+    threatfox: {enabled: true, weight: 1.0, reliability: 0.85}
+    feodo: {enabled: true, weight: 1.0, reliability: 0.90}
+    sslbl: {enabled: true, weight: 0.9, reliability: 0.80}
+    greynoise: {enabled: true, weight: 0.8, reliability: 0.80, env_var: GREYNOISE_API_KEY, config_key: greynoise}
+    cins: {enabled: true, weight: 0.7, reliability: 0.70}
+    spamhaus_drop: {enabled: true, weight: 0.9, reliability: 0.85}
+  disagreement: {confidence_penalty_per_conflict: 15.0, max_penalty: 40.0}
+phase_j: {window_days: 90, rapid_changes_threshold: 3, rapid_window_hours: 24}
+phase_k: {max_depth: 4, max_paths: 100, confidence: {base: 40.0, per_source: 20.0, cap: 95.0}}
+phase_m:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8787
+  require_auth: true
+  token_env_var: RECONIP_API_TOKEN
+  tokens: []
+  rate_limit_per_min: 60
+  max_batch: 100
+phase_n: {allow_private_targets: false, max_batch: 100, subprocess_timeout: 6.0}
+phase_p2:
+  subdomain_enum:
+    enabled: true
+    sources: [crtsh, hackertarget, otx]
+    max_results: 200
+  typosquatting:
+    enabled: true
+    max_distance: 2
+    check_domains: true
+  passive_dns:
+    enabled: true
+    sources: [otx, virustotal]
+    max_history_days: 365
+  reverse_ip:
+    enabled: true
+    sources: [hackertarget, internetdb]
+    max_results: 100
+  ca_analysis:
+    enabled: true
+    suspicious_cas: ["Let's Encrypt", "ZeroSSL"]
+    # Levenshtein distance threshold for typosquatting
+    levenshtein_threshold: 2
+  whois_enhanced:
+    enabled: true
+    parse_dates: true
+    extract_contacts: true

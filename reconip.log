@@ -1,0 +1,50 @@
+2026-09-04 19:24:58,511 - ReconIP - INFO - تم حفظ التقرير: ./reports/8.8.8.8_20260904_192458.html
+2026-09-12 19:52:35,302 [WARNING] ReconIP: Gave up on https://api.bgpview.io/ip/8.8.8.8
+2026-09-12 22:15:19,361 [ERROR] ReconIP: YAML parse error: mapping values are not allowed here
+  in "config.yaml", line 9, column 51
+2026-09-18 03:53:46,494 [ERROR] ReconIP: Phase E DB init failed: cannot rollback - no transaction is active
+2026-09-18 04:05:50,791 [ERROR] ReconIP: Phase E DB init failed: cannot rollback - no transaction is active
+2026-09-18 04:05:50,983 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 04:05:51,008 [INFO] ReconIP: bgpview retry 1/3 in 0.51s
+2026-09-18 04:05:57,820 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 04:05:57,820 [INFO] ReconIP: bgpview retry 2/3 in 1.04s
+2026-09-18 04:06:03,912 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 04:06:08,227 [WARNING] ReconIP: certspotter HTTP 403 → AUTHENTICATION
+2026-09-18 04:12:03,896 [ERROR] ReconIP: Phase E DB init failed: cannot rollback - no transaction is active
+2026-09-18 04:12:04,367 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 04:12:10,924 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 04:12:20,763 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 04:12:25,852 [WARNING] ReconIP: certspotter HTTP 403 -> AUTHENTICATION
+2026-09-18 04:44:18,026 [ERROR] ReconIP: Phase E DB init failed: cannot rollback - no transaction is active
+2026-09-18 04:44:18,237 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 04:44:25,050 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 04:44:34,800 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 08:07:50,002 [ERROR] ReconIP: Phase E DB init failed: cannot rollback - no transaction is active
+2026-09-18 08:07:56,970 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 08:08:03,814 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 08:08:09,982 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 08:21:11,966 [ERROR] ReconIP: Phase E DB init failed: cannot rollback - no transaction is active
+2026-09-18 08:21:12,400 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 08:21:18,994 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 08:21:25,112 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 08:27:15,682 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 08:27:22,491 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 08:27:32,125 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 15:57:17,142 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 15:57:23,027 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 15:57:29,175 [WARNING] ReconIP: bgpview ERROR [NETWORK]: HTTPSConnectionPool(host='api.bgpview.io', port=443): Max retries exceeded with url: /ip/8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='api.bgpview.io', port=443): Failed to resolve 'api.bgpview.io' ([Errno -2] Name or service not known)"))
+2026-09-18 16:05:33,922 [WARNING] ReconIP: crtsh HTTP 502 -> TRANSIENT
+2026-09-18 16:05:33,923 [INFO] ReconIP: crtsh retry 1 in 0.53s
+2026-09-18 16:05:35,444 [WARNING] ReconIP: crtsh HTTP 502 -> TRANSIENT
+2026-09-18 16:05:35,445 [INFO] ReconIP: crtsh retry 2 in 1.19s
+2026-09-18 16:05:39,005 [WARNING] ReconIP: crtsh HTTP 502 -> TRANSIENT
+2026-09-18 16:30:21,799 [WARNING] ReconIP: ripe ERROR [NETWORK]: HTTPSConnectionPool(host='stat.ripe.net', port=443): Max retries exceeded with url: /data/prefix-overview/data.json?resource=8.8.8.8 (Caused by NameResolutionError("HTTPSConnection(host='stat.ripe.net', port=443): Failed to resolve 'stat.ripe.net' ([Errno -3] Temporary failure in name resolution)"))
+2026-09-18 16:32:07,901 [ERROR] ReconIP: Phase J report failed: 'IntelDB' object has no attribute '_phase_j_get_timeline_events'
+2026-09-18 16:32:07,901 [ERROR] ReconIP: Phase J record failed: 'IntelDB' object has no attribute '_phase_j_get_previous_state'
+2026-09-18 17:23:00,196 [INFO] ReconIP: [runtime] state: OperationalState.STARTING -> OperationalState.STARTING 
+2026-09-18 17:23:00,197 [INFO] ReconIP: [runtime] state: OperationalState.STARTING -> OperationalState.DEGRADED (5 issue(s))
+2026-09-18 17:24:39,967 [ERROR] ReconIP: Phase J report failed: 'IntelDB' object has no attribute '_phase_j_get_timeline_events'
+2026-09-18 17:24:39,968 [ERROR] ReconIP: Phase J record failed: 'IntelDB' object has no attribute '_phase_j_get_previous_state'
+2026-09-18 17:24:39,969 [ERROR] ReconIP: Phase K persist failed: 'IntelDB' object has no attribute '_phase_k_upsert_nodes'
+2026-09-18 18:53:27,633 [ERROR] persist: table graph_entities has no column named etype
+2026-09-20 19:03:52,702 [WARNING] asn ripe: name '_clean_org' is not defined

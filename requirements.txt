@@ -1,0 +1,6 @@
+requests
+rich
+pyyaml
+dnspython
+python-whois
+cryptography
