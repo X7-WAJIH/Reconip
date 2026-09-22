@@ -55,6 +55,178 @@ evidence:
     ct: 0.9
     threat: 0.5
     passive_dns: 0.6
+providers:
+  abuseipdb:
+    enabled: true
+    type: http
+    url: "https://api.abuseipdb.com/api/v2/check?ipAddress={target}"
+    method: GET
+    api_key_env: ABUSEIPDB_API_KEY
+    api_key_header: Key
+    timeout: 10
+    reliability: 0.95
+    weight: 1.0
+    freshness_ttl: 1800
+    response_map:
+      threat_score: "data.abuseConfidenceScore"
+      tags: "data.usageType"
+      first_seen: "data.lastReportedAt"
+      last_seen: "data.lastReportedAt"
+      evidence: "data.reports.0.comment"
+  virustotal:
+    enabled: true
+    type: http
+    url: "https://www.virustotal.com/api/v3/ip_addresses/{target}"
+    method: GET
+    api_key_env: VIRUSTOTAL_API_KEY
+    api_key_header: x-apikey
+    timeout: 10
+    reliability: 0.95
+    weight: 1.0
+    freshness_ttl: 1800
+    response_map:
+      threat_score: "data.attributes.last_analysis_stats.malicious"
+      tags: "data.attributes.tags"
+      first_seen: "data.attributes.first_seen_itw"
+      last_seen: "data.attributes.last_analysis_date"
+      evidence: "data.attributes.reputation"
+  threatfox:
+    enabled: true
+    type: http
+    url: "https://threatfox-api.abuse.ch/api/v1/"
+    method: POST
+    api_key_env: THREATFOX_API_KEY
+    api_key_header: Auth-Key
+    timeout: 10
+    reliability: 0.85
+    weight: 0.9
+    freshness_ttl: 1800
+    response_map:
+      threat_score: "data.0.confidence_level"
+      tags: "data.0.threat_type"
+      first_seen: "data.0.first_seen"
+      last_seen: "data.0.last_seen"
+      evidence: "data.0.malware"
+  alienvault:
+    enabled: true
+    type: http
+    url: "https://otx.alienvault.com/api/v1/indicators/IPv4/{target}/general"
+    method: GET
+    api_key_env: ALIENVAULT_API_KEY
+    api_key_header: X-OTX-API-KEY
+    timeout: 10
+    reliability: 0.8
+    weight: 0.8
+    freshness_ttl: 1800
+    response_map:
+      threat_score: "pulse_info.count"
+      tags: "pulse_info.pulses.0.tags"
+      first_seen: "pulse_info.pulses.0.created"
+      last_seen: "pulse_info.pulses.0.modified"
+      evidence: "pulse_info.pulses.0.name"
+  greynoise:
+    enabled: true
+    type: http
+    url: "https://api.greynoise.io/v3/community/{target}"
+    method: GET
+    api_key_env: GREYNOISE_API_KEY
+    api_key_header: key
+    timeout: 10
+    reliability: 0.7
+    weight: 0.7
+    freshness_ttl: 1800
+    response_map:
+      threat_score: "classification"
+      tags: "tags"
+      first_seen: "last_seen"
+      last_seen: "last_seen"
+      evidence: "message"
+  spamhaus_drop:
+    enabled: true
+    type: http
+    url: "https://api.spamhaus.org/api/v1/data/drop"
+    method: GET
+    timeout: 10
+    reliability: 0.9
+    weight: 0.9
+    freshness_ttl: 3600
+    response_map:
+      threat_score: "score"
+      tags: "tags"
+      first_seen: "first_seen"
+      last_seen: "last_seen"
+      evidence: "description"
+  urlhaus:
+    enabled: true
+    type: http
+    url: "https://urlhaus-api.abuse.ch/v1/host/"
+    method: POST
+    timeout: 10
+    reliability: 0.75
+    weight: 0.8
+    freshness_ttl: 1800
+    response_map:
+      threat_score: "threat"
+      tags: "tags"
+      first_seen: "first_seen"
+      last_seen: "last_seen"
+      evidence: "url"
+  feodo:
+    enabled: true
+    type: http
+    url: "https://feodotracker.abuse.ch/blocklist/?download=ipblocklist"
+    method: GET
+    timeout: 10
+    reliability: 0.9
+    weight: 1.0
+    freshness_ttl: 1800
+    response_map:
+      threat_score: "score"
+      tags: "tags"
+      first_seen: "first_seen"
+      last_seen: "last_seen"
+      evidence: "evidence"
+  sslbl:
+    enabled: true
+    type: http
+    url: "https://sslbl.abuse.ch/blacklist/sslipblacklist.csv"
+    method: GET
+    timeout: 10
+    reliability: 0.8
+    weight: 0.9
+    freshness_ttl: 1800
+    response_map:
+      threat_score: "score"
+      tags: "tags"
+      first_seen: "first_seen"
+      last_seen: "last_seen"
+      evidence: "reason"
+  cins:
+    enabled: true
+    type: http
+    url: "http://cinsscore.com/list/ci-badguys.txt"
+    method: GET
+    timeout: 10
+    reliability: 0.7
+    weight: 0.7
+    freshness_ttl: 1800
+    response_map:
+      threat_score: "score"
+      tags: "tags"
+      first_seen: "first_seen"
+      last_seen: "last_seen"
+      evidence: "description"
+weights:
+  abuseipdb: 1.0
+  virustotal: 1.0
+  alienvault: 0.8
+  greynoise: 0.7
+  spamhaus_drop: 0.9
+  threatfox: 0.9
+  urlhaus: 0.8
+  feodo: 0.7
+  sslbl: 0.7
+  cins: 0.6
 phase_d:
   workers: 8
   cache: {enabled: true, db_path: ./reconip_cache.db,

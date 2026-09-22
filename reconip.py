@@ -13,6 +13,7 @@ from dataclasses import dataclass, asdict, field
 from enum import Enum
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from abc import ABC, abstractmethod
 
 import yaml, requests, dns.resolver, dns.reversename, dns.exception
 try: import geoip2.database; GEOIP2 = True
@@ -678,6 +679,210 @@ def collect_passive_dns(target):
     except Exception as e:
         evidences.append(make_evidence(source="passive_dns", value=None, normalized_value=None, confidence=0.0, status="FAILED", ttl_key="passive_dns", metadata={"reason": str(e)}))
     return evidences
+
+# ============================================================
+#  SOURCE RELIABILITY ENGINE — v32 (Stage 3)
+# ============================================================
+class BaseProvider(ABC):
+    """
+    Abstract base class for all threat intelligence providers (Stage 3).
+    Each provider must implement query(target) -> Optional[Dict].
+    """
+    def __init__(self, name: str, config: Dict[str, Any]):
+        self.name = name
+        self.config = config or {}
+        self.enabled = self.config.get("enabled", True)
+        self.api_key_env = self.config.get("api_key_env")
+        self.api_key = os.getenv(self.api_key_env) if self.api_key_env else None
+        # Reliability metrics
+        self.reliability = float(self.config.get("reliability", 0.5))
+        self.weight = float(self.config.get("weight", 1.0))
+        # Runtime metrics
+        self.latency = None
+        self.last_success = None
+        self.error_rate = 0.0
+        self.total_queries = 0
+        self.failed_queries = 0
+        # Freshness
+        self.freshness_ttl = int(self.config.get("freshness_ttl", 1800))
+        self.logger = logging.getLogger(f"provider.{self.name}")
+
+    def is_configured(self) -> bool:
+        """Return True if the provider has all required configuration (e.g., API key)."""
+        if self.api_key_env and not self.api_key:
+            return False
+        return True
+
+    def record_success(self, latency: float):
+        self.latency = latency
+        self.last_success = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.total_queries += 1
+
+    def record_failure(self, error: str):
+        self.total_queries += 1
+        self.failed_queries += 1
+        self.error_rate = self.failed_queries / self.total_queries if self.total_queries else 0.0
+        self.logger.warning(f"Provider {self.name} failed: {error}")
+
+    def compute_confidence(self) -> float:
+        """Dynamic confidence based on reliability, error_rate, freshness."""
+        base = self.reliability
+        base *= (1.0 - self.error_rate)
+        if self.last_success is None:
+            base *= 0.5
+        return max(0.0, min(1.0, round(base, 3)))
+
+    @abstractmethod
+    def query(self, target: str) -> Optional[Dict[str, Any]]:
+        """Query provider for target. Must return dict with threat_score, tags, etc. Return None on failure."""
+        pass
+
+# Provider registry for Stage 3 (kept separate from legacy PROVIDERS list for compat)
+PROVIDERS: Dict[str, type] = {}
+PROVIDERS_REGISTRY: Dict[str, type] = {}
+
+class HTTPProvider(BaseProvider):
+    """
+    Generic provider that performs HTTP GET/POST to a configured URL (Stage 3).
+    Response expected JSON. Mapping via response_map dot notation.
+    """
+    def __init__(self, name: str, config: Dict[str, Any]):
+        super().__init__(name, config)
+        self.url_template = config.get("url", "")
+        self.method = config.get("method", "GET").upper()
+        self.headers = dict(config.get("headers", {}))
+        self.params = dict(config.get("params", {}))
+        self.timeout = int(config.get("timeout", 10))
+        self.response_map = dict(config.get("response_map", {}))
+
+    def query(self, target: str) -> Optional[Dict[str, Any]]:
+        if not self.is_configured():
+            self.logger.warning(f"Provider {self.name} not configured (missing API key).")
+            return None
+        url = self.url_template.format(target=target) if self.url_template else ""
+        if not url:
+            self.record_failure("no url")
+            return None
+        headers = self.headers.copy()
+        params = self.params.copy()
+        if self.api_key:
+            if self.config.get("api_key_header"):
+                headers[self.config["api_key_header"]] = self.api_key
+            elif self.config.get("api_key_param"):
+                params[self.config["api_key_param"]] = self.api_key
+        start = time.time()
+        try:
+            if self.method == "GET":
+                resp = requests.get(url, headers=headers, params=params, timeout=self.timeout)
+            else:
+                resp = requests.post(url, headers=headers, json=params, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            latency = time.time() - start
+            self.record_success(latency)
+            result = {}
+            for key, path in self.response_map.items():
+                result[key] = self._extract(data, path)
+            return result
+        except Exception as e:
+            self.record_failure(str(e))
+            return None
+
+    def _extract(self, data: Any, path: str) -> Any:
+        """Extract nested value via dot notation."""
+        cur = data
+        for part in path.split("."):
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            elif isinstance(cur, list) and part.isdigit():
+                try:
+                    cur = cur[int(part)]
+                except Exception:
+                    return None
+            else:
+                return None
+            if cur is None:
+                return None
+        return cur
+
+def load_providers(config: Dict[str, Any]) -> Dict[str, BaseProvider]:
+    """Instantiate all enabled providers from config (Stage 3)."""
+    providers: Dict[str, BaseProvider] = {}
+    for name, pconfig in (config.get("providers", {}) or {}).items():
+        if not pconfig.get("enabled", True):
+            continue
+        ptype = pconfig.get("type", "http")
+        if ptype == "http":
+            providers[name] = HTTPProvider(name, pconfig)
+            PROVIDERS_REGISTRY[name] = HTTPProvider
+        else:
+            logging.warning(f"Unknown provider type '{ptype}' for {name}")
+    return providers
+
+def load_api_keys(providers: Dict[str, BaseProvider]) -> None:
+    """Check required API keys and log warnings (Stage 3)."""
+    for name, provider in providers.items():
+        if provider.api_key_env and not provider.api_key:
+            logging.warning(f"API key for {name} not set. Set {provider.api_key_env} to enable.")
+
+def run_providers(target: str, providers: Dict[str, BaseProvider]) -> List[Evidence]:
+    """
+    Run all enabled providers and return List[Evidence] (Stage 3).
+    Each Evidence represents provider result with status OK/FAILED/NOT_CONFIGURED.
+    """
+    evidences: List[Evidence] = []
+    for name, provider in providers.items():
+        if not provider.enabled:
+            continue
+        if not provider.is_configured():
+            evidences.append(make_evidence(
+                source=name,
+                value=None,
+                normalized_value=None,
+                confidence=0.0,
+                status="NOT_CONFIGURED",
+                ttl_key="threat",
+                metadata={"reason": "missing API key", "api_key_env": provider.api_key_env, "data_type": "threat", "field": name}
+            ))
+            continue
+        result = provider.query(target)
+        if result is None:
+            evidences.append(make_evidence(
+                source=name,
+                value=None,
+                normalized_value=None,
+                confidence=0.0,
+                status="FAILED",
+                ttl_key="threat",
+                metadata={"error_rate": provider.error_rate, "latency": provider.latency, "data_type": "threat", "field": name}
+            ))
+            continue
+        conf = provider.compute_confidence()
+        evidences.append(make_evidence(
+            source=name,
+            value=result.get("threat_score"),
+            normalized_value=result.get("threat_score"),
+            confidence=conf,
+            status="OK",
+            ttl_key="threat",
+            metadata={
+                "reliability": provider.reliability,
+                "weight": provider.weight,
+                "latency": provider.latency,
+                "tags": result.get("tags", []),
+                "first_seen": result.get("first_seen"),
+                "last_seen": result.get("last_seen"),
+                "evidence": result.get("evidence", ""),
+                "error_rate": provider.error_rate,
+                "data_type": "threat",
+                "field": name
+            }
+        ))
+    return evidences
+
+def calculate_provider_confidence(provider: BaseProvider) -> float:
+    """Helper to compute provider confidence (Stage 3)."""
+    return provider.compute_confidence() if hasattr(provider, 'compute_confidence') else 0.5
 
 # ============================================================
 #  HEALTH + CIRCUIT + RATE LIMIT
@@ -4146,6 +4351,20 @@ def recon(target, enable_db=True, parallel=None):
     out["module_statuses"]["threat"] = threat_st
     out["phase_i"] = threat_agg
 
+    # Stage 3: Source Reliability Engine — run new providers (v32) with reliability/weight
+    stage3_threat_evs: List[Evidence] = []
+    try:
+        cfg_providers = load_providers(CFG)
+        load_api_keys(cfg_providers)
+        stage3_threat_evs = run_providers(ip, cfg_providers)
+        # Keep for evidence_engine; also optionally extend evs for legacy scoring (as Ev)
+        # Convert to Ev for downstream if needed, but keep separate to avoid double count
+        out["stage3_threat_evidences"] = [e.to_dict() for e in stage3_threat_evs]
+    except Exception as e:
+        log.debug(f"stage3 providers: {e}")
+        stage3_threat_evs = []
+        out["stage3_threat_evidences"] = []
+
     out["scan_status"] = agg_scan_status(out["module_statuses"])
     anycast = ip in CFG["geo_validation"]["anycast_ips"]
     cs = conflict_report(evs, anycast=anycast)
@@ -4303,6 +4522,16 @@ def recon(target, enable_db=True, parallel=None):
                 evidence_store.setdefault(ev.source, []).append(ev.to_dict())
     except Exception as e:
         log.debug(f"threat evidence: {e}")
+        pass
+    # Stage 3: merge new provider evidences (v32) — reliability, error_rate, confidence
+    try:
+        for ev in stage3_threat_evs:
+            # Avoid duplicates already added via threat_obs
+            if not any(e.get("source") == ev.source for e in evidence_flat):
+                evidence_flat.append(ev.to_dict())
+                evidence_store.setdefault(ev.source, []).append(ev.to_dict())
+    except Exception as e:
+        log.debug(f"stage3 merge: {e}")
         pass
     # Stage 2: ensure every field traceable — add evidence_engine and keep legacy evidence for compat
     out.update({
