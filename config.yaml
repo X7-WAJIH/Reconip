@@ -90,6 +90,19 @@ dns:
     mimecast: ["mimecast.com"]
     zoho: ["zoho.com"]
     yandex: ["yandex.net", "yandex.ru"]
+infrastructure:
+  include_peering: true
+  include_history: true
+  rdap_endpoint: "https://rdap.arin.net/registry/ip/{ip}"
+  asn_lookup_source: "team-cymru"
+  classify_asn: true
+  related_infrastructure: true
+  max_sibling_prefixes: 5
+  asn_type_patterns:
+    hosting: ["google", "amazon", "microsoft", "cloudflare", "akamai", "fastly", "hosting", "datacenter", "vps", "cloud"]
+    education: ["university", "college", "edu"]
+    government: ["government", "gov", "ministry"]
+    isp: ["telecom", "mobile", "broadband", "isp"]
 providers:
   abuseipdb:
     enabled: true

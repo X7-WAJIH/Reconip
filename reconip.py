@@ -217,7 +217,8 @@ DEFAULTS = {
                             "disagreement_penalty": 0.2, "score_range": [0, 100],
                             "provider_weights": {"abuseipdb": 1.0, "virustotal": 1.0, "alienvault": 0.8, "greynoise": 0.7, "spamhaus_drop": 0.9, "threatfox": 0.9, "urlhaus": 0.8, "feodo": 0.7, "sslbl": 0.7, "cins": 0.6}},
     "dns": {"records": ["A", "AAAA", "PTR", "NS", "MX", "TXT", "CAA", "SOA", "CNAME"], "ttl_analysis": True, "mail_analysis": True, "consistency_checks": True, "security_checks": True, "cname_chain_max_hops": 5, "low_ttl_threshold": 60, "high_ttl_threshold": 86400,
-           "known_mail_providers": {"google": ["google.com", "googlemail.com", "gmail.com"], "microsoft": ["outlook.com", "office365.com", "protection.outlook.com"], "cloudflare": ["cloudflare.net", "cloudflare.com"], "amazon": ["amazonaws.com", "ses.amazonaws.com"], "proofpoint": ["pphosted.com", "proofpoint.com"], "mimecast": ["mimecast.com"], "zoho": ["zoho.com"], "yandex": ["yandex.net", "yandex.ru"]}}
+           "known_mail_providers": {"google": ["google.com", "googlemail.com", "gmail.com"], "microsoft": ["outlook.com", "office365.com", "protection.outlook.com"], "cloudflare": ["cloudflare.net", "cloudflare.com"], "amazon": ["amazonaws.com", "ses.amazonaws.com"], "proofpoint": ["pphosted.com", "proofpoint.com"], "mimecast": ["mimecast.com"], "zoho": ["zoho.com"], "yandex": ["yandex.net", "yandex.ru"]}},
+    "infrastructure": {"include_peering": True, "include_history": True, "rdap_endpoint": "https://rdap.arin.net/registry/ip/{ip}", "asn_lookup_source": "team-cymru", "classify_asn": True, "related_infrastructure": True, "max_sibling_prefixes": 5, "asn_type_patterns": {"hosting": ["google", "amazon", "microsoft", "cloudflare", "akamai", "fastly", "hosting", "datacenter", "vps", "cloud"], "education": ["university", "college", "edu"], "government": ["government", "gov", "ministry"], "isp": ["telecom", "mobile", "broadband", "isp"]}}
 }
 
 def deep_merge(a, b):
@@ -1437,6 +1438,280 @@ def collect_rdap(ip):
                         ev = make_evidence(source="rdap", value=it[3], normalized_value=str(it[3]).strip().lower(), confidence=0.9, status="OK", ttl_key="whois", metadata={"field": "abuse_email", "data_type": "rdap", "target": ip, "raw_value": it[3]})
                         evs.append(ev)
     return evs, MS.SUCCESS.value if evs else MS.PARTIAL.value
+
+# ============================================================
+#  INFRASTRUCTURE INTELLIGENCE — v33.1 (Stage 6)
+# ============================================================
+def _resolve_to_ip(target: str) -> Optional[str]:
+    """Return the target as an IP string. If domain, resolve to first A record (Stage 6)."""
+    try:
+        ipaddress.ip_address(target)
+        return target
+    except ValueError:
+        pass
+    try:
+        import dns.resolver
+        answers = dns.resolver.resolve(target, "A", raise_on_no_answer=False)
+        if answers and answers.rrset:
+            return answers[0].to_text()
+    except Exception:
+        pass
+    return None
+
+def _classify_asn(asn_name: str) -> str:
+    """Classify ASN type based on name patterns (Stage 6)."""
+    name = asn_name.lower()
+    if any(k in name for k in ["google", "amazon", "microsoft", "cloudflare", "akamai", "fastly"]):
+        return "hosting"
+    if any(k in name for k in ["university", "college", "edu"]):
+        return "education"
+    if any(k in name for k in ["government", "gov", "ministry"]):
+        return "government"
+    if any(k in name for k in ["telecom", "mobile", "broadband", "isp"]):
+        return "isp"
+    if any(k in name for k in ["hosting", "datacenter", "vps", "cloud"]):
+        return "hosting"
+    return "unknown"
+
+def asn_analysis(ip: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Query ASN information for an IP via Team Cymru DNS (Stage 6, no API key).
+    """
+    result: Dict[str, Any] = {
+        "asn": None,
+        "asn_name": None,
+        "country": None,
+        "type": "unknown",
+        "source": "team-cymru",
+        "confidence": 0.0
+    }
+    try:
+        import dns.resolver
+        rev = ".".join(reversed(ip.split(".")))
+        query = f"{rev}.origin.asn.cymru.com"
+        answers = dns.resolver.resolve(query, "TXT", raise_on_no_answer=False)
+        if answers and answers.rrset:
+            txt = answers[0].to_text().strip('"')
+            parts = [p.strip() for p in txt.split("|")]
+            if len(parts) >= 5:
+                try:
+                    result["asn"] = int(parts[0])
+                except Exception:
+                    result["asn"] = parts[0]
+                result["prefix"] = parts[1]
+                result["country"] = parts[2]
+                result["rir"] = parts[3]
+                result["allocated"] = parts[4]
+                result["confidence"] = 0.95
+    except Exception as e:
+        result["error"] = str(e)
+    if result.get("asn"):
+        try:
+            import dns.resolver
+            query = f"AS{result['asn']}.asn.cymru.com"
+            answers = dns.resolver.resolve(query, "TXT", raise_on_no_answer=False)
+            if answers and answers.rrset:
+                txt = answers[0].to_text().strip('"')
+                parts = [p.strip() for p in txt.split("|")]
+                if len(parts) >= 5:
+                    result["asn_name"] = parts[4]
+        except Exception:
+            pass
+    result["type"] = _classify_asn(result.get("asn_name", "") or "")
+    return result
+
+def prefix_analysis(ip: str, config: Dict[str, Any], asn_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Analyze the prefix containing the IP (Stage 6)."""
+    result: Dict[str, Any] = {
+        "prefix": None,
+        "netrange": None,
+        "cidr": None,
+        "prefix_length": None,
+        "host_count": None,
+        "rir": None,
+        "allocated": None,
+        "confidence": 0.0
+    }
+    if asn_data.get("prefix"):
+        result["prefix"] = asn_data["prefix"]
+        try:
+            net = ipaddress.ip_network(asn_data["prefix"], strict=False)
+            result["cidr"] = str(net)
+            result["prefix_length"] = net.prefixlen
+            result["host_count"] = net.num_addresses
+            result["netrange"] = f"{net.network_address} - {net.broadcast_address}"
+        except Exception:
+            pass
+    if asn_data.get("rir"):
+        result["rir"] = asn_data["rir"]
+    if asn_data.get("allocated"):
+        result["allocated"] = asn_data["allocated"]
+    if result["prefix"]:
+        result["confidence"] = 0.9
+    return result
+
+def _rdap_lookup(ip: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Query RDAP for IP information via ARIN (Stage 6)."""
+    result: Dict[str, Any] = {
+        "handle": None,
+        "name": None,
+        "country": None,
+        "org": None,
+        "abuse_email": None,
+        "netrange": None,
+        "cidr": None,
+        "created": None,
+        "updated": None,
+        "status": [],
+        "confidence": 0.0,
+        "source": "rdap"
+    }
+    try:
+        url = f"https://rdap.arin.net/registry/ip/{ip}"
+        timeout = 10
+        try:
+            timeout = int(config.get("timeouts", {}).get("http", 10))
+        except Exception:
+            pass
+        resp = requests.get(url, timeout=timeout, headers={"Accept": "application/rdap+json"})
+        if resp.status_code != 200:
+            result["error"] = f"RDAP HTTP {resp.status_code}"
+            return result
+        data = resp.json()
+        result["handle"] = data.get("handle")
+        result["name"] = data.get("name")
+        for entity in data.get("entities", []):
+            if "registrant" in entity.get("roles", []):
+                vcard = entity.get("vcardArray", [])
+                if len(vcard) > 1:
+                    for item in vcard[1]:
+                        if item[0] == "fn":
+                            result["org"] = item[3]
+                        if item[0] == "adr":
+                            if isinstance(item[3], list) and len(item[3]) >= 7:
+                                result["country"] = item[3][6]
+        for entity in data.get("entities", []):
+            if "abuse" in entity.get("roles", []):
+                vcard = entity.get("vcardArray", [])
+                if len(vcard) > 1:
+                    for item in vcard[1]:
+                        if item[0] == "email":
+                            result["abuse_email"] = item[3]
+        for event in data.get("events", []):
+            if event.get("eventAction") == "registration":
+                result["created"] = event.get("eventDate")
+            elif event.get("eventAction") == "last changed":
+                result["updated"] = event.get("eventDate")
+        cidr0 = data.get("cidr0_cidrs", [])
+        if cidr0:
+            c = cidr0[0]
+            result["cidr"] = f"{c.get('v4prefix')}/{c.get('length')}"
+            result["netrange"] = result["cidr"]
+        result["status"] = data.get("status", [])
+        result["confidence"] = 0.9
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+def _extract_organization(rdap_data: Dict[str, Any], asn_data: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "name": rdap_data.get("org") or asn_data.get("asn_name"),
+        "handle": rdap_data.get("handle"),
+        "country": rdap_data.get("country") or asn_data.get("country"),
+        "abuse_email": rdap_data.get("abuse_email"),
+        "source": "rdap+asn",
+        "confidence": 0.9 if rdap_data.get("org") else 0.7
+    }
+
+def _extract_origin(rdap_data: Dict[str, Any], asn_data: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "origin_asn": asn_data.get("asn"),
+        "origin_as_name": asn_data.get("asn_name"),
+        "routing_status": "unknown",
+        "source": "asn",
+        "confidence": 0.85 if asn_data.get("asn") else 0.0
+    }
+
+def related_infrastructure(ip: str, asn_data: Dict[str, Any], prefix_data: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Find related infrastructure: sibling prefixes, related ASNs, shared nameservers (Stage 6).
+    """
+    result: Dict[str, Any] = {
+        "sibling_prefixes": [],
+        "related_asns": [],
+        "shared_nameservers": [],
+        "notes": []
+    }
+    if prefix_data.get("prefix"):
+        try:
+            net = ipaddress.ip_network(prefix_data["prefix"], strict=False)
+            supernet = net.supernet(prefixlen_diff=1)
+            result["sibling_prefixes"].append(str(supernet))
+            if net.prefixlen > 24:
+                parent = ipaddress.ip_network(f"{ip}/24", strict=False)
+                result["sibling_prefixes"].append(str(parent))
+        except Exception:
+            pass
+    org_name = asn_data.get("asn_name", "") or ""
+    if org_name:
+        result["notes"].append(f"ASN name '{org_name}' may be related to other ASNs in the same organization.")
+    return result
+
+def _infra_history(rdap_data: Dict[str, Any], asn_data: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "allocated": asn_data.get("allocated"),
+        "rdap_created": rdap_data.get("created"),
+        "rdap_updated": rdap_data.get("updated"),
+        "change_detected": False,
+        "notes": []
+    }
+
+def _peering_info(asn_data: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "asn": asn_data.get("asn"),
+        "peers": [],
+        "upstreams": [],
+        "source": "none",
+        "confidence": 0.0,
+        "note": "Peering data requires external BGP source."
+    }
+
+def infra_profile(target: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build an Infrastructure Profile for an IP or domain target (Stage 6).
+    Steps: resolve → ASN → prefix → RDAP → org → origin → related → history → peering
+    """
+    infra_cfg = config.get("infrastructure", {}) or {}
+    include_peering = infra_cfg.get("include_peering", True)
+    include_history = infra_cfg.get("include_history", True)
+    ip = _resolve_to_ip(target)
+    if not ip:
+        return {
+            "status": "FAILED",
+            "reason": "Could not resolve target to an IP address.",
+            "ip": None
+        }
+    asn_data = asn_analysis(ip, config)
+    prefix_data = prefix_analysis(ip, config, asn_data)
+    rdap_data = _rdap_lookup(ip, config)
+    org_data = _extract_organization(rdap_data, asn_data)
+    origin_data = _extract_origin(rdap_data, asn_data)
+    related = related_infrastructure(ip, asn_data, prefix_data, config)
+    history: Dict[str, Any] = {}
+    if include_history:
+        history = _infra_history(rdap_data, asn_data)
+    return {
+        "status": "OK",
+        "ip": ip,
+        "asn": asn_data,
+        "prefix": prefix_data,
+        "rdap": rdap_data,
+        "organization": org_data,
+        "origin": origin_data,
+        "related_infrastructure": related,
+        "history": history,
+        "peering": _peering_info(asn_data, config) if include_peering else {}
+    }
 
 # ============================================================
 #  DNS
@@ -5125,6 +5400,14 @@ def recon(target, enable_db=True, parallel=None):
     rels = build_rels(ents, evs, ip)
     ni = network_intel(ip, domain, evs, trusted, cert_ci)
 
+    # Stage 6: Infrastructure Intelligence — v33.1
+    try:
+        infra = infra_profile(target, CFG)
+        out["infrastructure_intelligence"] = infra
+    except Exception as e:
+        log.debug(f"infra profile: {e}")
+        out["infrastructure_intelligence"] = {"status": "FAILED", "reason": str(e), "ip": ip}
+
     # Passive OSINT enrichment (v21.2) — B4 fix with public resolver / anycast check
     try:
         rev_raw = PassiveOSINT.hackertarget_reverse_ip(ip)
@@ -5789,6 +6072,38 @@ def render_text(d):
                 out.append(f"   {_c('ANOMALIES', C.WARN).ljust(14)} {len(anomalies)}")
                 for an in anomalies[:3]:
                     out.append(f"     {_c('['+an.get('severity','')+']', _severity_color(an.get('severity','')))} {an.get('type')} - {an.get('message')[:60]}")
+            out.append(_section_footer())
+
+    # [05a1] INFRASTRUCTURE INTELLIGENCE — v33.1 (Stage 6)
+    infra = d.get("infrastructure_intelligence") or {}
+    if infra:
+        if infra.get("status") == "OK":
+            out.append(_section_header("05a1", "Infrastructure Intelligence"))
+            asn = infra.get("asn") or {}
+            out.append(f"   {_c('ASN', C.KEY).ljust(14)} {_c(str(asn.get('asn', 'n/a')), C.VAL)} {_c(str(asn.get('asn_name',''))[:50], C.GRY)}")
+            out.append(f"   {_c('TYPE', C.KEY).ljust(14)} {_c(str(asn.get('type','')), C.VAL)}")
+            prefix = infra.get("prefix") or {}
+            out.append(f"   {_c('PREFIX', C.KEY).ljust(14)} {_c(str(prefix.get('prefix','n/a')), C.VAL)}")
+            out.append(f"   {_c('RIR', C.KEY).ljust(14)} {_c(str(prefix.get('rir','n/a')), C.VAL)}")
+            org = infra.get("organization") or {}
+            out.append(f"   {_c('ORG', C.KEY).ljust(14)} {_c(str(org.get('name','n/a')), C.VAL)}")
+            if org.get("abuse_email"):
+                out.append(f"   {_c('ABUSE', C.KEY).ljust(14)} {_c(str(org.get('abuse_email')), C.CYN)}")
+            origin = infra.get("origin") or {}
+            out.append(f"   {_c('ORIGIN', C.KEY).ljust(14)} {_c(str(origin.get('origin_asn','n/a')), C.VAL)}")
+            related = infra.get("related_infrastructure") or {}
+            if related.get("sibling_prefixes"):
+                out.append(f"   {_c('SIBLINGS', C.KEY).ljust(14)} {_c(', '.join(related['sibling_prefixes'][:3]), C.VAL)}")
+            hist = infra.get("history") or {}
+            if hist.get("allocated"):
+                out.append(f"   {_c('ALLOCATED', C.KEY).ljust(14)} {_c(str(hist.get('allocated')), C.VAL)}")
+            peering = infra.get("peering") or {}
+            if peering.get("note"):
+                out.append(f"   {_c('PEERING', C.KEY).ljust(14)} {_c(str(peering.get('note')), C.GRY)}")
+            out.append(_section_footer())
+        elif infra.get("status") == "FAILED":
+            out.append(_section_header("05a1", "Infrastructure Intelligence"))
+            out.append(f"   {_c('STATUS', C.FAIL)} {infra.get('reason','')}")
             out.append(_section_footer())
 
     # [05b] PASSIVE OSINT — B2, B4, B5 fixes integrated
