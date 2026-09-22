@@ -41,6 +41,20 @@ source_reliability:
 freshness:
   thresholds: {fresh: 300, recent: 3600, aging: 86400, stale: 604800}
   weights: {fresh: 1.0, recent: 0.9, aging: 0.7, stale: 0.4, unknown: 0.5}
+evidence:
+  freshness_ttl:
+    dns: 3600       # 1 hour
+    whois: 86400    # 24 hours
+    threat: 1800    # 30 minutes
+    ct: 86400       # 24 hours
+    passive_dns: 3600
+  default_ttl: 3600
+  confidence_defaults:
+    dns: 0.95
+    whois: 0.85
+    ct: 0.9
+    threat: 0.5
+    passive_dns: 0.6
 phase_d:
   workers: 8
   cache: {enabled: true, db_path: ./reconip_cache.db,
