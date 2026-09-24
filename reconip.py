@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """ReconIP v21.2 — OSINT/CTI Platform"""
 import argparse, sys, os, re, json, time, logging, socket, ssl
+import base64
+import csv, io
 import ipaddress, subprocess, hashlib, math, asyncio, sqlite3
 import threading, uuid, random, shutil, signal, pathlib
 import hmac, urllib.request, urllib.error, urllib.parse
 import html as _html
-from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from urllib.parse import urlparse
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Set, Tuple
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, asdict, field
 from enum import Enum
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from abc import ABC, abstractmethod
+import contextvars
 
 import yaml, requests, dns.resolver, dns.reversename, dns.exception, dns.rdatatype
 try: import geoip2.database; GEOIP2 = True
@@ -22,8 +26,60 @@ try:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes as _ch
     from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, ec as _ec, dsa as _dsa, ed25519 as _ed, ed448 as _ed4
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa, ec, dsa
+    from cryptography.x509.oid import NameOID
     CRYPTO = True
-except ImportError: CRYPTO = False
+except ImportError:
+    CRYPTO = False
+    try:
+        from cryptography.x509.oid import NameOID  # type: ignore
+    except Exception:
+        NameOID = None  # type: ignore
+    try:
+        from cryptography.hazmat.primitives import serialization  # type: ignore
+    except Exception:
+        serialization = None  # type: ignore
+
+# ============================================================
+#  AUTH PROVIDER REGISTRY — Stage A2
+#  Context-local reference to the active providers dict so
+#  _lookup_env_for() can resolve env var names without changing
+#  _log_auth_summary() signatures. Safe across threads.
+# ============================================================
+_PROVIDERS_REGISTRY: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = \
+    contextvars.ContextVar("_PROVIDERS_REGISTRY", default=None)
+
+
+def _set_providers_registry(providers: Optional[Dict[str, Any]]) -> None:
+    """Publish the active providers dict for auth diagnostics (Stage A2)."""
+    try:
+        _PROVIDERS_REGISTRY.set(providers)
+    except Exception:
+        pass
+
+
+def _lookup_env_for(provider_name: str) -> Optional[str]:
+    """
+    Look up the env var name declared for a provider (Stage A2).
+
+    Returns None when the registry is unavailable, in which case
+    callers fall back to logging only the provider name.
+    """
+    try:
+        providers = _PROVIDERS_REGISTRY.get()
+    except Exception:
+        return None
+    if not isinstance(providers, dict):
+        return None
+    try:
+        p = providers.get(provider_name)
+    except Exception:
+        return None
+    try:
+        return getattr(p, "auth_env", None) or None
+    except Exception:
+        return None
 
 # ============================================================
 #  ANSI COLOR ENGINE — HACKER THEME
@@ -86,6 +142,10 @@ def _banner():
     pad = (w - 4 - len(sub)) // 2
     lines.append(C.DRED + "║ " + C.RST + C.RED + " " * pad + sub +
                  " " * (w - 4 - len(sub) - pad) + C.RST + C.DRED + " ║" + C.RST)
+    sig = "X7  •  X7Λ†ΞX"
+    pad = (w - 4 - len(sig)) // 2
+    lines.append(C.DRED + "║ " + C.RST + C.GRY + " " * pad + sig +
+                 " " * (w - 4 - len(sig) - pad) + C.RST + C.DRED + " ║" + C.RST)
     lines.append(C.DRED + "╚" + "═" * (w - 2) + "╝" + C.RST)
     return "\n".join(lines)
 
@@ -218,7 +278,23 @@ DEFAULTS = {
                             "provider_weights": {"abuseipdb": 1.0, "virustotal": 1.0, "alienvault": 0.8, "greynoise": 0.7, "spamhaus_drop": 0.9, "threatfox": 0.9, "urlhaus": 0.8, "feodo": 0.7, "sslbl": 0.7, "cins": 0.6}},
     "dns": {"records": ["A", "AAAA", "PTR", "NS", "MX", "TXT", "CAA", "SOA", "CNAME"], "ttl_analysis": True, "mail_analysis": True, "consistency_checks": True, "security_checks": True, "cname_chain_max_hops": 5, "low_ttl_threshold": 60, "high_ttl_threshold": 86400,
            "known_mail_providers": {"google": ["google.com", "googlemail.com", "gmail.com"], "microsoft": ["outlook.com", "office365.com", "protection.outlook.com"], "cloudflare": ["cloudflare.net", "cloudflare.com"], "amazon": ["amazonaws.com", "ses.amazonaws.com"], "proofpoint": ["pphosted.com", "proofpoint.com"], "mimecast": ["mimecast.com"], "zoho": ["zoho.com"], "yandex": ["yandex.net", "yandex.ru"]}},
-    "infrastructure": {"include_peering": True, "include_history": True, "rdap_endpoint": "https://rdap.arin.net/registry/ip/{ip}", "asn_lookup_source": "team-cymru", "classify_asn": True, "related_infrastructure": True, "max_sibling_prefixes": 5, "asn_type_patterns": {"hosting": ["google", "amazon", "microsoft", "cloudflare", "akamai", "fastly", "hosting", "datacenter", "vps", "cloud"], "education": ["university", "college", "edu"], "government": ["government", "gov", "ministry"], "isp": ["telecom", "mobile", "broadband", "isp"]}}
+    "infrastructure": {"include_peering": True, "include_history": True, "rdap_endpoint": "https://rdap.arin.net/registry/ip/{ip}", "asn_lookup_source": "team-cymru", "classify_asn": True, "related_infrastructure": True, "max_sibling_prefixes": 5, "asn_type_patterns": {"hosting": ["google", "amazon", "microsoft", "cloudflare", "akamai", "fastly", "hosting", "datacenter", "vps", "cloud"], "education": ["university", "college", "edu"], "government": ["government", "gov", "ministry"], "isp": ["telecom", "mobile", "broadband", "isp"]}},
+    "certificate": {"include_expired": True, "include_san": True, "include_fingerprint": True, "live_handshake": True, "ct_source": "crt.sh", "ct_timeout": 15, "near_expiry_days": 30, "weak_algorithms": ["sha1", "md5"], "min_rsa_key_size": 2048, "max_wildcards_before_warning": 5, "max_shared_san_before_warning": 3, "ignore_private_certs": False},
+    "passive_dns": {"timeline": True, "churn_threshold": 5, "active_window_days": 30, "short_lived_days": 7, "max_related_domains": 50, "max_churn_domains": 20, "sources": []},
+    "history": {"enabled": True, "db_path": "reconip.db", "compare_fields": ["dns", "asn", "prefix", "certificate", "whois", "threat", "domains"], "severity_map": {"certificate.fingerprint_sha256": "critical", "certificate.issuer_cn": "high", "asn.asn": "critical", "asn.asn_name": "moderate", "prefix.cidr": "high", "prefix.rir": "moderate", "dns.NS": "high", "dns.MX": "moderate", "dns.A": "moderate", "dns.AAAA": "moderate", "dns.TXT": "low", "dns.CAA": "low", "whois.abuse_email": "critical", "whois.org": "moderate", "whois.country": "moderate", "threat.observed_threat_score": "high", "threat.threat_confidence": "high", "domains": "low"}, "max_changes_in_report": 100},
+    "anomaly": {"enabled": True, "checks": ["dns", "cert", "asn", "history", "infra", "provider", "stale"], "max_stale_seconds": 86400, "max_anomalies_in_report": 200, "severity_buckets": {"informational": 0, "low": 1, "moderate": 2, "high": 3}},
+    "correlation": {"enabled": True, "min_shared": 1, "include_nodes": True, "include_edges": True, "max_shared_in_report": 100, "max_related_targets": 50, "node_types": ["ip", "asn", "prefix", "organization", "domain", "nameserver", "mailserver", "certificate", "san", "passive_dns_domain", "history", "threat_intel"], "edge_types": ["belongs_to_asn", "in_prefix", "announces", "owned_by", "resolves_to", "has_ptr", "has_nameserver", "has_mailserver", "has_cname", "uses_certificate", "certificate_covers", "appears_in_passive_dns", "has_history", "has_threat_intel"], "notes": ["A shared relationship indicates shared infrastructure, not shared intent.", "Shared ASN, prefix, or nameserver may be normal for CDNs, hosting providers, or cloud platforms.", "Shared certificate is a stronger signal of shared ownership, but can also be a shared CDN certificate.", "Correlation is evidence, not a verdict. Always validate before drawing conclusions."]},
+    "vulnerability": {"enabled": True, "require_validation": True, "use_nvd_api": False, "nvd_api_key_env": "NVD_API_KEY", "min_technology_confidence": 0.7, "max_candidates": 50, "severity_buckets": {"critical": 9.0, "high": 7.0, "medium": 4.0, "low": 0.0}, "notes": ["A CVE matching a version is a CANDIDATE, not a confirmation.", "A candidate is not a vulnerability.", "A vulnerability is not an exploit.", "An exploit is not an impact.", "Validation on the target is required before any conclusion."]},
+    "fingerprinting": {"enabled": True, "min_confidence": 0.7, "active_banner_grab": False, "passive_hints": True, "http_head_request": False, "tls_extension_probe": False, "ssh_banner": False, "smtp_banner": False, "dns_version_probe": False, "max_banner_length": 4096, "notes": ["A banner is a hint, not a fact.", "A version is a claim, not a certainty.", "If evidence is insufficient, the tool returns UNKNOWN.", "Active banner grabbing is disabled by default."]},
+    "attack_surface": {"enabled": True, "port_scan": False, "authorized": False, "authorized_targets": [], "include_sensitive": True, "max_services_in_report": 200, "imported_services": [], "notes": ["OPEN \u2260 VULNERABLE.", "A detected service is not a confirmed vulnerability.", "Active scanning is disabled by default.", "No exploitation is performed."]},
+    "timeouts": {"default": 10, "dns": 5, "http": 10},
+    "confidence": {"enabled": True, "separate": True, "weights": {"data": 0.4, "threat": 0.3, "geo": 0.2, "assessment": 0.1}, "data_weights": {"freshness": 0.4, "status": 0.3, "coverage": 0.3}, "threat_weights": {"coverage": 0.4, "agreement": 0.3, "freshness": 0.3}, "geo_weights": {"country_agreement": 0.5, "field_availability": 0.5}, "labels": {"high": 0.85, "moderate": 0.65, "low": 0.40, "very_low": 0.0}, "notes": ["Confidence is not accuracy.", "Confidence is not certainty.", "Confidence is the tool's own estimation of how much it knows.", "A low-confidence report is not a bad report — it is an honest one."]},
+    "scoring": {"enabled": True, "explain": True, "weights": {"threat": 1.0, "infra": 0.8, "data_quality": 0.6, "exposure": 0.7, "anomaly": 0.5, "coverage": 0.4}, "labels": {"very_low": 0.0, "low": 20.0, "moderate": 40.0, "high": 60.0, "very_high": 80.0}, "notes": ["A score is not a verdict.", "A score is not a fact.", "A score is an explainable estimate.", "Every score must answer: WHY this number?"]},
+    "reports": {"default_format": "html", "output_dir": "reports/", "include_raw": False, "classification": "UNCLASSIFIED", "formats": ["json", "html", "markdown", "csv", "stix", "misp"], "sections": ["target", "executive", "data_quality", "network", "dns", "cert", "passive_dns", "history", "threat", "correlation", "attack_surface", "technology", "vuln", "anomalies", "evidence", "confidence", "limitations", "next"], "max_anomalies_in_html": 100, "max_candidates_in_html": 50, "notes": ["The report is evidence-driven.", "It does not claim compromise, exploitation, or impact.", "Every finding must be validated in context."]},
+    "version": "v42.1",
+    "batch": {"enabled": True, "max_workers": 4, "max_workers_hard_limit": 16, "max_targets": 1000, "correlate": True, "quiet": False, "input_file": {"allow_comments": True, "allow_blank_lines": True, "strip_whitespace": True}, "notes": ["Each target is processed in isolation.", "One target's failure does not affect another.", "Cross-target correlation is evidence-driven.", "A shared relationship across targets is not shared intent."]},
+    "performance": {"parallel": True, "max_workers": 8, "timeout_budget": 30, "min_timeout_budget": 10, "max_timeout_budget": 120, "default_min_interval": 0.0, "rate_limits": {"abuseipdb": 2.0, "virustotal": 15.0, "threatfox": 1.0, "alienvault": 6.0, "greynoise": 3.0, "spamhaus_drop": 5.0, "urlhaus": 2.0, "feodo": 2.0, "sslbl": 2.0, "cins": 2.0}, "priority_weights": {"reliability": 0.5, "weight": 0.3, "configured_bonus": 0.2}, "circuit_breaker": {"error_rate_threshold": 0.8, "penalty": 1.0}, "cache": {"enabled": True, "ttl_seconds": 3600}, "notes": ["Speed is a property of execution, not a property of evidence.", "Every provider still returns an Evidence object.", "Failed providers are never silently skipped.", "Rate limits are enforced locally per provider.", "Timeout budget caps total provider time."]},
+    "cache": {"enabled": True, "db_path": "reconip_cache.db", "ttl_seconds": 3600, "stale_threshold": 7200, "expired_threshold": 86400, "purge_expired": True, "cache_failures": False, "cache_provider_results": True, "cache_dns": True, "cache_whois": True, "cache_certificates": True, "cache_passive_dns": True, "provider_ttls": {"abuseipdb": 1800, "virustotal": 3600, "alienvault": 3600, "greynoise": 1800, "spamhaus_drop": 7200, "threatfox": 1800, "urlhaus": 1800, "feodo": 3600, "sslbl": 3600, "cins": 3600}, "section_ttls": {"dns": 3600, "whois": 86400, "certificate": 86400, "passive_dns": 3600}, "notes": ["Cache is a memory, not a source of truth.", "FRESH cache may skip a query.", "STALE cache is marked and used only as fallback.", "EXPIRED cache is never used.", "Failed providers are never cached."]},
 }
 
 def deep_merge(a, b):
@@ -689,6 +765,63 @@ def collect_passive_dns(target):
 # ============================================================
 #  SOURCE RELIABILITY ENGINE — v32 (Stage 3)
 # ============================================================
+# ============================================================
+#  AUTH SUPPORT — v44.5 (Stage R4)
+#  Declarative, config-driven authentication. Secrets live in
+#  environment variables only and are scrubbed from logs/evidence.
+# ============================================================
+_LOADED_SECRETS: set = set()
+_SECRETS_LOCK = threading.Lock()
+
+
+def _register_secret(secret: Optional[str]) -> None:
+    """
+    Register a secret for scrubbing. No-op if secret is None or empty.
+    """
+    if secret and isinstance(secret, str) and len(secret) >= 4:
+        try:
+            with _SECRETS_LOCK:
+                _LOADED_SECRETS.add(secret)
+        except Exception:
+            _LOADED_SECRETS.add(secret)
+
+
+def _scrub(text: Any) -> Any:
+    """
+    Replace any registered secret in a string with '***REDACTED***'.
+    Non-strings are returned unchanged.
+    """
+    if not isinstance(text, str):
+        return text
+    try:
+        secrets = list(_LOADED_SECRETS)
+    except Exception:
+        return text
+    for s in secrets:
+        if s and s in text:
+            text = text.replace(s, "***REDACTED***")
+    return text
+
+
+def _scrub_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Recursively scrub secrets from a dict. Returns a new dict.
+    """
+    if not isinstance(d, dict):
+        return d
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        if isinstance(v, str):
+            out[k] = _scrub(v)
+        elif isinstance(v, dict):
+            out[k] = _scrub_dict(v)
+        elif isinstance(v, list):
+            out[k] = [_scrub(x) if isinstance(x, str) else x for x in v]
+        else:
+            out[k] = v
+    return out
+
+
 class BaseProvider(ABC):
     """
     Abstract base class for all threat intelligence providers (Stage 3).
@@ -698,37 +831,92 @@ class BaseProvider(ABC):
         self.name = name
         self.config = config or {}
         self.enabled = self.config.get("enabled", True)
-        self.api_key_env = self.config.get("api_key_env")
-        self.api_key = os.getenv(self.api_key_env) if self.api_key_env else None
-        # Reliability metrics
+
+        # ---- Auth declaration (Stage R4: declarative, config-driven) ----
+        self.auth_type = (self.config.get("auth_type") or "api_key_header").lower()
+        self.auth_header = self.config.get("auth_header")
+        self.auth_param = self.config.get("auth_param")
+        self.auth_env = self.config.get("api_key_env")
+        self.api_key = os.getenv(self.auth_env) if self.auth_env else None
+
+        # Register for scrubbing
+        if self.api_key:
+            _register_secret(self.api_key)
+
+        # ---- Reliability metrics ----
         self.reliability = float(self.config.get("reliability", 0.5))
         self.weight = float(self.config.get("weight", 1.0))
         # Runtime metrics
-        self.latency = None
-        self.last_success = None
+        self.latency: Optional[float] = None
+        self.last_success: Optional[str] = None
         self.error_rate = 0.0
         self.total_queries = 0
         self.failed_queries = 0
         # Freshness
         self.freshness_ttl = int(self.config.get("freshness_ttl", 1800))
+        self.last_error: Optional[str] = None
+
         self.logger = logging.getLogger(f"provider.{self.name}")
 
     def is_configured(self) -> bool:
-        """Return True if the provider has all required configuration (e.g., API key)."""
-        if self.api_key_env and not self.api_key:
+        """
+        A provider is configured if:
+          - auth_type == 'none', OR
+          - auth_type requires a key AND the env var is set
+        """
+        if (self.auth_type or "api_key_header").lower() == "none":
+            return True
+        if not self.auth_env:
             return False
-        return True
+        return bool(self.api_key)
+
+    def _build_auth(self,
+                    headers: Dict[str, str],
+                    params: Dict[str, Any]) -> None:
+        """
+        Inject authentication into headers and/or params based on auth_type.
+
+        Mutates headers and params in place. Does NOT log or return secrets.
+        """
+        if not self.api_key:
+            return
+
+        at = (self.auth_type or "api_key_header").lower()
+
+        if at == "api_key_header":
+            header_name = self.auth_header or self.config.get("api_key_header") or "Authorization"
+            headers[header_name] = self.api_key
+
+        elif at == "api_key_param":
+            param_name = self.auth_param or self.config.get("api_key_param") or "key"
+            params[param_name] = self.api_key
+
+        elif at == "bearer_token":
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        elif at == "basic_auth":
+            # api_key must be "user:pass"
+            token = base64.b64encode(self.api_key.encode("utf-8")).decode("ascii")
+            headers["Authorization"] = f"Basic {token}"
+
+        elif at == "none":
+            return
+
+        else:
+            raise ValueError(f"Unknown auth_type: {self.auth_type}")
 
     def record_success(self, latency: float):
         self.latency = latency
         self.last_success = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.total_queries += 1
 
-    def record_failure(self, error: str):
+    def record_failure(self, error: str) -> None:
         self.total_queries += 1
         self.failed_queries += 1
         self.error_rate = self.failed_queries / self.total_queries if self.total_queries else 0.0
-        self.logger.warning(f"Provider {self.name} failed: {error}")
+        scrubbed = _scrub(error)
+        self.last_error = scrubbed
+        self.logger.warning(f"Provider {self.name} failed: {scrubbed}")
 
     def compute_confidence(self) -> float:
         """Dynamic confidence based on reliability, error_rate, freshness."""
@@ -762,37 +950,260 @@ class HTTPProvider(BaseProvider):
         self.response_map = dict(config.get("response_map", {}))
 
     def query(self, target: str) -> Optional[Dict[str, Any]]:
+        """
+        Query the provider with format-aware parsing.
+
+        Returns:
+          - dict: successful parse (may be {} for "not in list")
+          - None: provider failure
+        """
         if not self.is_configured():
-            self.logger.warning(f"Provider {self.name} not configured (missing API key).")
+            self.last_error = "not_configured"
             return None
+
         url = self.url_template.format(target=target) if self.url_template else ""
         if not url:
             self.record_failure("no url")
             return None
-        headers = self.headers.copy()
-        params = self.params.copy()
-        if self.api_key:
-            if self.config.get("api_key_header"):
-                headers[self.config["api_key_header"]] = self.api_key
-            elif self.config.get("api_key_param"):
-                params[self.config["api_key_param"]] = self.api_key
+        headers = dict(self.headers)
+        params = {}
+        for k, v in (dict(self.params) or {}).items():
+            if isinstance(v, str):
+                try:
+                    params[k] = v.format(target=target)
+                except Exception:
+                    params[k] = v
+            else:
+                params[k] = v
+
+        # ---- Auth (Stage R4: declarative per-request injection) ----
+        try:
+            self._build_auth(headers, params)
+        except Exception as e:
+            self.record_failure(f"auth_error: {e}")
+            return None
+
+        # ---- POST body ----
+        body = None
+        if self.method == "POST":
+            body = {}
+            for k, v in (self.config.get("body", {}) or {}).items():
+                if isinstance(v, str):
+                    try:
+                        body[k] = v.format(target=target)
+                    except Exception:
+                        body[k] = v
+                else:
+                    body[k] = v
+
         start = time.time()
         try:
             if self.method == "GET":
-                resp = requests.get(url, headers=headers, params=params, timeout=self.timeout)
+                resp = _get_session().get(
+                    url, headers=headers, params=params, timeout=self.timeout
+                )
+            elif self.method == "POST":
+                resp = _get_session().post(
+                    url, headers=headers, params=params, data=body, timeout=self.timeout
+                )
             else:
-                resp = requests.post(url, headers=headers, json=params, timeout=self.timeout)
+                self.record_failure(f"unsupported method: {self.method}")
+                return None
+
             resp.raise_for_status()
-            data = resp.json()
             latency = time.time() - start
             self.record_success(latency)
-            result = {}
-            for key, path in self.response_map.items():
-                result[key] = self._extract(data, path)
-            return result
-        except Exception as e:
-            self.record_failure(str(e))
+
+            fmt = self.config.get("response_format", "json")
+            return self._parse_response(resp, fmt, target)
+
+        except requests.HTTPError as e:
+            # Scrub the URL in case a key was injected as a param
+            self.record_failure(f"HTTP error: {_scrub(str(e))}")
             return None
+        except requests.Timeout:
+            self.record_failure("timeout")
+            return None
+        except Exception as e:
+            self.record_failure(f"unexpected: {_scrub(str(e))}")
+            return None
+
+    def _parse_response(self, resp, fmt: str, target: str) -> Dict[str, Any]:
+        """
+        Dispatch response body parsing based on response_format.
+
+        Returns a normalized dict. Never raises for parse errors —
+        raises are caught by query() and recorded as failure.
+        """
+        fmt = (fmt or "json").lower()
+
+        if fmt == "json":
+            return self._parse_json(resp, target)
+
+        if fmt == "csv":
+            return self._parse_csv(resp, target)
+
+        if fmt == "text_lines":
+            return self._parse_text_lines(resp, target)
+
+        if fmt == "text":
+            return self._parse_text(resp, target)
+
+        raise ValueError(f"Unknown response_format: {fmt}")
+
+    def _parse_json(self, resp, target: str) -> Dict[str, Any]:
+        """
+        Parse a JSON response using response_map (dot notation).
+
+        If response_map is empty, returns the raw top-level keys
+        wrapped in a normalized shape.
+        """
+        data = resp.json()
+        response_map = self.config.get("response_map") or {}
+
+        if not response_map:
+            return {
+                "threat_score": None,
+                "tags": [],
+                "first_seen": None,
+                "last_seen": None,
+                "evidence": "JSON parsed; no response_map configured",
+            }
+
+        result: Dict[str, Any] = {}
+        for key, path in response_map.items():
+            result[key] = self._extract(data, path) if path else None
+        return result
+
+    def _parse_csv(self, resp, target: str) -> Dict[str, Any]:
+        """
+        Parse a CSV response and locate the target.
+
+        Config:
+          csv_map:
+            ip: "<column name for IP>"
+            tag: "<column name for tag>"
+            first_seen: "<column name>"
+            last_seen: "<column name>"
+          csv_target_column: "<column to match target against>"  # optional
+
+        Returns:
+          - dict with threat_score=1.0 if target found
+          - dict with threat_score=None if target not found
+          - raises on malformed CSV
+        """
+        reader = csv.DictReader(io.StringIO(resp.text))
+        csv_map = self.config.get("csv_map") or {}
+        target_col = self.config.get("csv_target_column") or csv_map.get("ip")
+
+        for row in reader:
+            if not isinstance(row, dict):
+                continue
+            # Determine which columns to search
+            if target_col and target_col in row:
+                val = row[target_col]
+                if isinstance(val, str) and val.strip() == target:
+                    return self._map_csv_row(row, csv_map)
+            else:
+                # Fallback: search all values
+                if target in (v.strip() for v in row.values() if isinstance(v, str)):
+                    return self._map_csv_row(row, csv_map)
+
+        # Target not in list — this is a valid answer
+        return {
+            "threat_score": None,
+            "tags": [],
+            "first_seen": None,
+            "last_seen": None,
+            "evidence": f"target not found in {self.name} CSV",
+        }
+
+    def _map_csv_row(self, row: Dict[str, str], csv_map: Dict[str, str]) -> Dict[str, Any]:
+        """Convert a matched CSV row into a normalized result."""
+        tag = row.get(csv_map.get("tag", ""), "") if csv_map.get("tag") else ""
+        first_seen = row.get(csv_map.get("first_seen", "")) if csv_map.get("first_seen") else None
+        last_seen = row.get(csv_map.get("last_seen", "")) if csv_map.get("last_seen") else None
+        return {
+            "threat_score": 1.0,
+            "tags": [tag] if tag else [],
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "evidence": str(row),
+        }
+
+    def _parse_text_lines(self, resp, target: str) -> Dict[str, Any]:
+        """
+        Parse a plain-text list where each line starts with an IP or CIDR.
+
+        Rules:
+          - Lines starting with '#' are skipped.
+          - Blank lines are skipped.
+          - The first token is taken as the entry (split on whitespace or comma).
+          - If the entry is a CIDR, the target is checked for membership.
+          - Inline comments after ';' or '#' are stripped.
+        """
+        for raw_line in (resp.text or "").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # Strip inline comments
+            for sep in (";", " #"):
+                if sep in line:
+                    line = line.split(sep, 1)[0].strip()
+
+            if not line:
+                continue
+
+            token = line.split()[0].split(",")[0].strip()
+            if not token:
+                continue
+
+            if "/" in token:
+                # CIDR match
+                if _ip_in_cidr(target, token):
+                    return {
+                        "threat_score": 1.0,
+                        "tags": ["listed"],
+                        "first_seen": None,
+                        "last_seen": None,
+                        "evidence": line,
+                    }
+            else:
+                if token == target:
+                    return {
+                        "threat_score": 1.0,
+                        "tags": ["listed"],
+                        "first_seen": None,
+                        "last_seen": None,
+                        "evidence": line,
+                    }
+
+        # Target not in list
+        return {
+            "threat_score": None,
+            "tags": [],
+            "first_seen": None,
+            "last_seen": None,
+            "evidence": f"target not found in {self.name} list",
+        }
+
+    def _parse_text(self, resp, target: str) -> Dict[str, Any]:
+        """
+        Capture a capped slice of raw text for diagnostic purposes.
+        Not intended for threat scoring.
+        """
+        try:
+            max_len = int(self.config.get("max_text_length", 4096))
+        except Exception:
+            max_len = 4096
+        return {
+            "threat_score": None,
+            "tags": [],
+            "first_seen": None,
+            "last_seen": None,
+            "evidence": (resp.text or "")[:max_len],
+        }
 
     def _extract(self, data: Any, path: str) -> Any:
         """Extract nested value via dot notation."""
@@ -811,6 +1222,14 @@ class HTTPProvider(BaseProvider):
                 return None
         return cur
 
+def _ip_in_cidr(ip: str, cidr: str) -> bool:
+    """Return True if ip is inside cidr. Returns False on parse errors."""
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False)
+    except Exception:
+        return False
+
+
 def load_providers(config: Dict[str, Any]) -> Dict[str, BaseProvider]:
     """Instantiate all enabled providers from config (Stage 3)."""
     providers: Dict[str, BaseProvider] = {}
@@ -825,65 +1244,1229 @@ def load_providers(config: Dict[str, Any]) -> Dict[str, BaseProvider]:
             logging.warning(f"Unknown provider type '{ptype}' for {name}")
     return providers
 
-def load_api_keys(providers: Dict[str, BaseProvider]) -> None:
-    """Check required API keys and log warnings (Stage 3)."""
-    for name, provider in providers.items():
-        if provider.api_key_env and not provider.api_key:
-            logging.warning(f"API key for {name} not set. Set {provider.api_key_env} to enable.")
+def load_api_keys(providers: Dict[str, BaseProvider],
+                  config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Inspect all providers and classify their auth state (Stage A2).
 
-def run_providers(target: str, providers: Dict[str, BaseProvider]) -> List[Evidence]:
+    Rules:
+      - Disabled providers are ignored entirely (no log, no warning).
+      - Providers with auth_type='none' require no key.
+      - Enabled providers without a key are recorded as 'missing'.
+      - Enabled providers without auth_env are recorded as 'misconfigured'.
+      - Keys are registered for scrubbing when present.
+      - This function never logs. Use _log_auth_summary() for output.
+
+    Returns:
+      {
+        "present":       [names with keys],
+        "missing":       [names enabled but key unset],
+        "misconfigured": [names enabled but no auth_env],
+        "disabled":      [names with enabled=false],
+        "no_auth":       [names with auth_type=none],
+        "not_required":  alias of no_auth (back-compat),
+        "missing_env":   {name: env var} for missing entries,
+      }
     """
-    Run all enabled providers and return List[Evidence] (Stage 3).
-    Each Evidence represents provider result with status OK/FAILED/NOT_CONFIGURED.
+    present: List[str] = []
+    missing: List[str] = []
+    misconfigured: List[str] = []
+    disabled: List[str] = []
+    no_auth: List[str] = []
+    missing_env: Dict[str, str] = {}
+
+    for name, provider in ((providers or {}).items()):
+        try:
+            enabled = bool(getattr(provider, "enabled", True))
+        except Exception:
+            enabled = True
+        if not enabled:
+            disabled.append(name)
+            continue
+
+        try:
+            auth_type = (getattr(provider, "auth_type", "api_key_header") or "api_key_header").lower()
+        except Exception:
+            auth_type = "api_key_header"
+        if auth_type == "none":
+            no_auth.append(name)
+            continue
+
+        try:
+            auth_env = getattr(provider, "auth_env", None)
+        except Exception:
+            auth_env = None
+        if not auth_env:
+            misconfigured.append(name)
+            continue
+
+        try:
+            key = os.getenv(auth_env)
+        except Exception:
+            key = None
+        if not key:
+            missing.append(name)
+            try:
+                missing_env[name] = auth_env
+            except Exception:
+                pass
+        else:
+            present.append(name)
+            _register_secret(key)
+
+    # Disabled providers are skipped by load_providers(), so derive them
+    # from the declared config (explicit param, else module-global CFG).
+    try:
+        src = config if isinstance(config, dict) else None
+        if src is None:
+            try:
+                src = CFG
+            except Exception:
+                src = None
+        declared = (src.get("providers", {}) or {}) if isinstance(src, dict) else {}
+        if not isinstance(declared, dict):
+            declared = {}
+        loaded = set((providers or {}).keys())
+        for dname, pconfig in declared.items():
+            if dname in loaded:
+                continue
+            if isinstance(pconfig, dict) and not pconfig.get("enabled", True):
+                if dname not in disabled:
+                    disabled.append(dname)
+    except Exception:
+        pass
+
+    return {
+        "present": present,
+        "missing": missing,
+        "misconfigured": misconfigured,
+        "disabled": disabled,
+        "no_auth": no_auth,
+        "not_required": list(no_auth),
+        "missing_env": missing_env,
+    }
+
+
+def _auth_warning_mode(config: Optional[Dict[str, Any]] = None) -> str:
     """
-    evidences: List[Evidence] = []
-    for name, provider in providers.items():
-        if not provider.enabled:
+    Resolve the auth warning mode from config (Stage A2).
+
+    logging.auth_warnings: "summary" (default) | "per_provider" | "off".
+    Falls back to the module-global CFG, then to "summary".
+    """
+    try:
+        src = config if isinstance(config, dict) else None
+        if src is None:
+            try:
+                src = CFG
+            except Exception:
+                src = None
+        if isinstance(src, dict):
+            lg = src.get("logging", {}) or {}
+            if isinstance(lg, dict):
+                mode = str(lg.get("auth_warnings", "summary") or "summary").lower()
+                if mode in ("summary", "per_provider", "off"):
+                    return mode
+    except Exception:
+        pass
+    return "summary"
+
+
+def _log_auth_summary(auth_info: Dict[str, Any],
+                      config: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Emit exactly one line per run summarizing auth state (Stage A2).
+
+    Rules:
+      - If any enabled provider is missing a key -> one WARNING line
+        (mode "summary"), legacy per-provider lines (mode "per_provider"),
+        or silence (mode "off").
+      - Otherwise -> one INFO line.
+      - Never warn about disabled or auth_type=none providers.
+    """
+    try:
+        present = list(auth_info.get("present", []) or [])
+        missing = list(auth_info.get("missing", []) or [])
+        misconfigured = list(auth_info.get("misconfigured", []) or [])
+        disabled = list(auth_info.get("disabled", []) or [])
+        no_auth = list(auth_info.get("no_auth", []) or auth_info.get("not_required", []) or [])
+        missing_env = auth_info.get("missing_env", {}) or {}
+    except Exception:
+        return
+    try:
+        mode = _auth_warning_mode(config)
+    except Exception:
+        mode = "summary"
+
+    # Preserve order, drop duplicates.
+    offenders: List[str] = []
+    for n in list(missing) + list(misconfigured):
+        if n not in offenders:
+            offenders.append(n)
+
+    if offenders:
+        if mode == "off":
+            logging.info(
+                f"Auth: {len(present)} configured, {len(offenders)} missing, "
+                f"{len(disabled)} disabled, {len(no_auth)} no-auth."
+            )
+            return
+        if mode == "per_provider":
+            for name in offenders:
+                if name in misconfigured:
+                    try:
+                        at = "unknown"
+                        try:
+                            reg = _PROVIDERS_REGISTRY.get()
+                            if isinstance(reg, dict) and name in reg:
+                                at = getattr(reg[name], "auth_type", "unknown")
+                        except Exception:
+                            pass
+                        logging.warning(
+                            f"Provider {name} declares auth_type={at} "
+                            f"but no api_key_env. Set one in config.yaml."
+                        )
+                    except Exception:
+                        pass
+                else:
+                    env = None
+                    try:
+                        env = missing_env.get(name) or _lookup_env_for(name)
+                    except Exception:
+                        env = None
+                    logging.warning(
+                        f"API key for {name} not set. "
+                        f"Set {env if env else '(unknown env var)'} to enable."
+                    )
+            logging.info(
+                f"Auth: {len(present)} configured, "
+                f"{len(offenders)} missing, "
+                f"{len(no_auth)} not required."
+            )
+            logging.warning(
+                f"Missing API keys for: {', '.join(offenders)}. "
+                f"These providers will report NOT_CONFIGURED."
+            )
+            return
+        # ---- Default: one summary WARNING line ----
+        detail_parts: List[str] = []
+        for name in offenders:
+            if name in misconfigured:
+                detail_parts.append(f"{name} (no api_key_env)")
+                continue
+            env = None
+            try:
+                env = missing_env.get(name) or _lookup_env_for(name)
+            except Exception:
+                env = None
+            detail_parts.append(f"{name} ({env})" if env else name)
+        detail = ", ".join(detail_parts)
+        logging.warning(
+            f"{len(offenders)} enabled provider(s) "
+            f"missing API keys: {detail}. "
+            f"These will report NOT_CONFIGURED."
+        )
+        return
+
+    # ---- All good: one INFO line ----
+    logging.info(
+        f"Auth: {len(present)} configured, 0 missing, "
+        f"{len(disabled)} disabled, {len(no_auth)} no-auth."
+    )
+
+# ============================================================
+#  PERFORMANCE ENGINE — v43 (Stage 19)
+#  Parallel providers + timeout budget + rate limits + pooling.
+#  Speed is execution. Evidence is unchanged.
+# ============================================================
+_thread_local = threading.local()
+
+
+def _get_session() -> "requests.Session":
+    """
+    Return a thread-local requests.Session for connection pooling.
+    """
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+        # Sensible defaults for connection reuse
+        try:
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=4,
+                pool_maxsize=8,
+                max_retries=0  # retries handled explicitly
+            )
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+        except Exception:
+            pass
+        try:
+            session.headers.update({"User-Agent": "ReconIP/43"})
+        except Exception:
+            pass
+        _thread_local.session = session
+    return _thread_local.session
+
+
+_RATE_STATE_LOCK = threading.Lock()
+_RATE_STATE: Dict[str, Dict[str, float]] = {}
+
+
+def _acquire_rate_token(provider_name: str,
+                        config: Dict[str, Any]) -> float:
+    """
+    Block until a rate token is available for this provider.
+    Returns the actual wait time (seconds).
+
+    Uses a simple minimum-interval model:
+      - Each provider has a 'min_interval' (seconds between calls).
+      - If the last call was < min_interval ago, sleep the remainder.
+    """
+    try:
+        perf_cfg = config.get("performance", {}) if isinstance(config, dict) else {}
+    except Exception:
+        perf_cfg = {}
+    if not isinstance(perf_cfg, dict):
+        perf_cfg = {}
+    rate_cfg = perf_cfg.get("rate_limits", {}) if isinstance(perf_cfg.get("rate_limits", {}), dict) else {}
+    default_interval = perf_cfg.get("default_min_interval", 0.0)
+    try:
+        default_interval = float(default_interval)
+    except Exception:
+        default_interval = 0.0
+    try:
+        min_interval = float(rate_cfg.get(provider_name, default_interval))
+    except Exception:
+        min_interval = default_interval
+
+    if min_interval <= 0:
+        return 0.0
+
+    now = time.monotonic()
+    with _RATE_STATE_LOCK:
+        state = _RATE_STATE.setdefault(provider_name, {"last": 0.0})
+        elapsed = now - state["last"]
+        wait_time = max(0.0, min_interval - elapsed)
+        # Reserve the slot before releasing the lock
+        state["last"] = now + wait_time
+
+    if wait_time > 0:
+        time.sleep(wait_time)
+    return wait_time
+
+
+def provider_priority(name: str,
+                      provider: Any,
+                      config: Dict[str, Any]) -> int:
+    """
+    Higher score = run first.
+
+    Signals:
+      - reliability (from Stage 3)
+      - weight (from Stage 3)
+      - configured (API key present)
+      - not in circuit-breaker state
+    """
+    try:
+        perf_cfg = config.get("performance", {}) if isinstance(config, dict) else {}
+    except Exception:
+        perf_cfg = {}
+    if not isinstance(perf_cfg, dict):
+        perf_cfg = {}
+    priority_weights = perf_cfg.get("priority_weights", {
+        "reliability": 0.5,
+        "weight": 0.3,
+        "configured_bonus": 0.2
+    })
+    if not isinstance(priority_weights, dict):
+        priority_weights = {"reliability": 0.5, "weight": 0.3, "configured_bonus": 0.2}
+
+    try:
+        rel = float(getattr(provider, "reliability", 0.5) or 0.5)
+    except Exception:
+        rel = 0.5
+    try:
+        w = float(getattr(provider, "weight", 1.0) or 1.0)
+    except Exception:
+        w = 1.0
+    try:
+        configured = bool(provider.is_configured()) if hasattr(provider, "is_configured") else True
+    except Exception:
+        configured = True
+    try:
+        err_rate = float(getattr(provider, "error_rate", 0.0) or 0.0)
+    except Exception:
+        err_rate = 0.0
+
+    score = 0.0
+    try:
+        score += rel * float(priority_weights.get("reliability", 0.5))
+    except Exception:
+        pass
+    try:
+        score += w * float(priority_weights.get("weight", 0.3))
+    except Exception:
+        pass
+    if configured:
+        try:
+            score += float(priority_weights.get("configured_bonus", 0.2))
+        except Exception:
+            pass
+
+    # Circuit breaker: heavily deprioritize if error_rate >= threshold
+    try:
+        cb_cfg = perf_cfg.get("circuit_breaker", {}) if isinstance(perf_cfg.get("circuit_breaker", {}), dict) else {}
+        threshold = float(cb_cfg.get("error_rate_threshold", 0.8))
+        penalty = float(cb_cfg.get("penalty", 1.0))
+    except Exception:
+        threshold, penalty = 0.8, 1.0
+    if err_rate >= threshold:
+        score -= penalty
+
+    return int(round(score * 1000))
+
+
+def timeout_budget(config: Dict[str, Any],
+                   provider_count: int) -> float:
+    """
+    Return the total seconds allowed for provider execution.
+
+    Rules:
+      - Use configured 'timeout_budget' as a hard cap.
+      - If provider_count is small, cap it lower to avoid waiting.
+      - Never return <= 0.
+    """
+    try:
+        perf_cfg = config.get("performance", {}) if isinstance(config, dict) else {}
+    except Exception:
+        perf_cfg = {}
+    if not isinstance(perf_cfg, dict):
+        perf_cfg = {}
+    try:
+        budget = float(perf_cfg.get("timeout_budget", 30))
+    except Exception:
+        budget = 30.0
+    try:
+        min_budget = float(perf_cfg.get("min_timeout_budget", 10))
+    except Exception:
+        min_budget = 10.0
+    try:
+        max_budget = float(perf_cfg.get("max_timeout_budget", 120))
+    except Exception:
+        max_budget = 120.0
+
+    # Scale down if very few providers
+    try:
+        if int(provider_count) <= 2:
+            budget = min(budget, min_budget * 2)
+    except Exception:
+        pass
+
+    return max(min_budget, min(max_budget, budget))
+
+
+# ============================================================
+#  CACHE INTELLIGENCE — v43.1 (Stage 20)
+#  reconip_cache.db as a first-class layer: FRESH / STALE / EXPIRED.
+#  Cache is a memory, not a source of truth.
+# ============================================================
+_CACHE_DB_LOCK = threading.Lock()
+
+
+def _cache_resolve_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return the effective config (explicit arg or global CFG)."""
+    try:
+        if isinstance(config, dict):
+            return config
+    except Exception:
+        pass
+    try:
+        return CFG if isinstance(CFG, dict) else {}
+    except Exception:
+        return {}
+
+
+def cache_init(db_path: str = "reconip_cache.db") -> None:
+    """
+    Ensure the cache table exists with the correct schema.
+    Idempotent. Migrates the legacy Stage-3 schema (k, d, e) forward.
+    """
+    if not db_path:
+        db_path = "reconip_cache.db"
+    with _CACHE_DB_LOCK:
+        try:
+            with sqlite3.connect(db_path, timeout=30) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                cols = set()
+                try:
+                    cols = {r[1] for r in conn.execute("PRAGMA table_info(cache)").fetchall()}
+                except Exception:
+                    cols = set()
+                if not cols:
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS cache (
+                            key          TEXT PRIMARY KEY,
+                            value        TEXT NOT NULL,
+                            source       TEXT NOT NULL,
+                            ttl_seconds  INTEGER NOT NULL,
+                            cached_at    TEXT NOT NULL,
+                            cached_at_unix REAL NOT NULL
+                        )
+                    """)
+                elif "k" in cols and "key" not in cols:
+                    # Legacy Stage-3 schema: migrate rows, then replace table.
+                    try:
+                        legacy = conn.execute("SELECT k, d, e FROM cache").fetchall()
+                    except Exception:
+                        legacy = []
+                    now = time.time()
+                    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    conn.execute("DROP TABLE cache")
+                    conn.execute("""
+                        CREATE TABLE cache (
+                            key          TEXT PRIMARY KEY,
+                            value        TEXT NOT NULL,
+                            source       TEXT NOT NULL,
+                            ttl_seconds  INTEGER NOT NULL,
+                            cached_at    TEXT NOT NULL,
+                            cached_at_unix REAL NOT NULL
+                        )
+                    """)
+                    for k, d, e in legacy:
+                        try:
+                            remaining = float(e) - now
+                        except Exception:
+                            continue
+                        if remaining <= 0:
+                            continue  # drop already-expired legacy rows
+                        try:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO cache "
+                                "(key, value, source, ttl_seconds, cached_at, cached_at_unix) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                (k, d, "migrated", int(remaining), now_iso, now)
+                            )
+                        except Exception:
+                            continue
+                else:
+                    # New schema present (possibly partial): add any missing columns.
+                    for coldef in (
+                        ("value", "TEXT"),
+                        ("source", "TEXT"),
+                        ("ttl_seconds", "INTEGER"),
+                        ("cached_at", "TEXT"),
+                        ("cached_at_unix", "REAL"),
+                    ):
+                        if coldef[0] not in cols:
+                            try:
+                                conn.execute(f"ALTER TABLE cache ADD COLUMN {coldef[0]} {coldef[1]}")
+                            except Exception:
+                                pass
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_source ON cache(source)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_cached_at ON cache(cached_at_unix)")
+                conn.commit()
+        except Exception as e:
+            log.debug(f"cache_init: {e}")
+
+
+def _cache_ttl_for(name: str, config: Dict[str, Any]) -> int:
+    """Resolve TTL for a provider: provider_ttls override, else default."""
+    try:
+        cache_cfg = config.get("cache", {}) if isinstance(config, dict) else {}
+    except Exception:
+        cache_cfg = {}
+    if not isinstance(cache_cfg, dict):
+        cache_cfg = {}
+    try:
+        prov_ttls = cache_cfg.get("provider_ttls", {}) or {}
+        if isinstance(prov_ttls, dict) and name in prov_ttls:
+            return int(prov_ttls[name])
+    except Exception:
+        pass
+    try:
+        return int(cache_cfg.get("ttl_seconds", 3600))
+    except Exception:
+        return 3600
+
+
+def cache_set(key: str,
+              value: Dict[str, Any],
+              config: Optional[Any] = None,
+              ttl_seconds: Optional[int] = None,
+              source: Optional[str] = None) -> None:
+    """
+    Store a value in the cache.
+
+    Rules:
+      - value must be a JSON-serializable dict (Evidence-shaped).
+      - source is inferred from value.get('source') if not provided.
+      - ttl_seconds is inferred from config if not provided.
+      - Cached values with status == FAILED are NOT cached.
+    """
+    # Backward compat: legacy call form cache_set(key, value, ttl:int)
+    if config is not None and not isinstance(config, dict):
+        try:
+            ttl_seconds = int(config)
+        except Exception:
+            pass
+        config = None
+    cfg = _cache_resolve_config(config)
+    try:
+        cache_cfg = cfg.get("cache", {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        cache_cfg = {}
+    if not isinstance(cache_cfg, dict):
+        cache_cfg = {}
+    if not cache_cfg.get("enabled", True):
+        return
+
+    # Never cache failures
+    if not isinstance(value, dict):
+        return
+    if value.get("status") == "FAILED":
+        return
+
+    db_path = cache_cfg.get("db_path", "reconip_cache.db") or "reconip_cache.db"
+    if ttl_seconds is None:
+        try:
+            ttl_seconds = int(cache_cfg.get("ttl_seconds", 3600))
+        except Exception:
+            ttl_seconds = 3600
+    else:
+        try:
+            ttl_seconds = int(ttl_seconds)
+        except Exception:
+            ttl_seconds = 3600
+    if source is None:
+        try:
+            source = value.get("source", "unknown") or "unknown"
+        except Exception:
+            source = "unknown"
+
+    now = datetime.now(timezone.utc)
+    cached_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    cached_at_unix = now.timestamp()
+
+    try:
+        payload = json.dumps(value, sort_keys=True, default=str)
+    except Exception:
+        return
+
+    with _CACHE_DB_LOCK:
+        try:
+            with sqlite3.connect(db_path, timeout=30) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("""
+                    INSERT OR REPLACE INTO cache
+                        (key, value, source, ttl_seconds, cached_at, cached_at_unix)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (key, payload, str(source), int(ttl_seconds), cached_at, float(cached_at_unix)))
+                conn.commit()
+        except Exception as e:
+            log.debug(f"cache_set: {e}")
+
+
+def cache_status(cached_at_unix: float,
+                 ttl_seconds: int,
+                 config: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Return FRESH, STALE, or EXPIRED based on age and thresholds.
+
+    FRESH:   age <= ttl_seconds
+    STALE:   ttl_seconds < age <= expired_threshold
+    EXPIRED: age > expired_threshold
+
+    stale_threshold is the advisory "very stale" marker (see is_very_stale).
+    Thresholds are normalized: stale >= ttl, expired >= stale.
+    """
+    cfg = _cache_resolve_config(config)
+    try:
+        cache_cfg = cfg.get("cache", {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        cache_cfg = {}
+    if not isinstance(cache_cfg, dict):
+        cache_cfg = {}
+    try:
+        ttl_seconds = int(ttl_seconds)
+    except Exception:
+        ttl_seconds = 3600
+    try:
+        stale_threshold = int(cache_cfg.get("stale_threshold", 7200))
+    except Exception:
+        stale_threshold = 7200
+    try:
+        expired_threshold = int(cache_cfg.get("expired_threshold", 86400))
+    except Exception:
+        expired_threshold = 86400
+
+    # Normalize thresholds
+    if stale_threshold < ttl_seconds:
+        stale_threshold = ttl_seconds
+    if expired_threshold < stale_threshold:
+        expired_threshold = stale_threshold
+
+    try:
+        age = time.time() - float(cached_at_unix)
+    except Exception:
+        return "EXPIRED"
+
+    if age <= ttl_seconds:
+        return "FRESH"
+    if age <= expired_threshold:
+        return "STALE"
+    return "EXPIRED"
+
+
+def cache_get(key: str,
+              config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve a cache entry.
+
+    Returns:
+      - None if:
+          - cache is disabled
+          - key does not exist
+          - entry is EXPIRED
+      - A dict with:
+          - 'value': the cached Evidence dict
+          - 'status': FRESH | STALE
+          - 'cached_at': ISO8601
+          - 'age_seconds': float
+          - 'ttl_seconds': int
+          - 'is_very_stale': bool
+          - 'source': str
+    """
+    cfg = _cache_resolve_config(config)
+    try:
+        cache_cfg = cfg.get("cache", {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        cache_cfg = {}
+    if not isinstance(cache_cfg, dict):
+        cache_cfg = {}
+    if not cache_cfg.get("enabled", True):
+        return None
+
+    db_path = cache_cfg.get("db_path", "reconip_cache.db") or "reconip_cache.db"
+
+    try:
+        with _CACHE_DB_LOCK:
+            with sqlite3.connect(db_path, timeout=30) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                row = conn.execute("""
+                    SELECT value, source, ttl_seconds, cached_at, cached_at_unix
+                    FROM cache WHERE key = ?
+                """, (key,)).fetchone()
+    except Exception:
+        return None
+
+    if not row:
+        return None
+
+    value_json, source, ttl_seconds, cached_at, cached_at_unix = row
+    try:
+        ttl_seconds = int(ttl_seconds)
+    except Exception:
+        ttl_seconds = 3600
+    status = cache_status(cached_at_unix, ttl_seconds, cfg)
+    if status == "EXPIRED":
+        return None
+
+    try:
+        value = json.loads(value_json)
+    except Exception:
+        return None
+    if not isinstance(value, dict):
+        return None
+
+    try:
+        age_seconds = time.time() - float(cached_at_unix)
+    except Exception:
+        return None
+    try:
+        stale_threshold = int(cache_cfg.get("stale_threshold", 7200))
+    except Exception:
+        stale_threshold = 7200
+    is_very_stale = age_seconds > stale_threshold
+
+    return {
+        "value": value,
+        "status": status,
+        "cached_at": cached_at,
+        "age_seconds": round(age_seconds, 2),
+        "ttl_seconds": int(ttl_seconds),
+        "is_very_stale": bool(is_very_stale),
+        "source": source
+    }
+
+
+def cache_purge_expired(config: Optional[Dict[str, Any]] = None) -> int:
+    """
+    Delete EXPIRED cache entries. Returns count of deleted rows.
+    Call this once per run or on a schedule.
+    """
+    cfg = _cache_resolve_config(config)
+    try:
+        cache_cfg = cfg.get("cache", {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        cache_cfg = {}
+    if not isinstance(cache_cfg, dict):
+        cache_cfg = {}
+    if not cache_cfg.get("enabled", True):
+        return 0
+    if not cache_cfg.get("purge_expired", True):
+        return 0
+
+    db_path = cache_cfg.get("db_path", "reconip_cache.db") or "reconip_cache.db"
+    try:
+        expired_threshold = int(cache_cfg.get("expired_threshold", 86400))
+    except Exception:
+        expired_threshold = 86400
+    cutoff = time.time() - expired_threshold
+
+    try:
+        with _CACHE_DB_LOCK:
+            with sqlite3.connect(db_path, timeout=30) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                cursor = conn.execute(
+                    "DELETE FROM cache WHERE cached_at_unix < ?",
+                    (cutoff,)
+                )
+                deleted = cursor.rowcount
+                conn.commit()
+        return int(deleted or 0)
+    except Exception:
+        return 0
+
+
+def cache_stats(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Return cache statistics: total entries, by source, by status.
+    """
+    cfg = _cache_resolve_config(config)
+    try:
+        cache_cfg = cfg.get("cache", {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        cache_cfg = {}
+    if not isinstance(cache_cfg, dict):
+        cache_cfg = {}
+    if not cache_cfg.get("enabled", True):
+        return {"enabled": False}
+
+    db_path = cache_cfg.get("db_path", "reconip_cache.db") or "reconip_cache.db"
+    try:
+        with _CACHE_DB_LOCK:
+            with sqlite3.connect(db_path, timeout=30) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                rows = conn.execute("""
+                    SELECT source, ttl_seconds, cached_at_unix
+                    FROM cache
+                """).fetchall()
+    except Exception:
+        return {"enabled": True, "error": "cache_read_failed"}
+
+    total = len(rows)
+    by_source: Dict[str, int] = {}
+    by_status: Dict[str, int] = {"FRESH": 0, "STALE": 0, "EXPIRED": 0}
+
+    for source, ttl_seconds, cached_at_unix in rows:
+        try:
+            by_source[source] = by_source.get(source, 0) + 1
+            status = cache_status(cached_at_unix, ttl_seconds, cfg)
+            by_status[status] = by_status.get(status, 0) + 1
+        except Exception:
             continue
-        if not provider.is_configured():
-            evidences.append(make_evidence(
-                source=name,
-                value=None,
-                normalized_value=None,
-                confidence=0.0,
-                status="NOT_CONFIGURED",
-                ttl_key="threat",
-                metadata={"reason": "missing API key", "api_key_env": provider.api_key_env, "data_type": "threat", "field": name}
-            ))
-            continue
+
+    return {
+        "enabled": True,
+        "total": total,
+        "by_source": by_source,
+        "by_status": by_status
+    }
+
+
+def _section_cache(report: Dict[str, Any],
+                   config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Section: cache intelligence summary.
+    Attached as report["cache_intelligence"]; the 18-section structure is unchanged.
+    """
+    try:
+        stats = cache_stats(config)
+    except Exception:
+        stats = {"enabled": False}
+    if not isinstance(stats, dict):
+        stats = {"enabled": False}
+    return {
+        "enabled": stats.get("enabled", False),
+        "total_entries": stats.get("total", 0),
+        "by_source": stats.get("by_source", {}),
+        "by_status": stats.get("by_status", {}),
+        "notes": [
+            "Cache is a memory, not a source of truth.",
+            "FRESH cache may skip a query.",
+            "STALE cache is marked and used only as fallback.",
+            "EXPIRED cache is never used.",
+            "Cache never replaces a failed provider — it complements it."
+        ]
+    }
+
+
+
+def _provider_evidence(source: str,
+                       value: Any,
+                       status: str,
+                       reason: str = "") -> Dict[str, Any]:
+    """
+    Build an Evidence-shaped dict for a non-OK provider state.
+    """
+    return make_evidence(
+        source=source,
+        value=value,
+        normalized_value=value,
+        confidence=0.0,
+        status=status,
+        ttl_key="threat",
+        metadata={"reason": reason}
+    ).to_dict()
+
+
+def _run_one_provider(name: str,
+                      provider: Any,
+                      target: str,
+                      config: Dict[str, Any],
+                      deadline: float) -> Dict[str, Any]:
+    """
+    Run one provider and return a normalized Evidence dict.
+
+    Behavior:
+      - Respects rate limits.
+      - Checks cache before querying.
+      - Enforces the deadline (deadline is time.monotonic()).
+      - Never raises — always returns an Evidence-shaped dict.
+    """
+    try:
+        enabled = bool(getattr(provider, "enabled", True))
+    except Exception:
+        enabled = True
+    if not enabled:
+        return _provider_evidence(name, None, "NOT_CONFIGURED",
+                                  reason="disabled in config")
+
+    try:
+        configured = bool(provider.is_configured()) if hasattr(provider, "is_configured") else True
+    except Exception:
+        configured = True
+    if not configured:
+        return _provider_evidence(name, None, "NOT_CONFIGURED",
+                                  reason="missing API key")
+
+    # Circuit breaker
+    try:
+        cb_cfg = config.get("performance", {}).get("circuit_breaker", {}) if isinstance(config, dict) else {}
+        if not isinstance(cb_cfg, dict):
+            cb_cfg = {}
+        threshold = float(cb_cfg.get("error_rate_threshold", 0.8))
+    except Exception:
+        threshold = 0.8
+    try:
+        err_rate = float(getattr(provider, "error_rate", 0.0) or 0.0)
+    except Exception:
+        err_rate = 0.0
+    if err_rate >= threshold:
+        return _provider_evidence(name, None, "FAILED",
+                                  reason="circuit breaker open")
+
+    cache_key = f"provider:{name}:{target}"
+
+    # ---- Cache lookup (Stage 20: FRESH / STALE / EXPIRED) ----
+    cached = cache_get(cache_key, config)
+    if cached is not None:
+        # Copy so per-thread mutation never corrupts shared state
+        try:
+            cached_value = json.loads(json.dumps(cached["value"]))
+        except Exception:
+            cached_value = dict(cached.get("value", {}))
+        if not isinstance(cached_value, dict):
+            cached_value = {}
+        try:
+            cached_value.setdefault("metadata", {})
+            cached_value["metadata"].update({
+                "cache_hit": True,
+                "cache_status": cached["status"],
+                "cache_age_seconds": cached["age_seconds"],
+                "cache_cached_at": cached["cached_at"],
+                "cache_is_very_stale": cached["is_very_stale"]
+            })
+        except Exception:
+            pass
+        # FRESH: return without querying provider
+        if cached["status"] == "FRESH":
+            return cached_value
+        # STALE: keep cached value as fallback; attempt a refresh
+        # (unless deadline is exhausted)
+        try:
+            remaining = deadline - time.monotonic()
+        except Exception:
+            remaining = 1.0
+        if remaining <= 0:
+            return cached_value
+        # Fall through to refresh
+
+    # Rate limit
+    try:
+        remaining = deadline - time.monotonic()
+    except Exception:
+        remaining = 1.0
+    if remaining <= 0:
+        return _provider_evidence(name, None, "FAILED",
+                                  reason="timeout budget exhausted")
+
+    try:
+        wait_time = _acquire_rate_token(name, config)
+    except Exception:
+        wait_time = 0.0
+    try:
+        remaining = deadline - time.monotonic()
+    except Exception:
+        remaining = 1.0
+    if remaining <= 0:
+        return _provider_evidence(name, None, "FAILED",
+                                  reason="rate limit consumed budget")
+
+    # Query
+    try:
         result = provider.query(target)
-        if result is None:
-            evidences.append(make_evidence(
-                source=name,
-                value=None,
-                normalized_value=None,
-                confidence=0.0,
-                status="FAILED",
-                ttl_key="threat",
-                metadata={"error_rate": provider.error_rate, "latency": provider.latency, "data_type": "threat", "field": name}
-            ))
-            continue
-        conf = provider.compute_confidence()
-        evidences.append(make_evidence(
+    except Exception as e:
+        try:
+            provider.record_failure(str(e))
+        except Exception:
+            pass
+        # If we had a STALE cache, return it instead of failing
+        if cached is not None:
+            try:
+                ev = json.loads(json.dumps(cached["value"]))
+            except Exception:
+                ev = dict(cached.get("value", {}))
+            try:
+                ev.setdefault("metadata", {})["cache_refresh_failed"] = True
+            except Exception:
+                pass
+            return ev
+        return _provider_evidence(name, None, "FAILED", reason=str(e))
+
+    if result is None:
+        if cached is not None:
+            try:
+                ev = json.loads(json.dumps(cached["value"]))
+            except Exception:
+                ev = dict(cached.get("value", {}))
+            try:
+                ev.setdefault("metadata", {})["cache_refresh_failed"] = True
+            except Exception:
+                pass
+            return ev
+        try:
+            reason = getattr(provider, "last_error", None) or "no result"
+        except Exception:
+            reason = "no result"
+        return _provider_evidence(name, None, "FAILED", reason=str(reason))
+
+    try:
+        conf = float(provider.compute_confidence()) if hasattr(provider, "compute_confidence") else 0.5
+    except Exception:
+        conf = 0.5
+    try:
+        ev = make_evidence(
             source=name,
             value=result.get("threat_score"),
             normalized_value=result.get("threat_score"),
             confidence=conf,
             status="OK",
             ttl_key="threat",
-            metadata={
-                "reliability": provider.reliability,
-                "weight": provider.weight,
-                "latency": provider.latency,
+            metadata=_scrub_dict({
+                "reliability": getattr(provider, "reliability", 0.5),
+                "weight": getattr(provider, "weight", 1.0),
+                "latency": getattr(provider, "latency", None),
                 "tags": result.get("tags", []),
                 "first_seen": result.get("first_seen"),
                 "last_seen": result.get("last_seen"),
                 "evidence": result.get("evidence", ""),
-                "error_rate": provider.error_rate,
-                "data_type": "threat",
-                "field": name
-            }
-        ))
+                "error_rate": getattr(provider, "error_rate", 0.0),
+                "cache_hit": False,
+                "cache_status": "MISS",
+                "cache_refreshed": cached is not None and cached.get("status") == "STALE",
+                "auth_type": getattr(provider, "auth_type", "api_key_header"),
+            })
+        )
+        ev_dict = ev.to_dict()
+    except Exception as e:
+        return _provider_evidence(name, None, "FAILED", reason=str(e))
+
+    # ---- Store in cache (Stage 20: failures are never cached) ----
+    try:
+        ttl = _cache_ttl_for(name, config if isinstance(config, dict) else {})
+    except Exception:
+        ttl = 3600
+    try:
+        cache_set(cache_key, ev_dict, config, ttl_seconds=ttl, source=name)
+    except Exception:
+        pass
+
+    return ev_dict
+
+
+def run_providers_parallel(target: str,
+                           providers: Dict[str, Any],
+                           config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Run all enabled providers in parallel with:
+      - provider prioritization
+      - bounded concurrency
+      - timeout budget enforcement
+      - per-provider rate limits
+      - caching
+
+    Returns a list of Evidence-shaped dicts, one per provider.
+    """
+    try:
+        perf_cfg = config.get("performance", {}) if isinstance(config, dict) else {}
+    except Exception:
+        perf_cfg = {}
+    if not isinstance(perf_cfg, dict):
+        perf_cfg = {}
+    parallel = perf_cfg.get("parallel", True)
+    try:
+        max_workers = max(1, int(perf_cfg.get("max_workers", 8)))
+    except Exception:
+        max_workers = 8
+
+    try:
+        items = list((providers or {}).items())
+    except Exception:
+        items = []
+    enabled = [(name, p) for name, p in items if getattr(p, "enabled", True)]
+    if not enabled:
+        return []
+
+    # Prioritize
+    try:
+        enabled.sort(key=lambda x: provider_priority(x[0], x[1], config), reverse=True)
+    except Exception:
+        pass
+
+    try:
+        budget = float(timeout_budget(config, len(enabled)))
+    except Exception:
+        budget = 30.0
+    deadline = time.monotonic() + budget
+
+    results: List[Optional[Dict[str, Any]]] = [None] * len(enabled)
+
+    if not parallel or len(enabled) == 1:
+        for i, (name, provider) in enumerate(enabled):
+            try:
+                results[i] = _run_one_provider(name, provider, target, config, deadline)
+            except Exception as e:
+                results[i] = _provider_evidence(name, None, "FAILED", reason=str(e))
+        return [r for r in results if r is not None]
+
+    ex = ThreadPoolExecutor(max_workers=max_workers,
+                            thread_name_prefix="reconip-provider")
+    try:
+        future_map = {
+            ex.submit(_run_one_provider, name, provider, target, config, deadline): i
+            for i, (name, provider) in enumerate(enabled)
+        }
+
+        done, not_done = wait(
+            list(future_map.keys()),
+            timeout=budget,
+            return_when=concurrent.futures.ALL_COMPLETED
+        )
+
+        # Collect completed
+        for future in done:
+            idx = future_map[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                results[idx] = _provider_evidence(
+                    enabled[idx][0], None, "FAILED", reason=str(e)
+                )
+
+        # Cancel stragglers (never block on them: budget is a hard cap)
+        for future in not_done:
+            idx = future_map[future]
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            if results[idx] is None:
+                results[idx] = _provider_evidence(
+                    enabled[idx][0], None, "FAILED",
+                    reason="timeout budget exceeded"
+                )
+    finally:
+        # Do NOT wait for stragglers: shutdown detached so the
+        # timeout budget is actually enforced (with-block would join).
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            try:
+                ex.shutdown(wait=False)
+            except Exception:
+                pass
+
+    return [r for r in results if r is not None]
+
+def _ev_dict_to_evidence(d: Dict[str, Any]) -> Evidence:
+    """Convert an Evidence-shaped dict (Stage 19) back to an Evidence object."""
+    try:
+        meta = d.get("metadata", {}) if isinstance(d, dict) else {}
+        if not isinstance(meta, dict):
+            meta = {"raw": meta}
+        meta.setdefault("data_type", "threat")
+        return Evidence(
+            source=d.get("source", "unknown"),
+            timestamp=d.get("timestamp") or Evidence.now_iso(),
+            value=d.get("value"),
+            normalized_value=d.get("normalized_value", d.get("value")),
+            confidence=float(d.get("confidence", 0.0) or 0.0),
+            freshness=d.get("freshness", "UNKNOWN") or "UNKNOWN",
+            status=d.get("status", "FAILED") or "FAILED",
+            metadata=meta,
+        )
+    except Exception:
+        return make_evidence(source="unknown", value=None, confidence=0.0, status="FAILED", ttl_key="threat")
+
+
+def run_providers(target: str,
+                  providers: Dict[str, BaseProvider],
+                  config: Optional[Dict[str, Any]] = None) -> List[Evidence]:
+    """
+    Backwards-compatible wrapper for Stage 3 callers.
+    Delegates to run_providers_parallel().
+
+    Returns List[Evidence] (converted from Evidence-shaped dicts) so
+    all downstream Stage 4 aggregation code is unchanged.
+    """
+    try:
+        cfg = config if isinstance(config, dict) else (CFG if isinstance(CFG, dict) else {})
+    except Exception:
+        cfg = {}
+    try:
+        dicts = run_providers_parallel(target, providers, cfg)
+    except Exception as e:
+        logging.error(f"run_providers_parallel failed, no evidence: {e}")
+        return []
+    evidences: List[Evidence] = []
+    for d in dicts or []:
+        try:
+            if isinstance(d, Evidence):
+                evidences.append(d)
+            elif isinstance(d, dict):
+                evidences.append(_ev_dict_to_evidence(d))
+        except Exception:
+            continue
     return evidences
 
 def calculate_provider_confidence(provider: BaseProvider) -> float:
@@ -978,9 +2561,7 @@ class Cache:
         s.l1 = {}; s.p = p; s._l = threading.Lock()
         s.h1 = s.h2 = s.m = 0
         try:
-            c = sqlite3.connect(p)
-            c.execute("CREATE TABLE IF NOT EXISTS cache(k TEXT PRIMARY KEY,d TEXT,e REAL)")
-            c.commit(); c.close()
+            cache_init(p)
         except Exception: pass
     def get(s, k):
         t = time.time()
@@ -989,25 +2570,53 @@ class Cache:
             if v and t < v[0]: s.h1 += 1; return v[1]
             if v: del s.l1[k]
         try:
-            c = sqlite3.connect(s.p)
-            r = c.execute("SELECT d,e FROM cache WHERE k=?", (k,)).fetchone()
-            if r and t < r[1]:
-                v = json.loads(r[0])
-                with s._l: s.l1[k] = (r[1], v)
-                s.h2 += 1; c.close(); return v
+            with _CACHE_DB_LOCK:
+                c = sqlite3.connect(s.p, timeout=30)
+                try:
+                    r = c.execute("SELECT value, ttl_seconds, cached_at_unix FROM cache WHERE key=?", (k,)).fetchone()
+                finally:
+                    c.close()
             if r:
-                c.execute("DELETE FROM cache WHERE k=?", (k,)); c.commit()
-            c.close()
+                try:
+                    v = json.loads(r[0])
+                except Exception:
+                    v = None
+                if v is not None:
+                    try:
+                        expiry = float(r[2]) + int(r[1])
+                    except Exception:
+                        expiry = 0.0
+                    if t < expiry:
+                        with s._l: s.l1[k] = (expiry, v)
+                        s.h2 += 1; return v
+                    try:
+                        with _CACHE_DB_LOCK:
+                            c = sqlite3.connect(s.p, timeout=30)
+                            try:
+                                c.execute("DELETE FROM cache WHERE key=?", (k,)); c.commit()
+                            finally:
+                                c.close()
+                    except Exception: pass
         except Exception: pass
         with s._l: s.m += 1
         return None
     def set(s, k, v, ttl):
-        e = time.time() + ttl
+        try:
+            ttl = int(ttl)
+        except Exception:
+            ttl = 3600
+        t = time.time()
+        e = t + ttl
         with s._l: s.l1[k] = (e, v)
         try:
-            c = sqlite3.connect(s.p)
-            c.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)", (k, json.dumps(v), e))
-            c.commit(); c.close()
+            iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            with _CACHE_DB_LOCK:
+                c = sqlite3.connect(s.p, timeout=30)
+                try:
+                    c.execute("INSERT OR REPLACE INTO cache(key, value, source, ttl_seconds, cached_at, cached_at_unix) VALUES(?,?,?,?,?,?)", (k, json.dumps(v, default=str), "http", int(ttl), iso, float(t)))
+                    c.commit()
+                finally:
+                    c.close()
         except Exception: pass
     def stats(s):
         with s._l:
@@ -2505,6 +4114,3255 @@ def ct_parse(ct_entries):
         }
         parsed.append(cert)
     return parsed
+
+# ============================================================
+#  CERTIFICATE INTELLIGENCE 2.0 — v34 (Stage 7)
+#  Single source of truth for TLS / CT certificate correlation.
+#  Reuses crt.sh (existing CT source); no new providers.
+# ============================================================
+def _is_ip(target: str) -> bool:
+    try:
+        ipaddress.ip_address(target)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_expired(not_after: Optional[str]) -> bool:
+    if not not_after:
+        return False
+    try:
+        dt = datetime.fromisoformat(not_after.replace("Z", "+00:00"))
+        return dt < datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+def _is_near_expiry(not_after: Optional[str], days: int = 30) -> bool:
+    if not not_after:
+        return False
+    try:
+        dt = datetime.fromisoformat(not_after.replace("Z", "+00:00"))
+        delta = (dt - datetime.now(timezone.utc)).days
+        return 0 <= delta <= days
+    except Exception:
+        return False
+
+
+def _get_name_attr(name: x509.Name, oid) -> Optional[str]:
+    try:
+        attrs = name.get_attributes_for_oid(oid)
+        return attrs[0].value if attrs else None
+    except Exception:
+        return None
+
+
+def _key_info(pubkey) -> Tuple[str, Optional[int]]:
+    if isinstance(pubkey, rsa.RSAPublicKey):
+        return "RSA", pubkey.key_size
+    if isinstance(pubkey, ec.EllipticCurvePublicKey):
+        return "EC", pubkey.key_size
+    if isinstance(pubkey, dsa.DSAPublicKey):
+        return "DSA", pubkey.key_size
+    return "unknown", None
+
+
+def _parse_x509(cert: x509.Certificate, source: str = "unknown") -> Dict[str, Any]:
+    """
+    Parse a cryptography.x509.Certificate into a structured dict.
+    """
+    fingerprint = hashlib.sha256(cert.public_bytes(serialization.Encoding.DER)).hexdigest()
+    subject_cn = _get_name_attr(cert.subject, NameOID.COMMON_NAME)
+    subject_o = _get_name_attr(cert.subject, NameOID.ORGANIZATION_NAME)
+    issuer_cn = _get_name_attr(cert.issuer, NameOID.COMMON_NAME)
+    issuer_o = _get_name_attr(cert.issuer, NameOID.ORGANIZATION_NAME)
+    san_domains: List[str] = []
+    san_ips: List[str] = []
+    try:
+        ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        for name in ext.value:
+            if isinstance(name, x509.DNSName):
+                san_domains.append(name.value.lower())
+            elif isinstance(name, x509.IPAddress):
+                san_ips.append(str(name.value))
+    except x509.ExtensionNotFound:
+        pass
+    if hasattr(cert, "not_valid_before_utc"):
+        not_before = cert.not_valid_before_utc.isoformat()
+    else:
+        not_before = cert.not_valid_before.isoformat()
+    if hasattr(cert, "not_valid_after_utc"):
+        not_after = cert.not_valid_after_utc.isoformat()
+    else:
+        not_after = cert.not_valid_after.isoformat()
+    now = datetime.now(timezone.utc)
+    try:
+        if hasattr(cert, "not_valid_after_utc"):
+            expired = cert.not_valid_after_utc < now
+        else:
+            expired = cert.not_valid_after < now.replace(tzinfo=None)
+    except Exception:
+        expired = False
+    near_expiry = False
+    try:
+        if hasattr(cert, "not_valid_after_utc"):
+            delta = (cert.not_valid_after_utc - now).days
+        else:
+            delta = (cert.not_valid_after - now.replace(tzinfo=None)).days
+        near_expiry = 0 <= delta <= 30
+    except Exception:
+        pass
+    pubkey = cert.public_key()
+    key_type, key_size = _key_info(pubkey)
+    try:
+        sig_algo = cert.signature_hash_algorithm.name if cert.signature_hash_algorithm else "unknown"
+    except Exception:
+        sig_algo = "unknown"
+    wildcard = any(d.startswith("*.") for d in san_domains) or (subject_cn or "").startswith("*.")
+    return {
+        "source": source,
+        "fingerprint_sha256": fingerprint,
+        "subject_cn": subject_cn,
+        "subject_o": subject_o,
+        "issuer_cn": issuer_cn,
+        "issuer_o": issuer_o,
+        "san_domains": sorted(set(san_domains)),
+        "san_ips": sorted(set(san_ips)),
+        "san_count": len(san_domains) + len(san_ips),
+        "not_before": not_before,
+        "not_after": not_after,
+        "expired": expired,
+        "near_expiry": near_expiry,
+        "key_type": key_type,
+        "key_size": key_size,
+        "signature_algorithm": sig_algo,
+        "wildcard": wildcard,
+        "serial": str(cert.serial_number),
+    }
+
+
+def live_certificate(ip: str, port: int = 443,
+                     timeout: int = 10) -> Optional[Dict[str, Any]]:
+    """
+    Perform a TLS handshake with the IP and extract the certificate.
+    Returns a dict with parsed certificate data, or None on failure.
+    """
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=ip) as ssock:
+                der = ssock.getpeercert(binary_form=True)
+                if not der:
+                    return None
+                cert = x509.load_der_x509_certificate(der)
+                return _parse_x509(cert, source="live")
+    except Exception as e:
+        return {"error": str(e), "source": "live", "status": "FAILED"}
+
+
+def ct_collect(target: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Query CT logs for certificates associated with the target.
+    Uses crt.sh JSON endpoint.
+    Returns a list of parsed certificate dicts.
+    """
+    results: List[Dict[str, Any]] = []
+    cert_cfg = (config or {}).get("certificate", {}) if isinstance(config, dict) else {}
+    timeout = cert_cfg.get("ct_timeout") or (config.get("timeouts", {}).get("http", 10) if isinstance(config, dict) else 10)
+    is_ip = _is_ip(target)
+    try:
+        if is_ip:
+            return results
+        url = f"https://crt.sh/?q={target}&output=json"
+        resp = requests.get(url, timeout=timeout)
+        if resp.status_code != 200:
+            return results
+        data = resp.json()
+    except Exception:
+        return results
+    if not isinstance(data, list):
+        return results
+    seen_fingerprints = set()
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        fp = entry.get("sha256") or entry.get("fingerprint_sha256")
+        if not fp:
+            cid = str(entry.get("id", ""))
+            fp = f"crtsh:{cid}" if cid else None
+        if not fp or fp in seen_fingerprints:
+            continue
+        seen_fingerprints.add(fp)
+        name_value = entry.get("name_value", "") or ""
+        san_domains = sorted({
+            n.strip().lower()
+            for n in str(name_value).split("\n")
+            if n.strip()
+        })
+        parsed = {
+            "source": "ct",
+            "fingerprint_sha256": fp,
+            "subject_cn": entry.get("common_name"),
+            "issuer_cn": entry.get("issuer_name"),
+            "issuer_o": None,
+            "san_domains": san_domains,
+            "san_ips": [],
+            "san_count": len(san_domains),
+            "not_before": entry.get("not_before"),
+            "not_after": entry.get("not_after"),
+            "expired": _is_expired(entry.get("not_after")),
+            "near_expiry": _is_near_expiry(entry.get("not_after")),
+            "key_type": None,
+            "key_size": None,
+            "signature_algorithm": None,
+            "wildcard": any(d.startswith("*.") for d in san_domains),
+            "serial": entry.get("serial_number"),
+            "ct_entry_id": entry.get("id"),
+        }
+        results.append(parsed)
+    return results
+
+
+def certificate_metadata(cert: Dict[str, Any],
+                         history: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Build a metadata object for a certificate.
+    history: optional dict with first_seen/last_seen from a CT timeline.
+    """
+    history = history or {}
+    return {
+        "fingerprint_sha256": cert.get("fingerprint_sha256"),
+        "first_seen": history.get("first_seen") or cert.get("not_before"),
+        "last_seen": history.get("last_seen") or cert.get("not_after"),
+        "current": not cert.get("expired", False),
+        "expired": cert.get("expired", False),
+        "near_expiry": cert.get("near_expiry", False),
+        "issuer_cn": cert.get("issuer_cn"),
+        "issuer_o": cert.get("issuer_o"),
+        "signature_algorithm": cert.get("signature_algorithm"),
+        "key_type": cert.get("key_type"),
+        "key_size": cert.get("key_size"),
+        "san_count": cert.get("san_count", 0),
+        "wildcard": cert.get("wildcard", False)
+    }
+
+
+def ct_correlate(live_cert: Optional[Dict[str, Any]],
+                 ct_certs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Correlate the live certificate with CT certificates.
+    Identify:
+      - Live cert in CT (same fingerprint)
+      - Live cert not in CT (private or internal)
+      - CT certs matching live SANs
+    """
+    result: Dict[str, Any] = {
+        "live_in_ct": False,
+        "live_fingerprint": None,
+        "ct_fingerprints": [],
+        "matching_sans": [],
+        "private_certificate": False
+    }
+    if not live_cert or live_cert.get("status") == "FAILED":
+        return result
+    live_fp = live_cert.get("fingerprint_sha256")
+    result["live_fingerprint"] = live_fp
+    result["ct_fingerprints"] = [c.get("fingerprint_sha256") for c in (ct_certs or [])]
+    if live_fp and live_fp in result["ct_fingerprints"]:
+        result["live_in_ct"] = True
+    elif live_fp:
+        result["private_certificate"] = True
+    live_sans = set(live_cert.get("san_domains", []) or [])
+    for c in (ct_certs or []):
+        shared = live_sans & set(c.get("san_domains", []) or [])
+        if shared:
+            result["matching_sans"].append({
+                "fingerprint": c.get("fingerprint_sha256"),
+                "shared_sans": sorted(shared)
+            })
+    return result
+
+
+def certificate_relationships(certificates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Build relationships:
+      - by issuer
+      - by fingerprint
+      - by shared SAN
+      - by wildcard scope
+    """
+    relationships: Dict[str, Any] = {
+        "by_issuer": {},
+        "by_fingerprint": {},
+        "by_shared_san": [],
+        "wildcard_certs": [],
+        "expired_certs": [],
+        "weak_algo_certs": []
+    }
+    for cert in (certificates or []):
+        issuer = cert.get("issuer_cn") or cert.get("issuer_o") or "unknown"
+        relationships["by_issuer"].setdefault(issuer, []).append(
+            cert.get("fingerprint_sha256")
+        )
+    for cert in (certificates or []):
+        fp = cert.get("fingerprint_sha256")
+        if fp:
+            relationships["by_fingerprint"].setdefault(fp, []).append(
+                cert.get("subject_cn") or cert.get("source")
+            )
+    san_map: Dict[str, List[str]] = {}
+    for cert in (certificates or []):
+        for san in (cert.get("san_domains", []) or []):
+            san_map.setdefault(san, []).append(cert.get("fingerprint_sha256"))
+    for san, fps in san_map.items():
+        if len(set(fps)) > 1:
+            relationships["by_shared_san"].append({
+                "san": san,
+                "certificates": sorted(set(fps))
+            })
+    relationships["wildcard_certs"] = [
+        c.get("fingerprint_sha256") for c in (certificates or []) if c.get("wildcard")
+    ]
+    relationships["expired_certs"] = [
+        c.get("fingerprint_sha256") for c in (certificates or []) if c.get("expired")
+    ]
+    weak = []
+    for c in (certificates or []):
+        algo = (c.get("signature_algorithm") or "").lower()
+        key_size = c.get("key_size") or 0
+        if "sha1" in algo or "md5" in algo:
+            weak.append(c.get("fingerprint_sha256"))
+        elif c.get("key_type") == "RSA" and key_size and key_size < 2048:
+            weak.append(c.get("fingerprint_sha256"))
+    relationships["weak_algo_certs"] = weak
+    return relationships
+
+
+def _certificate_anomalies(certificates: List[Dict[str, Any]],
+                           relationships: Dict[str, Any]) -> List[Dict[str, Any]]:
+    anomalies: List[Dict[str, Any]] = []
+    try:
+        cert_cfg = CFG.get("certificate", {}) if isinstance(CFG, dict) else {}
+    except Exception:
+        cert_cfg = {}
+    max_wildcards = cert_cfg.get("max_wildcards_before_warning", 5)
+    max_shared = cert_cfg.get("max_shared_san_before_warning", 3)
+    try:
+        max_wildcards = int(max_wildcards)
+    except Exception:
+        max_wildcards = 5
+    try:
+        max_shared = int(max_shared)
+    except Exception:
+        max_shared = 3
+    if relationships.get("expired_certs"):
+        anomalies.append({
+            "type": "expired_certificate",
+            "severity": "moderate",
+            "message": f"{len(relationships['expired_certs'])} expired certificate(s) found."
+        })
+    if relationships.get("weak_algo_certs"):
+        anomalies.append({
+            "type": "weak_algorithm",
+            "severity": "high",
+            "message": f"{len(relationships['weak_algo_certs'])} certificate(s) use weak algorithms."
+        })
+    wildcards = relationships.get("wildcard_certs", []) or []
+    if len(wildcards) > max_wildcards:
+        anomalies.append({
+            "type": "wildcard_overuse",
+            "severity": "informational",
+            "message": f"{len(wildcards)} wildcard certificates detected."
+        })
+    for entry in (relationships.get("by_shared_san", []) or []):
+        if len(entry.get("certificates", [])) > max_shared:
+            anomalies.append({
+                "type": "shared_san_across_certs",
+                "severity": "informational",
+                "message": f"SAN '{entry['san']}' appears in {len(entry['certificates'])} certificates."
+            })
+    return anomalies
+
+
+def certificate_intelligence(target: str,
+                             config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Full certificate intelligence pipeline.
+    Single source of truth for certificate layer (Stage 7).
+    """
+    config = config or {}
+    cert_cfg = config.get("certificate", {}) if isinstance(config, dict) else {}
+    include_expired = cert_cfg.get("include_expired", True)
+    include_san = cert_cfg.get("include_san", True)
+    include_fingerprint = cert_cfg.get("include_fingerprint", True)
+    live_handshake = cert_cfg.get("live_handshake", True)
+    timeouts = config.get("timeouts", {}) if isinstance(config, dict) else {}
+    live_timeout = timeouts.get("default", 10)
+    try:
+        live_timeout = int(live_timeout)
+    except Exception:
+        live_timeout = 10
+    live = None
+    if live_handshake:
+        try:
+            live = live_certificate(target, timeout=live_timeout)
+        except Exception as e:
+            live = {"error": str(e), "source": "live", "status": "FAILED"}
+    ct_certs = ct_collect(target, config)
+    if not include_expired:
+        ct_certs = [c for c in ct_certs if not c.get("expired")]
+    if not include_san:
+        for c in ([live] if live else []) + ct_certs:
+            if isinstance(c, dict):
+                c = dict(c)
+        # keep SANs internally for correlation; flag only controls exposure
+    _ = include_san
+    _ = include_fingerprint
+    correlation = ct_correlate(live, ct_certs)
+    all_certs = ([live] if live and isinstance(live, dict) and live.get("status") != "FAILED" and live.get("fingerprint_sha256") else []) + (ct_certs or [])
+    metadata = [certificate_metadata(c) for c in all_certs]
+    relationships = certificate_relationships(all_certs)
+    anomalies = _certificate_anomalies(all_certs, relationships)
+    return {
+        "live_certificate": live,
+        "ct_certificates": ct_certs,
+        "correlation": correlation,
+        "metadata": metadata,
+        "relationships": relationships,
+        "anomalies": anomalies,
+        "summary": {
+            "total_certificates": len(all_certs),
+            "live_in_ct": correlation.get("live_in_ct", False),
+            "private_certificate": correlation.get("private_certificate", False),
+            "expired_count": len(relationships.get("expired_certs", [])),
+            "weak_algo_count": len(relationships.get("weak_algo_certs", [])),
+            "wildcard_count": len(relationships.get("wildcard_certs", []))
+        }
+    }
+
+# ============================================================
+#  PASSIVE DNS INTELLIGENCE — v34.1 (Stage 8)
+#  Single source of truth for passive DNS timeline layer.
+#  Uses existing passive DNS source(s); no new providers.
+# ============================================================
+def _normalize_timestamp(ts: Any) -> Optional[str]:
+    """
+    Normalize various timestamp formats to ISO8601 UTC.
+    Accepts: int (unix), float (unix), str (ISO8601 or unix string).
+    Returns None if unparseable.
+    """
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        try:
+            dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            return None
+    if isinstance(ts, str):
+        ts = ts.strip()
+        if not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            pass
+        try:
+            dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            return None
+    return None
+
+
+def _query_passive_dns_sources(target: str, config: Dict[str, Any],
+                               timeout: int) -> List[Dict[str, Any]]:
+    """
+    Query configured passive DNS sources.
+    Returns a list of raw records with fields:
+      domain, first_seen, last_seen, count, source, direction
+    """
+    records: List[Dict[str, Any]] = []
+    pdns_cfg = (config or {}).get("passive_dns", {}) if isinstance(config, dict) else {}
+    sources = pdns_cfg.get("sources", []) or []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        name = source.get("name", "unknown")
+        if source.get("enabled") is False:
+            continue
+        url_template = source.get("url")
+        if not url_template:
+            continue
+        try:
+            url = url_template.format(target=target)
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            items = data if isinstance(data, list) else data.get("results", [])
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                records.append({
+                    "domain": item.get("domain") or item.get("rrname"),
+                    "first_seen": item.get("first_seen") or item.get("time_first"),
+                    "last_seen": item.get("last_seen") or item.get("time_last"),
+                    "count": item.get("count"),
+                    "source": name,
+                    "direction": item.get("direction", "ip_to_domain")
+                })
+        except Exception:
+            continue
+    return records
+
+
+def passive_dns_collect(target: str, config: Dict[str, Any]) -> List[Evidence]:
+    """
+    Collect passive DNS records for a target and return them as Evidence objects.
+    Each Evidence represents one observation:
+      value = domain (or IP depending on direction)
+      metadata:
+        first_seen: ISO8601
+        last_seen:  ISO8601
+        direction:  "domain_to_ip" | "ip_to_domain"
+        count:      observation count (if available)
+    """
+    evidences: List[Evidence] = []
+    pdns_cfg = (config or {}).get("passive_dns", {}) if isinstance(config, dict) else {}
+    timeout = (config.get("timeouts", {}).get("http", 10) if isinstance(config, dict) else 10)
+    try:
+        timeout = int(timeout)
+    except Exception:
+        timeout = 10
+    raw_records = _query_passive_dns_sources(target, config, timeout)
+    for rec in raw_records:
+        domain = rec.get("domain")
+        if not domain:
+            continue
+        first_seen = _normalize_timestamp(rec.get("first_seen"))
+        last_seen = _normalize_timestamp(rec.get("last_seen"))
+        evidences.append(make_evidence(
+            source=rec.get("source", "passive_dns"),
+            value=domain,
+            normalized_value=str(domain).strip().lower().rstrip("."),
+            confidence=rec.get("confidence", 0.6),
+            status="OK",
+            ttl_key="passive_dns",
+            metadata={
+                "first_seen": first_seen,
+                "last_seen": last_seen,
+                "direction": rec.get("direction", "ip_to_domain"),
+                "count": rec.get("count"),
+                "raw_source": rec.get("source", "passive_dns")
+            }
+        ))
+    return evidences
+
+
+def passive_dns_timeline(evidences: List[Evidence],
+                         config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Build a chronological timeline per domain.
+    Each entry:
+      domain, first_seen, last_seen, lifespan_days, count,
+      observations (list of {first_seen, last_seen}),
+      lifecycle: ACTIVE | HISTORICAL
+    """
+    pdns_cfg = (config or {}).get("passive_dns", {}) if isinstance(config, dict) else {}
+    active_window_days = pdns_cfg.get("active_window_days", 30)
+    try:
+        active_window_days = int(active_window_days)
+    except Exception:
+        active_window_days = 30
+    now = datetime.now(timezone.utc)
+    grouped: Dict[str, List[Evidence]] = defaultdict(list)
+    for ev in (evidences or []):
+        if getattr(ev, "status", None) != "OK":
+            continue
+        key = getattr(ev, "normalized_value", None)
+        if not key:
+            continue
+        grouped[key].append(ev)
+    timeline = []
+    for domain, evs in grouped.items():
+        firsts = [e.metadata.get("first_seen") for e in evs if e.metadata.get("first_seen")]
+        lasts = [e.metadata.get("last_seen") for e in evs if e.metadata.get("last_seen")]
+        if not firsts and lasts:
+            firsts = lasts
+        if not lasts and firsts:
+            lasts = firsts
+        if not firsts or not lasts:
+            timeline.append({
+                "domain": domain,
+                "first_seen": None,
+                "last_seen": None,
+                "lifespan_days": None,
+                "count": sum((e.metadata.get("count") or 0) if isinstance(e.metadata.get("count"), (int, float)) else 0 for e in evs),
+                "observations": [],
+                "lifecycle": "UNKNOWN"
+            })
+            continue
+        first_seen = min(firsts)
+        last_seen = max(lasts)
+        try:
+            dt_first = datetime.fromisoformat(first_seen.replace("Z", "+00:00"))
+            dt_last = datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+            lifespan_days = (dt_last - dt_first).days
+        except Exception:
+            dt_last = None
+            lifespan_days = None
+        lifecycle = "UNKNOWN"
+        if dt_last is not None:
+            try:
+                if dt_last.tzinfo is None:
+                    dt_last = dt_last.replace(tzinfo=timezone.utc)
+                age_days = (now - dt_last).days
+                lifecycle = "ACTIVE" if age_days <= active_window_days else "HISTORICAL"
+            except Exception:
+                lifecycle = "UNKNOWN"
+        observations = [
+            {
+                "first_seen": e.metadata.get("first_seen"),
+                "last_seen": e.metadata.get("last_seen"),
+                "count": e.metadata.get("count"),
+                "source": e.source
+            }
+            for e in evs
+        ]
+        observations.sort(key=lambda x: (x["first_seen"] or ""))
+        total_count = 0
+        for e in evs:
+            c = e.metadata.get("count")
+            if isinstance(c, (int, float)):
+                total_count += c
+        timeline.append({
+            "domain": domain,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "lifespan_days": lifespan_days,
+            "count": total_count,
+            "observations": observations,
+            "lifecycle": lifecycle
+        })
+    timeline.sort(key=lambda x: (x["last_seen"] or ""), reverse=True)
+    return timeline
+
+
+def passive_dns_stats(timeline: List[Dict[str, Any]],
+                      config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute statistics over the passive DNS timeline.
+    """
+    pdns_cfg = (config or {}).get("passive_dns", {}) if isinstance(config, dict) else {}
+    churn_threshold = pdns_cfg.get("churn_threshold", 5)
+    short_lived_days = pdns_cfg.get("short_lived_days", 7)
+    max_churn = pdns_cfg.get("max_churn_domains", 20)
+    try:
+        churn_threshold = int(churn_threshold)
+    except Exception:
+        churn_threshold = 5
+    try:
+        short_lived_days = int(short_lived_days)
+    except Exception:
+        short_lived_days = 7
+    try:
+        max_churn = int(max_churn)
+    except Exception:
+        max_churn = 20
+    timeline = timeline or []
+    total = len(timeline)
+    active = [t for t in timeline if t.get("lifecycle") == "ACTIVE"]
+    historical = [t for t in timeline if t.get("lifecycle") == "HISTORICAL"]
+    unknown = [t for t in timeline if t.get("lifecycle") == "UNKNOWN"]
+    churn_domains = []
+    for t in timeline:
+        obs = t.get("observations", []) or []
+        if len(obs) >= churn_threshold:
+            if t.get("lifespan_days") is not None and t["lifespan_days"] <= short_lived_days:
+                churn_domains.append({
+                    "domain": t.get("domain"),
+                    "observation_count": len(obs),
+                    "lifespan_days": t.get("lifespan_days")
+                })
+            elif t.get("lifespan_days") is None:
+                churn_domains.append({
+                    "domain": t.get("domain"),
+                    "observation_count": len(obs),
+                    "lifespan_days": t.get("lifespan_days")
+                })
+        elif len(obs) >= churn_threshold:
+            churn_domains.append({
+                "domain": t.get("domain"),
+                "observation_count": len(obs),
+                "lifespan_days": t.get("lifespan_days")
+            })
+    lifespans = [t["lifespan_days"] for t in timeline if t.get("lifespan_days") is not None]
+    avg_lifespan = round(sum(lifespans) / len(lifespans), 2) if lifespans else None
+    firsts = [t["first_seen"] for t in timeline if t.get("first_seen")]
+    lasts = [t["last_seen"] for t in timeline if t.get("last_seen")]
+    return {
+        "total_domains": total,
+        "active_count": len(active),
+        "historical_count": len(historical),
+        "unknown_count": len(unknown),
+        "churn_count": len(churn_domains),
+        "churn_domains": churn_domains[:max_churn],
+        "avg_lifespan_days": avg_lifespan,
+        "earliest_first_seen": min(firsts) if firsts else None,
+        "latest_last_seen": max(lasts) if lasts else None,
+        "churn_threshold": churn_threshold,
+        "short_lived_days": short_lived_days
+    }
+
+
+def _passive_dns_anomalies(timeline: List[Dict[str, Any]],
+                           stats: Dict[str, Any]) -> List[Dict[str, Any]]:
+    anomalies = []
+    if (stats or {}).get("churn_count", 0) > 0:
+        anomalies.append({
+            "type": "dns_churn",
+            "severity": "moderate",
+            "message": f"{stats['churn_count']} domain(s) show rapid DNS churn."
+        })
+    if (stats or {}).get("historical_count", 0) > 0:
+        anomalies.append({
+            "type": "historical_domains",
+            "severity": "informational",
+            "message": f"{stats['historical_count']} historical domain(s) no longer active."
+        })
+    for t in (timeline or []):
+        if t.get("lifespan_days") is not None and t["lifespan_days"] <= 1:
+            anomalies.append({
+                "type": "short_lived_domain",
+                "severity": "informational",
+                "message": f"Domain '{t.get('domain')}' had lifespan of {t['lifespan_days']} day(s)."
+            })
+    unknown = [t for t in (timeline or []) if t.get("lifecycle") == "UNKNOWN"]
+    if unknown:
+        anomalies.append({
+            "type": "missing_timestamps",
+            "severity": "low",
+            "message": f"{len(unknown)} domain(s) have no usable timestamps."
+        })
+    return anomalies
+
+
+def _related_domains_by_ip(timeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Identify domains that share observations (e.g., same IP or same time window).
+    This is a lightweight correlation based on overlapping observation windows.
+    """
+    related = []
+    timeline = timeline or []
+    for i, a in enumerate(timeline):
+        for b in timeline[i+1:]:
+            a_first = a.get("first_seen")
+            a_last = a.get("last_seen")
+            b_first = b.get("first_seen")
+            b_last = b.get("last_seen")
+            if not (a_first and a_last and b_first and b_last):
+                continue
+            if a_first <= b_last and b_first <= a_last:
+                related.append({
+                    "domain_a": a.get("domain"),
+                    "domain_b": b.get("domain"),
+                    "overlap_start": max(a_first, b_first),
+                    "overlap_end": min(a_last, b_last)
+                })
+    try:
+        cap = int((CFG.get("passive_dns", {}) or {}).get("max_related_domains", 50)) if isinstance(CFG, dict) else 50
+    except Exception:
+        cap = 50
+    return related[:cap]
+
+
+def passive_dns_intelligence(target: str,
+                             config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Full passive DNS intelligence pipeline.
+    Single source of truth for passive DNS layer (Stage 8).
+    """
+    config = config or {}
+    pdns_cfg = config.get("passive_dns", {}) if isinstance(config, dict) else {}
+    build_timeline = pdns_cfg.get("timeline", True)
+    evidences = passive_dns_collect(target, config)
+    timeline = passive_dns_timeline(evidences, config) if build_timeline else []
+    stats = passive_dns_stats(timeline, config)
+    anomalies = _passive_dns_anomalies(timeline, stats)
+    related = _related_domains_by_ip(timeline)
+    return {
+        "evidence": [ev.to_dict() for ev in evidences],
+        "timeline": timeline,
+        "stats": stats,
+        "related_domains": related,
+        "anomalies": anomalies,
+        "summary": {
+            "total_domains": stats.get("total_domains"),
+            "active": stats.get("active_count"),
+            "historical": stats.get("historical_count"),
+            "churn": stats.get("churn_count"),
+            "avg_lifespan_days": stats.get("avg_lifespan_days")
+        }
+    }
+
+# ============================================================
+#  HISTORICAL INTELLIGENCE — v35 (Stage 9)
+#  Single source of truth for change detection layer.
+#  Storage: snapshots table inside reconip.db. No new providers.
+# ============================================================
+def init_snapshot_schema(db_path: str = "reconip.db") -> None:
+    """
+    Ensure the snapshots table exists in reconip.db.
+    """
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                data TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_snapshots_target
+            ON snapshots(target)
+        """)
+        conn.commit()
+
+
+def _extract_snapshot_fields(report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract a compact, comparable snapshot from a full report.
+    """
+    snapshot: Dict[str, Any] = {}
+
+    # DNS
+    dns = report.get("dns_intelligence", {}) or {}
+    dns_by_type: Dict[str, List[str]] = {}
+    for ev in dns.get("evidence", []) or []:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("status") != "OK":
+            continue
+        rtype = (ev.get("metadata", {}) or {}).get("record_type", "UNKNOWN")
+        dns_by_type.setdefault(rtype, []).append(ev.get("normalized_value"))
+    snapshot["dns"] = {k: sorted(set(map(str, v))) for k, v in dns_by_type.items()}
+
+    # ASN
+    infra = report.get("infrastructure_intelligence", {}) or {}
+    asn = infra.get("asn", {}) or {}
+    snapshot["asn"] = {
+        "asn": asn.get("asn"),
+        "asn_name": asn.get("asn_name"),
+        "country": asn.get("country"),
+        "type": asn.get("type")
+    }
+
+    # Prefix
+    prefix = infra.get("prefix", {}) or {}
+    snapshot["prefix"] = {
+        "cidr": prefix.get("cidr"),
+        "rir": prefix.get("rir"),
+        "allocated": prefix.get("allocated")
+    }
+
+    # Certificate
+    cert = report.get("certificate_intelligence", {}) or {}
+    live = cert.get("live_certificate") or {}
+    if not isinstance(live, dict):
+        live = {}
+    snapshot["certificate"] = {
+        "fingerprint_sha256": live.get("fingerprint_sha256"),
+        "issuer_cn": live.get("issuer_cn"),
+        "not_after": live.get("not_after"),
+        "san_count": live.get("san_count"),
+        "san_domains": sorted(set(live.get("san_domains", []) or []))
+    }
+
+    # Domain (passive DNS)
+    pdns = report.get("passive_dns_intelligence", {}) or {}
+    snapshot["domains"] = sorted({
+        t.get("domain") for t in pdns.get("timeline", []) or [] if isinstance(t, dict) and t.get("domain")
+    })
+
+    # Threat Intel
+    ti = report.get("threat_intelligence", {}) or {}
+    snapshot["threat"] = {
+        "observed_threat_score": ti.get("observed_threat_score"),
+        "threat_confidence": ti.get("threat_confidence"),
+        "ok_count": ti.get("ok_count"),
+        "failed_count": ti.get("failed_count")
+    }
+
+    # WHOIS / RDAP
+    rdap = infra.get("rdap", {}) or {}
+    org = infra.get("organization", {}) or {}
+    snapshot["whois"] = {
+        "org": org.get("name"),
+        "country": org.get("country"),
+        "abuse_email": org.get("abuse_email"),
+        "created": rdap.get("created"),
+        "updated": rdap.get("updated")
+    }
+
+    return snapshot
+
+
+def snapshot_current_state(target: str,
+                           report: Dict[str, Any],
+                           config: Dict[str, Any],
+                           db_path: str = "reconip.db") -> None:
+    """
+    Store a compact snapshot of the current report for future comparison.
+    Only fields that are stable and comparable are stored.
+    """
+    snapshot = _extract_snapshot_fields(report)
+    with _get_sqlite_lock():
+        with sqlite3.connect(db_path, timeout=30) as conn:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except Exception:
+                pass
+            conn.execute(
+                "INSERT INTO snapshots (target, timestamp, data) VALUES (?, ?, ?)",
+                (
+                    target,
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    json.dumps(snapshot, sort_keys=True)
+                )
+            )
+            conn.commit()
+
+
+def load_previous_snapshot(target: str,
+                           db_path: str = "reconip.db") -> Optional[Dict[str, Any]]:
+    """
+    Return the most recent previous snapshot for the target,
+    or None if no previous snapshot exists.
+    """
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            "SELECT timestamp, data FROM snapshots "
+            "WHERE target = ? ORDER BY id DESC LIMIT 2",
+            (target,)
+        )
+        rows = cursor.fetchall()
+
+    if len(rows) < 2:
+        # Only current snapshot exists (or none)
+        return None
+
+    # rows[0] is the current (just inserted) snapshot
+    # rows[1] is the previous one
+    timestamp, data = rows[1]
+    try:
+        parsed = json.loads(data)
+        parsed["_timestamp"] = timestamp
+        return parsed
+    except Exception:
+        return None
+
+
+def _compare_field(field: str, current: Any, previous: Any) -> Dict[str, Any]:
+    """
+    Compare a single field and return a structured diff.
+    Handles dicts, lists, and scalars.
+    """
+    result: Dict[str, Any] = {
+        "field": field,
+        "change_type": "UNCHANGED",
+        "changes": []
+    }
+
+    # Both missing
+    if current is None and previous is None:
+        return result
+
+    # Added (previous missing)
+    if previous is None and current is not None:
+        result["change_type"] = "ADDED"
+        result["changes"].append({
+            "key": field,
+            "old": None,
+            "new": current
+        })
+        return result
+
+    # Removed (current missing)
+    if current is None and previous is not None:
+        result["change_type"] = "REMOVED"
+        result["changes"].append({
+            "key": field,
+            "old": previous,
+            "new": None
+        })
+        return result
+
+    # Dict comparison
+    if isinstance(current, dict) and isinstance(previous, dict):
+        for key in sorted(set(current.keys()) | set(previous.keys())):
+            cur_val = current.get(key)
+            prev_val = previous.get(key)
+            if cur_val != prev_val:
+                result["changes"].append({
+                    "key": f"{field}.{key}",
+                    "old": prev_val,
+                    "new": cur_val
+                })
+        if result["changes"]:
+            result["change_type"] = "MODIFIED"
+        return result
+
+    # List comparison
+    if isinstance(current, list) and isinstance(previous, list):
+        cur_set = set(map(str, current))
+        prev_set = set(map(str, previous))
+        added = sorted(cur_set - prev_set)
+        removed = sorted(prev_set - cur_set)
+        if added:
+            result["changes"].append({"key": f"{field}.added", "old": [], "new": added})
+        if removed:
+            result["changes"].append({"key": f"{field}.removed", "old": removed, "new": []})
+        if result["changes"]:
+            result["change_type"] = "MODIFIED"
+        return result
+
+    # Scalar comparison
+    if current != previous:
+        result["change_type"] = "MODIFIED"
+        result["changes"].append({
+            "key": field,
+            "old": previous,
+            "new": current
+        })
+    return result
+
+
+def historical_compare(current: Dict[str, Any],
+                       previous: Dict[str, Any],
+                       config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compare current and previous snapshots field by field.
+    Returns a structured comparison dict.
+    """
+    history_cfg = (config or {}).get("history", {}) if isinstance(config, dict) else {}
+    compare_fields = history_cfg.get("compare_fields",
+                                     ["dns", "asn", "prefix", "certificate",
+                                      "whois", "threat", "domains"])
+
+    comparison: Dict[str, Any] = {
+        "previous_timestamp": previous.get("_timestamp"),
+        "current_timestamp": current.get("_timestamp"),
+        "fields": {}
+    }
+
+    for field in compare_fields:
+        cur = current.get(field)
+        prev = previous.get(field)
+        comparison["fields"][field] = _compare_field(field, cur, prev)
+
+    return comparison
+
+
+def _default_severity_map() -> Dict[str, str]:
+    return {
+        "certificate.fingerprint_sha256": "critical",
+        "certificate.issuer_cn": "high",
+        "asn.asn": "critical",
+        "asn.asn_name": "moderate",
+        "prefix.cidr": "high",
+        "prefix.rir": "moderate",
+        "dns.NS": "high",
+        "dns.MX": "moderate",
+        "dns.A": "moderate",
+        "dns.AAAA": "moderate",
+        "dns.TXT": "low",
+        "dns.CAA": "low",
+        "whois.abuse_email": "critical",
+        "whois.org": "moderate",
+        "whois.country": "moderate",
+        "threat.observed_threat_score": "high",
+        "threat.threat_confidence": "high",
+        "domains": "low"
+    }
+
+
+def _classify_change_severity(key: str, change: Dict[str, Any],
+                              severity_map: Dict[str, str]) -> str:
+    """
+    Return the severity for a given change.
+    Falls back to 'informational' if not mapped.
+    Special handling for threat score deltas.
+    """
+    # Exact match
+    if key in severity_map:
+        base = severity_map[key]
+        # Escalate threat score changes based on delta
+        if key == "threat.observed_threat_score":
+            try:
+                old = float(change.get("old") or 0)
+                new = float(change.get("new") or 0)
+                delta = abs(new - old)
+                if delta >= 50:
+                    return "critical"
+                if delta >= 20:
+                    return "high"
+                if delta >= 10:
+                    return "moderate"
+                return "low"
+            except Exception:
+                return base
+        return base
+
+    # Prefix match (e.g., "dns.A.added")
+    for mapped_key, sev in (severity_map or {}).items():
+        if key.startswith(mapped_key + "."):
+            return sev
+
+    return "informational"
+
+
+def change_detection(comparison: Dict[str, Any],
+                     config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Assign severity to each change and produce a prioritized list.
+    """
+    history_cfg = (config or {}).get("history", {}) if isinstance(config, dict) else {}
+    severity_map = history_cfg.get("severity_map", _default_severity_map())
+    if not isinstance(severity_map, dict):
+        severity_map = _default_severity_map()
+    max_changes = history_cfg.get("max_changes_in_report", 100)
+    try:
+        max_changes = int(max_changes)
+    except Exception:
+        max_changes = 100
+
+    changes = []
+    for field, diff in (comparison.get("fields", {}) or {}).items():
+        for change in (diff.get("changes", []) or []):
+            key = change.get("key", field)
+            severity = _classify_change_severity(key, change, severity_map)
+            changes.append({
+                "field": field,
+                "key": key,
+                "old": change.get("old"),
+                "new": change.get("new"),
+                "change_type": diff.get("change_type"),
+                "severity": severity
+            })
+
+    # Sort by severity
+    order = {"critical": 0, "high": 1, "moderate": 2, "low": 3, "informational": 4}
+    changes.sort(key=lambda c: order.get(c["severity"], 99))
+
+    changes = changes[:max_changes] if max_changes and max_changes > 0 else changes
+
+    return {
+        "total_changes": len(changes),
+        "by_severity": {
+            "critical": len([c for c in changes if c["severity"] == "critical"]),
+            "high": len([c for c in changes if c["severity"] == "high"]),
+            "moderate": len([c for c in changes if c["severity"] == "moderate"]),
+            "low": len([c for c in changes if c["severity"] == "low"]),
+            "informational": len([c for c in changes if c["severity"] == "informational"])
+        },
+        "changes": changes,
+        "previous_timestamp": comparison.get("previous_timestamp"),
+        "current_timestamp": comparison.get("current_timestamp")
+    }
+
+
+def historical_intelligence(target: str,
+                            current_report: Dict[str, Any],
+                            config: Dict[str, Any],
+                            db_path: str = "reconip.db") -> Dict[str, Any]:
+    """
+    Full historical intelligence pipeline.
+    """
+    config = config or {}
+    history_cfg = config.get("history", {}) if isinstance(config, dict) else {}
+    if not history_cfg.get("enabled", True):
+        return {"enabled": False}
+
+    db_path = history_cfg.get("db_path", db_path) or db_path
+
+    # Step 1: Ensure schema
+    init_snapshot_schema(db_path)
+
+    # Step 2: Store current snapshot
+    snapshot_current_state(target, current_report, config, db_path)
+
+    # Step 3: Load previous snapshot
+    previous = load_previous_snapshot(target, db_path)
+
+    if previous is None:
+        return {
+            "enabled": True,
+            "status": "FIRST_OBSERVATION",
+            "message": "No previous snapshot found. Baseline established.",
+            "previous_timestamp": None,
+            "current_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "changes": [],
+            "total_changes": 0
+        }
+
+    # Step 4: Current snapshot
+    current = _extract_snapshot_fields(current_report)
+    current["_timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Step 5: Compare
+    comparison = historical_compare(current, previous, config)
+
+    # Step 6: Detect changes
+    detection = change_detection(comparison, config)
+
+    return {
+        "enabled": True,
+        "status": "COMPARED",
+        "previous_timestamp": previous.get("_timestamp"),
+        "current_timestamp": current.get("_timestamp"),
+        "comparison": comparison,
+        "detection": detection
+    }
+
+# ============================================================
+#  ATTACK SURFACE INTELLIGENCE — v37 (Stage 11)
+#  Passive inventory of exposed services. OPEN != VULNERABLE.
+#  No active scanning unless explicitly authorized in config.
+#  No exploitation. This stage inventories, it does not attack.
+# ============================================================
+# Common port -> service name mapping (static, no scanning)
+KNOWN_PORTS: Dict[int, Dict[str, Any]] = {
+    21:   {"service": "ftp",      "protocol": "tcp", "risk_class": "high",   "sensitive": True},
+    22:   {"service": "ssh",      "protocol": "tcp", "risk_class": "moderate", "sensitive": True},
+    23:   {"service": "telnet",   "protocol": "tcp", "risk_class": "critical", "sensitive": True},
+    25:   {"service": "smtp",     "protocol": "tcp", "risk_class": "moderate", "sensitive": False},
+    53:   {"service": "dns",      "protocol": "tcp/udp", "risk_class": "low", "sensitive": False},
+    80:   {"service": "http",     "protocol": "tcp", "risk_class": "low",    "sensitive": False},
+    110:  {"service": "pop3",     "protocol": "tcp", "risk_class": "moderate", "sensitive": False},
+    143:  {"service": "imap",     "protocol": "tcp", "risk_class": "moderate", "sensitive": False},
+    443:  {"service": "https",    "protocol": "tcp", "risk_class": "low",    "sensitive": False},
+    445:  {"service": "smb",      "protocol": "tcp", "risk_class": "high",   "sensitive": True},
+    993:  {"service": "imaps",    "protocol": "tcp", "risk_class": "low",    "sensitive": False},
+    995:  {"service": "pop3s",    "protocol": "tcp", "risk_class": "low",    "sensitive": False},
+    1433: {"service": "mssql",    "protocol": "tcp", "risk_class": "high",   "sensitive": True},
+    1521: {"service": "oracle",   "protocol": "tcp", "risk_class": "high",   "sensitive": True},
+    3306: {"service": "mysql",    "protocol": "tcp", "risk_class": "high",   "sensitive": True},
+    3389: {"service": "rdp",      "protocol": "tcp", "risk_class": "critical","sensitive": True},
+    5432: {"service": "postgres", "protocol": "tcp", "risk_class": "high",   "sensitive": True},
+    5900: {"service": "vnc",      "protocol": "tcp", "risk_class": "critical","sensitive": True},
+    6379: {"service": "redis",    "protocol": "tcp", "risk_class": "high",   "sensitive": True},
+    8080: {"service": "http-alt", "protocol": "tcp", "risk_class": "low",    "sensitive": False},
+    8443: {"service": "https-alt","protocol": "tcp", "risk_class": "low",    "sensitive": False},
+    27017:{"service": "mongodb",  "protocol": "tcp", "risk_class": "high",   "sensitive": True},
+}
+
+
+def _collect_passive_services(target: str,
+                              report: Dict[str, Any],
+                              config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Collect passive service information from existing report data.
+
+    Sources:
+      - TLS handshake (port 443 confirmed)
+      - DNS (port 53 for DNS servers)
+      - MX/NS context
+      - Any imported scan results (from config or prior authorized scans)
+
+    NO active scanning is performed here.
+    """
+    services: List[Dict[str, Any]] = []
+
+    # ---- TLS handshake confirms 443/tcp ----
+    cert_intel = report.get("certificate_intelligence", {}) or {}
+    live = cert_intel.get("live_certificate") or {}
+    if isinstance(live, dict) and live and live.get("source") == "live":
+        services.append({
+            "port": 443,
+            "protocol": "tcp",
+            "state": "open",
+            "service": "https",
+            "evidence": "TLS handshake succeeded",
+            "source": "live_tls",
+            "confidence": 1.0
+        })
+
+    # ---- DNS context: PTR target means DNS service ----
+    dns = report.get("dns_intelligence", {}) or {}
+    dns_analysis = dns.get("analysis", {}) or {}
+    record_types = dns_analysis.get("record_types_present", []) or []
+    if "PTR" in record_types and "SOA" in record_types:
+        services.append({
+            "port": 53,
+            "protocol": "tcp/udp",
+            "state": "open",
+            "service": "dns",
+            "evidence": "PTR + SOA records indicate authoritative DNS",
+            "source": "dns_context",
+            "confidence": 0.9
+        })
+
+    # ---- Imported passive scan results ----
+    as_cfg = (config or {}).get("attack_surface", {}) if isinstance(config, dict) else {}
+    imported = as_cfg.get("imported_services", []) or []
+    for item in imported:
+        if not isinstance(item, dict):
+            continue
+        if item.get("target") == target or item.get("target") == "*":
+            services.append({
+                "port": item.get("port"),
+                "protocol": item.get("protocol", "tcp"),
+                "state": item.get("state", "open"),
+                "service": item.get("service"),
+                "evidence": item.get("evidence", "imported"),
+                "source": item.get("source", "imported"),
+                "confidence": item.get("confidence", 0.8)
+            })
+
+    return services
+
+
+def _collect_authorized_scan_services(target: str,
+                                      config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Perform an authorized active scan ONLY if explicitly enabled in config.
+
+    Placeholder: does NOT perform scanning by default. Actual scanning is
+    out of scope for this stage and requires explicit authorization,
+    legal review, and a dedicated stage.
+    """
+    as_cfg = (config or {}).get("attack_surface", {}) if isinstance(config, dict) else {}
+    if not as_cfg.get("port_scan", False):
+        return []
+
+    # Authorization gate
+    if not as_cfg.get("authorized", False):
+        return []
+
+    allowlist = as_cfg.get("authorized_targets", []) or []
+    if target not in allowlist and "*" not in allowlist:
+        return []
+
+    # No active scanning implemented in this stage.
+    # Return empty to avoid accidental active behavior.
+    return []
+
+
+def service_inventory(services: List[Dict[str, Any]],
+                      config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize and enrich a list of raw services into a structured inventory.
+    """
+    as_cfg = (config or {}).get("attack_surface", {}) if isinstance(config, dict) else {}
+    include_sensitive = as_cfg.get("include_sensitive", True)
+
+    inventory: List[Dict[str, Any]] = []
+    by_port: Dict[str, int] = defaultdict(int)
+    by_service: Dict[str, int] = defaultdict(int)
+    sensitive_ports: List[Dict[str, Any]] = []
+
+    for svc in services or []:
+        if not isinstance(svc, dict):
+            continue
+        port = svc.get("port")
+        if port is None:
+            continue
+        try:
+            port = int(port)
+        except Exception:
+            continue
+
+        known = KNOWN_PORTS.get(port, {})
+        entry = {
+            "port": port,
+            "protocol": svc.get("protocol") or known.get("protocol", "tcp"),
+            "state": svc.get("state", "open"),
+            "service": svc.get("service") or known.get("service", "unknown"),
+            "risk_class": known.get("risk_class", "unknown"),
+            "sensitive": known.get("sensitive", False),
+            "evidence": svc.get("evidence", ""),
+            "source": svc.get("source", "unknown"),
+            "confidence": svc.get("confidence", 0.5)
+        }
+        inventory.append(entry)
+
+        by_port[entry["protocol"]] += 1
+        by_service[entry["service"]] += 1
+
+        if entry["sensitive"]:
+            sensitive_ports.append(entry)
+
+    # Deduplicate by (port, protocol)
+    seen = set()
+    deduped = []
+    for e in inventory:
+        key = (e["port"], e["protocol"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(e)
+
+    # Sort by port
+    deduped.sort(key=lambda x: x["port"])
+
+    return {
+        "services": deduped,
+        "service_count": len(deduped),
+        "sensitive_count": len(sensitive_ports),
+        "sensitive_services": sensitive_ports if include_sensitive else [],
+        "by_protocol": dict(by_port),
+        "by_service": dict(by_service),
+        "ports": sorted({e["port"] for e in deduped})
+    }
+
+
+def _is_private_ip(ip: str) -> bool:
+    try:
+        import ipaddress
+        return ipaddress.ip_address(ip).is_private
+    except Exception:
+        return False
+
+
+def _classify_exposure(inventory: Dict[str, Any],
+                       report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Classify exposure: external vs internal, sensitive vs non-sensitive.
+    For now, everything on an internet-routable IP is considered external.
+    """
+    external = []
+    internal = []
+
+    # For now, treat all as external unless IP is RFC1918
+    ip = (report.get("infrastructure_intelligence", {}) or {}).get("ip", "") or ""
+    is_private = _is_private_ip(ip)
+
+    for svc in inventory.get("services", []) or []:
+        if is_private:
+            internal.append(svc)
+        else:
+            external.append(svc)
+
+    return {
+        "external_count": len(external),
+        "internal_count": len(internal),
+        "external_services": external,
+        "internal_services": internal,
+        "classification": "internal" if is_private else "external"
+    }
+
+
+def _attack_surface_anomalies(inventory: Dict[str, Any],
+                              report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    anomalies: List[Dict[str, Any]] = []
+    asn_type = ((report.get("infrastructure_intelligence", {}) or {}).get("asn", {}) or {}).get("type", "unknown")
+
+    for svc in inventory.get("services", []) or []:
+        # Sensitive administrative ports
+        if svc.get("sensitive") and svc.get("state") == "open":
+            anomalies.append({
+                "type": "sensitive_service_exposed",
+                "severity": "high" if svc.get("risk_class") == "critical" else "moderate",
+                "message": f"Sensitive service '{svc.get('service')}' on port {svc.get('port')}/{svc.get('protocol')} is exposed.",
+                "port": svc.get("port"),
+                "service": svc.get("service")
+            })
+
+        # Unexpected DNS service on non-DNS ASN
+        if svc.get("service") == "dns" and asn_type not in ("hosting", "isp"):
+            anomalies.append({
+                "type": "unexpected_dns_service",
+                "severity": "low",
+                "message": f"DNS service on port {svc.get('port')} for ASN type '{asn_type}'.",
+                "port": svc.get("port")
+            })
+
+        # Telnet is legacy and insecure
+        if svc.get("service") == "telnet":
+            anomalies.append({
+                "type": "legacy_service",
+                "severity": "high",
+                "message": f"Legacy service 'telnet' detected on port {svc.get('port')}.",
+                "port": svc.get("port")
+            })
+
+        # Cleartext protocols on internet-facing services
+        if svc.get("service") in ("ftp", "http", "pop3", "imap", "smtp") and svc.get("state") == "open":
+            anomalies.append({
+                "type": "cleartext_service",
+                "severity": "low",
+                "message": f"Cleartext service '{svc.get('service')}' on port {svc.get('port')}.",
+                "port": svc.get("port")
+            })
+
+    return anomalies
+
+
+def attack_surface(target: str,
+                   report: Dict[str, Any],
+                   config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Full attack surface intelligence pipeline.
+
+    Strict rules:
+      - Passive by default.
+      - No scanning unless explicitly authorized.
+      - OPEN != VULNERABLE.
+      - No exploitation.
+    """
+    as_cfg = (config or {}).get("attack_surface", {}) if isinstance(config, dict) else {}
+    if not as_cfg.get("enabled", True):
+        return {"enabled": False}
+
+    # Step 1: Passive collection
+    passive = _collect_passive_services(target, report, config)
+
+    # Step 2: Authorized active scan (disabled by default)
+    active = _collect_authorized_scan_services(target, config)
+
+    # Step 3: Merge
+    all_services = (passive or []) + (active or [])
+
+    # Step 4: Inventory
+    inventory = service_inventory(all_services, config)
+
+    # Step 5: Anomalies
+    anomalies = _attack_surface_anomalies(inventory, report)
+
+    # Step 6: Exposure classification
+    exposure = _classify_exposure(inventory, report)
+
+    # Step 7: Notes
+    notes = [
+        "OPEN \u2260 VULNERABLE. An open port is exposure, not a weakness.",
+        "A detected service is a fingerprint, not a confirmed vulnerability.",
+        "No exploitation is performed in this stage.",
+        "Active scanning is disabled by default and requires explicit authorization.",
+        "All services listed here must be validated before drawing security conclusions."
+    ]
+
+    return {
+        "enabled": True,
+        "services": inventory["services"],
+        "service_count": inventory["service_count"],
+        "sensitive_services": inventory["sensitive_services"],
+        "sensitive_count": inventory["sensitive_count"],
+        "by_protocol": inventory["by_protocol"],
+        "by_service": inventory["by_service"],
+        "ports": inventory["ports"],
+        "exposure": exposure,
+        "anomalies": anomalies,
+        "notes": notes,
+        "summary": {
+            "total_services": inventory["service_count"],
+            "sensitive_services": inventory["sensitive_count"],
+            "anomalies": len(anomalies),
+            "scan_mode": "active" if active else "passive"
+        }
+    }
+
+# ============================================================
+#  TECHNOLOGY FINGERPRINTING — v38 (Stage 12)
+#  Passive by default. A banner is a hint, not a fact.
+#  Never guess a version: insufficient evidence -> UNKNOWN.
+# ============================================================
+# HTTP Server header -> product + optional version
+HTTP_SERVER_SIGNATURES: List[Dict[str, Any]] = [
+    {"pattern": r"nginx/?([\d.]+)?",       "product": "nginx",     "class": "web_server", "confidence": 0.95},
+    {"pattern": r"Apache/?([\d.]+)?",      "product": "apache",    "class": "web_server", "confidence": 0.95},
+    {"pattern": r"Caddy",                  "product": "caddy",     "class": "web_server", "confidence": 0.90},
+    {"pattern": r"Microsoft-IIS/?([\d.]+)?", "product": "iis",     "class": "web_server", "confidence": 0.95},
+    {"pattern": r"cloudflare",             "product": "cloudflare","class": "cdn",        "confidence": 0.90},
+    {"pattern": r"LiteSpeed",              "product": "litespeed", "class": "web_server", "confidence": 0.90},
+    {"pattern": r"openresty/?([\d.]+)?",   "product": "openresty", "class": "web_server", "confidence": 0.90},
+    {"pattern": r"gunicorn/?([\d.]+)?",    "product": "gunicorn",  "class": "app_server", "confidence": 0.85},
+    {"pattern": r"uvicorn",                "product": "uvicorn",   "class": "app_server", "confidence": 0.85},
+    {"pattern": r"Werkzeug/?([\d.]+)?",    "product": "werkzeug",  "class": "app_server", "confidence": 0.85},
+    {"pattern": r"Kestrel",                "product": "kestrel",   "class": "app_server", "confidence": 0.85},
+]
+
+# TLS extension / cipher hints
+TLS_SIGNATURES: List[Dict[str, Any]] = [
+    {"pattern": r"OpenSSL", "product": "openssl", "class": "tls_stack", "confidence": 0.75},
+    {"pattern": r"BoringSSL", "product": "boringssl", "class": "tls_stack", "confidence": 0.80},
+    {"pattern": r"Go", "product": "go_tls", "class": "tls_stack", "confidence": 0.70},
+]
+
+# SSH banner
+SSH_SIGNATURES: List[Dict[str, Any]] = [
+    {"pattern": r"OpenSSH[_ ]([\d.p]+)", "product": "openssh", "class": "ssh_server", "confidence": 0.95},
+    {"pattern": r"dropbear[_ ]?([\d.]+)?", "product": "dropbear", "class": "ssh_server", "confidence": 0.90},
+    {"pattern": r"libssh[_ ]?([\d.]+)?", "product": "libssh", "class": "ssh_server", "confidence": 0.85},
+]
+
+# DNS software hints (from version.bind / behavior — passive only)
+DNS_SIGNATURES: List[Dict[str, Any]] = [
+    {"pattern": r"BIND ([\d.]+)", "product": "bind", "class": "dns_server", "confidence": 0.95},
+    {"pattern": r"PowerDNS", "product": "powerdns", "class": "dns_server", "confidence": 0.90},
+    {"pattern": r"Knot", "product": "knot", "class": "dns_server", "confidence": 0.90},
+    {"pattern": r"CoreDNS", "product": "coredns", "class": "dns_server", "confidence": 0.90},
+    {"pattern": r"Unbound", "product": "unbound", "class": "dns_server", "confidence": 0.90},
+]
+
+# SMTP banner
+SMTP_SIGNATURES: List[Dict[str, Any]] = [
+    {"pattern": r"Postfix", "product": "postfix", "class": "mail_server", "confidence": 0.90},
+    {"pattern": r"Exim ([\d.]+)", "product": "exim", "class": "mail_server", "confidence": 0.90},
+    {"pattern": r"Sendmail", "product": "sendmail", "class": "mail_server", "confidence": 0.90},
+]
+
+# ============================================================
+#  VULNERABILITY INTELLIGENCE — v39 (Stage 13)
+#  Candidate != Confirmed. Match != Vulnerable.
+#  No version + confidence -> no CPE. No range match -> no CVE.
+# ============================================================
+# Internal product -> (vendor, product) for CPE construction
+CPE_PRODUCT_MAP: Dict[str, Tuple[str, str]] = {
+    # Web servers
+    "nginx":      ("nginx", "nginx"),
+    "apache":     ("apache", "http_server"),
+    "caddy":      ("caddyserver", "caddy"),
+    "iis":        ("microsoft", "internet_information_services"),
+    "litespeed":  ("litespeedtech", "litespeed_web_server"),
+    "openresty":  ("openresty", "openresty"),
+    "gunicorn":   ("gunicorn", "gunicorn"),
+    "uvicorn":    ("encode", "uvicorn"),
+    "werkzeug":   ("pallets", "werkzeug"),
+    "kestrel":    ("microsoft", "kestrel"),
+
+    # TLS stacks
+    "openssl":    ("openssl", "openssl"),
+    "boringssl":  ("google", "boringssl"),
+    "go_tls":     ("golang", "go"),
+
+    # SSH
+    "openssh":    ("openbsd", "openssh"),
+    "dropbear":   ("dropbear", "dropbear_ssh_server"),
+    "libssh":     ("libssh", "libssh"),
+
+    # DNS
+    "bind":       ("isc", "bind"),
+    "powerdns":   ("powerdns", "authoritative_server"),
+    "knot":       ("cz.nic", "knot_dns"),
+    "coredns":    ("coredns", "coredns"),
+    "unbound":    ("nlnetlabs", "unbound"),
+
+    # Mail
+    "postfix":    ("postfix", "postfix"),
+    "exim":       ("exim", "exim"),
+    "sendmail":   ("sendmail", "sendmail"),
+
+    # CDN
+    "cloudflare": ("cloudflare", "cloudflare"),
+}
+
+# Minimal offline CVE index (fallback when no NVD API key is configured)
+OFFLINE_CVE_INDEX: Dict[str, List[Dict[str, Any]]] = {
+    "cpe:2.3:a:nginx:nginx": [
+        {
+            "cve": "CVE-2024-24989",
+            "severity": 7.5,
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+            "affected_range": "< 1.24.1",
+            "description": "NULL pointer dereference in nginx HTTP/3 module.",
+            "published": "2024-02-14"
+        },
+        {
+            "cve": "CVE-2023-44487",
+            "severity": 7.5,
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+            "affected_range": ">= 1.25.0, < 1.25.3",
+            "description": "HTTP/2 Rapid Reset attack.",
+            "published": "2023-10-10"
+        }
+    ],
+    "cpe:2.3:a:apache:http_server": [
+        {
+            "cve": "CVE-2023-44487",
+            "severity": 7.5,
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+            "affected_range": ">= 2.4.0, < 2.4.58",
+            "description": "HTTP/2 Rapid Reset attack.",
+            "published": "2023-10-10"
+        }
+    ],
+    "cpe:2.3:a:openssl:openssl": [
+        {
+            "cve": "CVE-2023-5678",
+            "severity": 5.3,
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L",
+            "affected_range": ">= 3.0.0, < 3.0.13",
+            "description": "Excessive time spent in DH check.",
+            "published": "2023-11-06"
+        }
+    ],
+    "cpe:2.3:a:openbsd:openssh": [
+        {
+            "cve": "CVE-2023-48795",
+            "severity": 5.9,
+            "vector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:H/A:N",
+            "affected_range": ">= 8.0, < 9.6",
+            "description": "Terrapin attack on SSH.",
+            "published": "2023-12-18"
+        }
+    ]
+}
+
+
+def _parse_version(version: str) -> Optional[Tuple[int, ...]]:
+    """
+    Parse a version string into a tuple of integers for comparison.
+    Returns None if the version cannot be parsed.
+    """
+    if not version:
+        return None
+    parts = re.split(r"[.\-_]", str(version).strip())
+    nums = []
+    for p in parts:
+        if p.isdigit():
+            nums.append(int(p))
+        else:
+            # Extract leading digits if present (e.g., "1a" -> 1)
+            m = re.match(r"(\d+)", p)
+            if m:
+                nums.append(int(m.group(1)))
+            else:
+                break
+    return tuple(nums) if nums else None
+
+
+def _version_in_range(version: str, affected_range: str) -> Optional[bool]:
+    """
+    Check if a version is within an affected range.
+
+    Supported range formats:
+      "< 1.24.1"
+      "<= 1.24.1"
+      "> 1.24.0, < 1.24.1"
+      ">= 1.25.0, < 1.25.3"
+      "*"
+    """
+    if not version or not affected_range:
+        return None
+
+    v = _parse_version(version)
+    if not v:
+        return None
+
+    if affected_range.strip() == "*":
+        return True
+
+    # Split on comma for compound ranges
+    clauses = [c.strip() for c in affected_range.split(",")]
+    for clause in clauses:
+        m = re.match(r"(<=|>=|<|>|=)\s*([\d.\-_a-zA-Z]+)", clause)
+        if not m:
+            return None
+        op, ref = m.group(1), m.group(2)
+        ref_v = _parse_version(ref)
+        if not ref_v:
+            return None
+
+        # Pad to same length
+        max_len = max(len(v), len(ref_v))
+        v_p = v + (0,) * (max_len - len(v))
+        r_p = ref_v + (0,) * (max_len - len(ref_v))
+
+        if op == "<"  and not (v_p <  r_p): return False
+        if op == "<=" and not (v_p <= r_p): return False
+        if op == ">"  and not (v_p >  r_p): return False
+        if op == ">=" and not (v_p >= r_p): return False
+        if op == "="  and not (v_p == r_p): return False
+
+    return True
+
+
+def technology_to_cpe(technology: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Convert a technology dict (product, version, confidence) into a CPE.
+
+    Rules:
+      - Product must be in CPE_PRODUCT_MAP.
+      - Version must be present AND confidence must be >= threshold.
+      - If version is missing or confidence is low, return None.
+    """
+    product = ((technology or {}).get("product") or "").lower()
+    version = (technology or {}).get("version")
+    confidence = (technology or {}).get("confidence", 0.0)
+    evidence = (technology or {}).get("evidence", []) or []
+
+    if not product or product not in CPE_PRODUCT_MAP:
+        return None
+
+    if not version:
+        return None
+
+    vendor, cpe_product = CPE_PRODUCT_MAP[product]
+    cpe = f"cpe:2.3:a:{vendor}:{cpe_product}:{version}:*:*:*:*:*:*:*"
+
+    return {
+        "cpe": cpe,
+        "product": product,
+        "vendor": vendor,
+        "version": version,
+        "confidence": confidence,
+        "evidence": evidence
+    }
+
+
+def _extract_cvss(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        if key in (metrics or {}) and metrics[key]:
+            data = metrics[key][0].get("cvssData", {})
+            return {
+                "score": data.get("baseScore"),
+                "vector": data.get("vectorString")
+            }
+    return {"score": None, "vector": None}
+
+
+def _extract_description(cve: Dict[str, Any]) -> str:
+    for desc in (cve or {}).get("descriptions", []) or []:
+        if isinstance(desc, dict) and desc.get("lang") == "en":
+            return desc.get("value", "")
+    return ""
+
+
+def _extract_affected_range(cve: Dict[str, Any],
+                            cpe_entry: Dict[str, Any]) -> str:
+    """
+    Extract affected range from NVD configurations.
+    Falls back to '*' if unknown.
+    """
+    for config_node in (cve or {}).get("configurations", []) or []:
+        if not isinstance(config_node, dict):
+            continue
+        for node in config_node.get("nodes", []) or []:
+            if not isinstance(node, dict):
+                continue
+            for match in node.get("cpeMatch", []) or []:
+                if not isinstance(match, dict):
+                    continue
+                if match.get("vulnerable"):
+                    start = match.get("versionStartIncluding") or match.get("versionStartExcluding")
+                    end = match.get("versionEndIncluding") or match.get("versionEndExcluding")
+                    if start and end:
+                        return f">= {start}, <= {end}"
+                    if end:
+                        return f"< {end}"
+                    if start:
+                        return f">= {start}"
+    return "*"
+
+
+def cpe_to_cve(cpe_entry: Dict[str, Any],
+               config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Map a CPE entry to a list of CVEs.
+
+    Uses:
+      - NVD API if API key is configured.
+      - Offline index otherwise.
+    """
+    vuln_cfg = (config or {}).get("vulnerability", {}) if isinstance(config, dict) else {}
+    nvd_api_key_env = vuln_cfg.get("nvd_api_key_env", "NVD_API_KEY")
+    nvd_api_key = os.getenv(nvd_api_key_env)
+    timeout = ((config or {}).get("timeouts", {}) or {}).get("http", 10)
+    try:
+        timeout = int(timeout)
+    except Exception:
+        timeout = 10
+
+    cpe = (cpe_entry or {}).get("cpe", "")
+    version = (cpe_entry or {}).get("version", "")
+
+    # ---- NVD API path ----
+    if nvd_api_key and vuln_cfg.get("use_nvd_api", False):
+        try:
+            # NVD API 2.0: virtualMatchString
+            url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+            params = {"virtualMatchString": cpe, "resultsPerPage": 50}
+            headers = {"apiKey": nvd_api_key}
+            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = []
+                for item in data.get("vulnerabilities", []) or []:
+                    cve = (item or {}).get("cve", {}) or {}
+                    metrics = cve.get("metrics", {}) or {}
+                    severity = _extract_cvss(metrics)
+                    results.append({
+                        "cve": cve.get("id"),
+                        "severity": severity.get("score"),
+                        "vector": severity.get("vector"),
+                        "affected_range": _extract_affected_range(cve, cpe_entry),
+                        "description": _extract_description(cve),
+                        "published": cve.get("published")
+                    })
+                return results
+        except Exception:
+            pass  # fall through to offline
+
+    # ---- Offline fallback ----
+    # Match by vendor:product prefix (strip version from CPE)
+    cpe_prefix = ":".join(cpe.split(":")[:5])  # cpe:2.3:a:vendor:product
+    results = []
+    for key, entries in OFFLINE_CVE_INDEX.items():
+        if key.startswith(cpe_prefix):
+            for entry in entries or []:
+                results.append(entry)
+    return results
+
+
+def vulnerability_candidates(report: Dict[str, Any],
+                             config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Produce vulnerability candidates from technology intelligence.
+
+    Rules:
+      - Only technologies with confident versions are considered.
+      - Only candidates are produced — never confirmed vulnerabilities.
+      - Every candidate carries evidence and a validation requirement.
+    """
+    vuln_cfg = (config or {}).get("vulnerability", {}) if isinstance(config, dict) else {}
+    if not vuln_cfg.get("enabled", True):
+        return {"enabled": False}
+
+    require_validation = vuln_cfg.get("require_validation", True)
+    min_tech_confidence = vuln_cfg.get("min_technology_confidence", 0.7)
+    try:
+        min_tech_confidence = float(min_tech_confidence)
+    except Exception:
+        min_tech_confidence = 0.7
+    max_candidates = vuln_cfg.get("max_candidates", 50)
+    try:
+        max_candidates = int(max_candidates)
+    except Exception:
+        max_candidates = 50
+
+    tech_intel = report.get("technology_intelligence", {}) or {}
+    technologies = []
+    for result in tech_intel.get("results", []) or []:
+        if not isinstance(result, dict):
+            continue
+        for tech in result.get("technology", []) or []:
+            if not isinstance(tech, dict):
+                continue
+            technologies.append({
+                "port": result.get("port"),
+                "service": result.get("service"),
+                "product": tech.get("product"),
+                "version": tech.get("version"),
+                "confidence": tech.get("confidence"),
+                "evidence": tech.get("evidence", []) or []
+            })
+
+    candidates: List[Dict[str, Any]] = []
+    cpes_built: List[Dict[str, Any]] = []
+
+    for tech in technologies:
+        # Gate 1: technology confidence
+        try:
+            conf_val = float(tech.get("confidence", 0.0) or 0.0)
+        except Exception:
+            continue
+        if conf_val < min_tech_confidence:
+            continue
+
+        # Gate 2: version must be present
+        if not tech.get("version"):
+            continue
+
+        # Step 1: Technology -> CPE
+        cpe_entry = technology_to_cpe(tech)
+        if not cpe_entry:
+            continue
+        cpes_built.append(cpe_entry)
+
+        # Step 2: CPE -> CVEs
+        cves = cpe_to_cve(cpe_entry, config)
+        if not cves:
+            continue
+
+        # Step 3: Filter by affected range
+        for cve in cves:
+            if not isinstance(cve, dict):
+                continue
+            in_range = _version_in_range(cpe_entry["version"], cve.get("affected_range", "*"))
+            if in_range is not True:
+                continue
+
+            candidates.append({
+                "technology": {
+                    "product": tech["product"],
+                    "version": tech["version"],
+                    "confidence": tech["confidence"]
+                },
+                "cpe": cpe_entry["cpe"],
+                "cve": cve.get("cve"),
+                "severity": cve.get("severity"),
+                "vector": cve.get("vector"),
+                "affected_range": cve.get("affected_range"),
+                "description": cve.get("description"),
+                "published": cve.get("published"),
+                "match_type": "range" if cve.get("affected_range") != "*" else "wildcard",
+                "confidence": round(min(float(tech["confidence"]), 0.9), 3),
+                "evidence": [
+                    f"technology:{tech['product']}@{tech['version']}",
+                    f"version_confidence:{tech['confidence']}",
+                    f"cpe:{cpe_entry['cpe']}",
+                    f"port:{tech['port']}"
+                ],
+                "status": "CANDIDATE" if not require_validation else "NEEDS_VALIDATION",
+                "notes": (
+                    "This is a candidate. Validation on the target is required "
+                    "before any conclusion can be drawn."
+                )
+            })
+
+    # Sort by severity desc, then confidence desc
+    candidates.sort(key=lambda c: (
+        -((c.get("severity") or 0) if isinstance(c.get("severity"), (int, float)) else 0),
+        -(c.get("confidence", 0) if isinstance(c.get("confidence"), (int, float)) else 0)
+    ))
+    candidates = candidates[:max_candidates] if max_candidates and max_candidates > 0 else candidates
+
+    # Summary
+    severity_buckets = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
+    for c in candidates:
+        s = c.get("severity")
+        if s is None:
+            severity_buckets["unknown"] += 1
+        elif s >= 9.0:
+            severity_buckets["critical"] += 1
+        elif s >= 7.0:
+            severity_buckets["high"] += 1
+        elif s >= 4.0:
+            severity_buckets["medium"] += 1
+        else:
+            severity_buckets["low"] += 1
+
+    notes = [
+        "A CVE matching a version is a CANDIDATE, not a confirmation.",
+        "A candidate is not a vulnerability.",
+        "A vulnerability is not an exploit.",
+        "An exploit is not an impact.",
+        "Validation on the target is required before any conclusion.",
+        "No exploitation is performed in this stage."
+    ]
+
+    return {
+        "enabled": True,
+        "candidates": candidates,
+        "cpes_built": cpes_built,
+        "summary": {
+            "technologies_analyzed": len(technologies),
+            "cpes_built": len(cpes_built),
+            "candidates": len(candidates),
+            "by_severity": severity_buckets,
+            "require_validation": require_validation,
+            "min_technology_confidence": min_tech_confidence
+        },
+        "notes": notes
+    }
+
+
+def _banner_grab_authorized(ip: str, port: int,
+                            protocol: str,
+                            config: Dict[str, Any],
+                            timeout: int = 5) -> Optional[str]:
+    """
+    Perform a banner grab ONLY if explicitly authorized.
+
+    Gates:
+      - fingerprinting.enabled == true
+      - fingerprinting.active_banner_grab == true
+      - attack_surface.authorized == true
+      - ip in attack_surface.authorized_targets
+
+    Returns the banner string, or None.
+    """
+    fp_cfg = (config or {}).get("fingerprinting", {}) if isinstance(config, dict) else {}
+    as_cfg = (config or {}).get("attack_surface", {}) if isinstance(config, dict) else {}
+
+    if not fp_cfg.get("enabled", True):
+        return None
+    if not fp_cfg.get("active_banner_grab", False):
+        return None
+    if not as_cfg.get("authorized", False):
+        return None
+    if ip not in (as_cfg.get("authorized_targets", []) or []) and "*" not in (as_cfg.get("authorized_targets", []) or []):
+        return None
+
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            # For HTTP, send a minimal request
+            if str(protocol).lower() in ("http", "https", "http-alt", "https-alt"):
+                request = f"HEAD / HTTP/1.0\r\nHost: {ip}\r\n\r\n"
+                sock.sendall(request.encode())
+            # For SSH, the server sends the banner first
+            try:
+                data = sock.recv(4096)
+                banner = data.decode("utf-8", errors="replace").strip()
+                max_len = fp_cfg.get("max_banner_length", 4096)
+                try:
+                    max_len = int(max_len)
+                except Exception:
+                    max_len = 4096
+                return banner[:max_len] if banner else None
+            except socket.timeout:
+                return None
+    except Exception:
+        return None
+
+
+def _passive_banner_from_report(service: Dict[str, Any],
+                                report: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Extract passive fingerprint hints from already-collected data.
+    No network activity.
+    """
+    hints: Dict[str, str] = {}
+
+    # TLS handshake may have recorded cipher/ALPN (if available)
+    cert_intel = report.get("certificate_intelligence", {}) or {}
+    live = cert_intel.get("live_certificate") or {}
+    if isinstance(live, dict) and service.get("port") == 443 and live:
+        if live.get("issuer_cn"):
+            hints["tls_issuer"] = live["issuer_cn"]
+        if live.get("signature_algorithm"):
+            hints["tls_sig_algo"] = live["signature_algorithm"]
+        if live.get("key_type"):
+            hints["tls_key_type"] = live["key_type"]
+
+    # DNS context
+    dns = report.get("dns_intelligence", {}) or {}
+    if service.get("service") == "dns":
+        dns_analysis = dns.get("analysis", {}) or {}
+        if dns_analysis.get("record_types_present"):
+            hints["dns_records"] = ",".join(dns_analysis["record_types_present"])
+
+    return hints
+
+
+def _match_signatures(text: str, signatures: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Match a string against a list of signature dicts.
+    Returns the first match with captured version (if any), or None.
+    """
+    if not text:
+        return None
+    for sig in signatures or []:
+        m = re.search(sig["pattern"], text, re.IGNORECASE)
+        if m:
+            version = None
+            try:
+                if m.groups():
+                    version = m.group(1) or None
+            except Exception:
+                version = None
+            return {
+                "product": sig["product"],
+                "class": sig["class"],
+                "version": version,
+                "confidence": sig["confidence"],
+                "pattern": sig["pattern"]
+            }
+    return None
+
+
+def version_confidence(base_confidence: float,
+                       version: Optional[str],
+                       evidence_sources: List[str]) -> float:
+    """
+    Adjust confidence based on:
+      - Whether a version was extracted
+      - Number of independent evidence sources
+      - Evidence reliability
+
+    Rules:
+      - No version -> confidence reduced by 30%
+      - Version from single source -> base confidence
+      - Version from multiple sources -> +10% (capped at 1.0)
+      - Version from banner only -> -10%
+    """
+    conf = base_confidence
+
+    if not version:
+        conf *= 0.7
+
+    source_count = len(set(evidence_sources or []))
+    if source_count >= 2:
+        conf = min(1.0, conf + 0.10)
+    elif source_count == 1 and "banner" in (evidence_sources or []):
+        conf = max(0.0, conf - 0.10)
+
+    return round(max(0.0, min(1.0, conf)), 3)
+
+
+def fingerprint_technology(service: Dict[str, Any],
+                           report: Dict[str, Any],
+                           config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fingerprint technology for a single service.
+
+    Returns:
+    {
+        "port": int,
+        "protocol": str,
+        "service": str,
+        "banner": str | None,
+        "technology": [...],
+        "status": "OK" | "INSUFFICIENT_EVIDENCE" | "UNKNOWN",
+        "notes": [...]
+    }
+    """
+    fp_cfg = (config or {}).get("fingerprinting", {}) if isinstance(config, dict) else {}
+    min_confidence = fp_cfg.get("min_confidence", 0.7)
+    try:
+        min_confidence = float(min_confidence)
+    except Exception:
+        min_confidence = 0.7
+    timeout = ((config or {}).get("timeouts", {}) or {}).get("default", 10)
+    try:
+        timeout = int(timeout)
+    except Exception:
+        timeout = 10
+
+    result = {
+        "port": service.get("port"),
+        "protocol": service.get("protocol"),
+        "service": service.get("service"),
+        "banner": None,
+        "technology": [],
+        "status": "UNKNOWN",
+        "notes": []
+    }
+
+    # ---- Gather evidence ----
+    evidence_sources: List[str] = []
+    banner = None
+
+    # 1. Passive hints from report
+    hints = _passive_banner_from_report(service, report)
+    if hints:
+        evidence_sources.append("passive_report")
+
+    # 2. Authorized banner grab
+    ip = (report.get("infrastructure_intelligence", {}) or {}).get("ip")
+    if ip:
+        try:
+            grabbed = _banner_grab_authorized(ip, service.get("port", 0),
+                                              service.get("service", ""),
+                                              config, timeout=timeout)
+        except Exception:
+            grabbed = None
+        if grabbed:
+            banner = grabbed
+            evidence_sources.append("banner")
+    result["banner"] = banner
+
+    # ---- Match signatures ----
+    svc = (service.get("service") or "").lower()
+    candidates: List[Dict[str, Any]] = []
+
+    if svc in ("http", "https", "http-alt", "https-alt"):
+        if banner:
+            m = _match_signatures(banner, HTTP_SERVER_SIGNATURES)
+            if m:
+                candidates.append(m)
+
+    if svc in ("ssh",):
+        if banner:
+            m = _match_signatures(banner, SSH_SIGNATURES)
+            if m:
+                candidates.append(m)
+
+    if svc in ("dns",):
+        # Only match if a version.bind response was captured (not implemented here)
+        # For now, no DNS fingerprint without active query
+        pass
+
+    if svc in ("smtp",):
+        if banner:
+            m = _match_signatures(banner, SMTP_SIGNATURES)
+            if m:
+                candidates.append(m)
+
+    # TLS hints (passive, from certificate)
+    if hints.get("tls_issuer"):
+        # Issuer alone is not enough for TLS stack; skip false positives
+        pass
+
+    # ---- Build technology list ----
+    for cand in candidates:
+        conf = version_confidence(cand["confidence"], cand.get("version"), evidence_sources)
+        if conf < min_confidence:
+            continue
+        result["technology"].append({
+            "product": cand["product"],
+            "class": cand["class"],
+            "version": cand.get("version"),
+            "confidence": conf,
+            "evidence": evidence_sources
+        })
+
+    # ---- Status ----
+    if result["technology"]:
+        result["status"] = "OK"
+    elif evidence_sources:
+        result["status"] = "INSUFFICIENT_EVIDENCE"
+        result["notes"].append(
+            "Evidence collected but no technology signature matched. Version unknown."
+        )
+    else:
+        result["status"] = "UNKNOWN"
+        result["notes"].append(
+            "No banner or passive hints available. Cannot fingerprint technology."
+        )
+
+    # ---- Explicit rule ----
+    if not result["technology"]:
+        result["notes"].append(
+            "No version claimed. Guessing is disabled by design."
+        )
+
+    return result
+
+
+def technology_intelligence(report: Dict[str, Any],
+                            config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Full technology fingerprinting pipeline across all attack surface services.
+    """
+    fp_cfg = (config or {}).get("fingerprinting", {}) if isinstance(config, dict) else {}
+    if not fp_cfg.get("enabled", True):
+        return {"enabled": False}
+
+    as_intel = report.get("attack_surface_intelligence", {}) or {}
+    services = as_intel.get("services", []) or []
+
+    results: List[Dict[str, Any]] = []
+    by_class: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+    for svc in services:
+        fp = fingerprint_technology(svc, report, config)
+        results.append(fp)
+        for tech in fp.get("technology", []) or []:
+            by_class[tech["class"]].append({
+                "port": fp["port"],
+                "product": tech["product"],
+                "version": tech["version"],
+                "confidence": tech["confidence"]
+            })
+
+    # Summary
+    total_technologies = sum(len(r.get("technology", []) or []) for r in results)
+    ok_count = len([r for r in results if r["status"] == "OK"])
+    insufficient = len([r for r in results if r["status"] == "INSUFFICIENT_EVIDENCE"])
+    unknown = len([r for r in results if r["status"] == "UNKNOWN"])
+
+    notes = [
+        "A banner is a hint, not a fact.",
+        "A version is a claim, not a certainty.",
+        "If evidence is insufficient, the tool returns UNKNOWN — it does not guess.",
+        "Confidence reflects evidence quality, not threat level."
+    ]
+
+    return {
+        "enabled": True,
+        "results": results,
+        "by_class": dict(by_class),
+        "summary": {
+            "services_analyzed": len(services),
+            "technologies_identified": total_technologies,
+            "ok": ok_count,
+            "insufficient_evidence": insufficient,
+            "unknown": unknown,
+            "min_confidence": fp_cfg.get("min_confidence", 0.7)
+        },
+        "notes": notes
+    }
+
+# ============================================================
+#  ANOMALY DETECTION ENGINE — v40 (Stage 14)
+#  Deviation from expectation, not a verdict. Evidence, not conclusion.
+#  No fabricated anomalies: zero is reported only after real checks run.
+# ============================================================
+ANOMALY_SEVERITIES = ["INFORMATIONAL", "LOW", "MODERATE", "HIGH"]
+ANOMALY_SEVERITY_ORDER = {s: i for i, s in enumerate(ANOMALY_SEVERITIES)}
+
+
+def _anomaly(category: str,
+             subtype: str,
+             severity: str,
+             message: str,
+             evidence: Optional[List[Any]] = None,
+             source_sections: Optional[List[str]] = None,
+             confidence: float = 0.5,
+             metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Build a structured anomaly object.
+    """
+    if severity not in ANOMALY_SEVERITY_ORDER:
+        severity = "INFORMATIONAL"
+
+    return {
+        "category": category,
+        "subtype": subtype,
+        "severity": severity,
+        "message": message,
+        "evidence": evidence or [],
+        "source_sections": source_sections or [],
+        "confidence": round(max(0.0, min(1.0, confidence)), 3),
+        "metadata": metadata or {}
+    }
+
+
+def classify_anomaly(category: str,
+                     subtype: str,
+                     context: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Return a canonical severity for a given anomaly category + subtype.
+    Context can override the default severity when needed.
+    """
+    context = context or {}
+
+    # Default severity map
+    severity_map: Dict[Tuple[str, str], str] = {
+        # DNS
+        ("dns", "ns_soa_mismatch"):        "MODERATE",
+        ("dns", "a_ptr_mismatch"):         "MODERATE",
+        ("dns", "cname_loop"):             "HIGH",
+        ("dns", "missing_spf"):            "LOW",
+        ("dns", "missing_dmarc"):          "LOW",
+        ("dns", "duplicate_records"):      "INFORMATIONAL",
+        ("dns", "low_ttl"):                "INFORMATIONAL",
+        ("dns", "conflicting_records"):    "MODERATE",
+
+        # Certificate
+        ("cert", "expired"):               "MODERATE",
+        ("cert", "near_expiry"):           "INFORMATIONAL",
+        ("cert", "weak_algorithm"):        "HIGH",
+        ("cert", "weak_key_size"):         "HIGH",
+        ("cert", "self_signed"):           "MODERATE",
+        ("cert", "hostname_mismatch"):     "HIGH",
+        ("cert", "wildcard_overuse"):      "INFORMATIONAL",
+        ("cert", "live_not_in_ct"):        "INFORMATIONAL",
+        ("cert", "shared_san_many"):       "INFORMATIONAL",
+
+        # ASN
+        ("asn", "type_service_mismatch"):  "MODERATE",
+        ("asn", "country_mismatch"):       "MODERATE",
+        ("asn", "multiple_asn_claims"):    "MODERATE",
+        ("asn", "name_org_mismatch"):      "LOW",
+
+        # History
+        ("history", "certificate_change"): "HIGH",
+        ("history", "asn_change"):         "HIGH",
+        ("history", "ns_change"):          "MODERATE",
+        ("history", "abuse_contact_change"): "HIGH",
+        ("history", "threat_score_change"): "HIGH",
+        ("history", "org_change"):         "MODERATE",
+        ("history", "record_added"):       "INFORMATIONAL",
+        ("history", "record_removed"):     "LOW",
+
+        # Infrastructure
+        ("infra", "shared_cert_unrelated_asn"):   "HIGH",
+        ("infra", "shared_ns_unrelated_org"):     "MODERATE",
+        ("infra", "unexpected_cdn_origin"):       "MODERATE",
+        ("infra", "prefix_overlap"):              "INFORMATIONAL",
+        ("infra", "peer_mismatch"):               "LOW",
+
+        # Provider
+        ("provider", "score_disagreement"):       "HIGH",
+        ("provider", "high_variance"):            "MODERATE",
+        ("provider", "single_provider_flag"):     "MODERATE",
+        ("provider", "low_coverage"):             "MODERATE",
+        ("provider", "failed_providers"):         "LOW",
+
+        # Stale
+        ("stale", "evidence_stale"):              "MODERATE",
+        ("stale", "provider_stale"):              "MODERATE",
+        ("stale", "snapshot_stale"):              "LOW",
+        ("stale", "threat_data_stale"):           "HIGH",
+    }
+
+    default = severity_map.get((category, subtype), "INFORMATIONAL")
+
+    # Context overrides
+    if context.get("force_severity") in ANOMALY_SEVERITY_ORDER:
+        return context["force_severity"]
+
+    # Escalate provider disagreement based on magnitude
+    if category == "provider" and subtype == "score_disagreement":
+        try:
+            delta = float(context.get("delta", 0))
+            if delta >= 50:
+                return "HIGH"
+            if delta >= 20:
+                return "MODERATE"
+            return "LOW"
+        except Exception:
+            pass
+
+    # Escalate historical threat score change
+    if category == "history" and subtype == "threat_score_change":
+        try:
+            delta = float(context.get("delta", 0))
+            if delta >= 50:
+                return "HIGH"
+            if delta >= 20:
+                return "MODERATE"
+            return "LOW"
+        except Exception:
+            pass
+
+    return default
+
+
+def _check_dns(report: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    anomalies: List[Dict[str, Any]] = []
+    dns = report.get("dns_intelligence", {}) or {}
+    analysis = dns.get("analysis", {}) or {}
+    if not analysis:
+        return anomalies
+
+    # NS vs SOA mismatch
+    nsoa = (analysis.get("consistency", {}) or {}).get("ns_vs_soa")
+    if isinstance(nsoa, dict) and nsoa.get("consistent") is False:
+        anomalies.append(_anomaly(
+            category="dns",
+            subtype="ns_soa_mismatch",
+            severity=classify_anomaly("dns", "ns_soa_mismatch"),
+            message="SOA primary is not listed in NS records.",
+            evidence=[nsoa],
+            source_sections=["dns_intelligence"],
+            confidence=0.85
+        ))
+
+    # A vs PTR mismatch
+    ap = (analysis.get("consistency", {}) or {}).get("a_vs_ptr")
+    if isinstance(ap, dict) and ap.get("consistent") is False:
+        anomalies.append(_anomaly(
+            category="dns",
+            subtype="a_ptr_mismatch",
+            severity=classify_anomaly("dns", "a_ptr_mismatch"),
+            message="A record and PTR record disagree.",
+            evidence=[ap],
+            source_sections=["dns_intelligence"],
+            confidence=0.8
+        ))
+
+    # CNAME loops
+    loops = (analysis.get("relationships", {}) or {}).get("cname_loops", []) or []
+    if loops:
+        anomalies.append(_anomaly(
+            category="dns",
+            subtype="cname_loop",
+            severity=classify_anomaly("dns", "cname_loop"),
+            message=f"{len(loops)} CNAME loop(s) detected.",
+            evidence=loops,
+            source_sections=["dns_intelligence"],
+            confidence=0.95
+        ))
+
+    # Missing SPF
+    security = analysis.get("security", {}) or {}
+    if security.get("spf_present") is False:
+        anomalies.append(_anomaly(
+            category="dns",
+            subtype="missing_spf",
+            severity=classify_anomaly("dns", "missing_spf"),
+            message="No SPF record found.",
+            evidence=[],
+            source_sections=["dns_intelligence"],
+            confidence=0.9
+        ))
+
+    # Missing DMARC
+    if security.get("dmarc_present") is False:
+        anomalies.append(_anomaly(
+            category="dns",
+            subtype="missing_dmarc",
+            severity=classify_anomaly("dns", "missing_dmarc"),
+            message="No DMARC record found.",
+            evidence=[],
+            source_sections=["dns_intelligence"],
+            confidence=0.9
+        ))
+
+    # Duplicate records
+    dupes = (analysis.get("consistency", {}) or {}).get("duplicate_records", []) or []
+    if dupes:
+        anomalies.append(_anomaly(
+            category="dns",
+            subtype="duplicate_records",
+            severity=classify_anomaly("dns", "duplicate_records"),
+            message=f"{len(dupes)} duplicate DNS record group(s) found.",
+            evidence=dupes,
+            source_sections=["dns_intelligence"],
+            confidence=0.95
+        ))
+
+    # Low TTL
+    ttl = analysis.get("ttl", {}) or {}
+    if ttl.get("low_ttl_warning"):
+        anomalies.append(_anomaly(
+            category="dns",
+            subtype="low_ttl",
+            severity=classify_anomaly("dns", "low_ttl"),
+            message=f"{ttl.get('low_ttl_count', 0)} record(s) with TTL below threshold.",
+            evidence=[ttl],
+            source_sections=["dns_intelligence"],
+            confidence=0.9
+        ))
+
+    return anomalies
+
+
+def _check_cert(report: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    anomalies: List[Dict[str, Any]] = []
+    cert = report.get("certificate_intelligence", {}) or {}
+    if not cert:
+        return anomalies
+
+    # Live certificate checks
+    live = cert.get("live_certificate") or {}
+    if isinstance(live, dict) and live and live.get("source") == "live":
+        if live.get("expired"):
+            anomalies.append(_anomaly(
+                category="cert",
+                subtype="expired",
+                severity=classify_anomaly("cert", "expired"),
+                message="Live certificate is expired.",
+                evidence=[{
+                    "fingerprint": live.get("fingerprint_sha256"),
+                    "not_after": live.get("not_after")
+                }],
+                source_sections=["certificate_intelligence"],
+                confidence=0.95
+            ))
+
+        if live.get("near_expiry"):
+            anomalies.append(_anomaly(
+                category="cert",
+                subtype="near_expiry",
+                severity=classify_anomaly("cert", "near_expiry"),
+                message="Live certificate is near expiry.",
+                evidence=[{
+                    "fingerprint": live.get("fingerprint_sha256"),
+                    "not_after": live.get("not_after")
+                }],
+                source_sections=["certificate_intelligence"],
+                confidence=0.9
+            ))
+
+        algo = (live.get("signature_algorithm") or "").lower()
+        if "sha1" in algo or "md5" in algo:
+            anomalies.append(_anomaly(
+                category="cert",
+                subtype="weak_algorithm",
+                severity=classify_anomaly("cert", "weak_algorithm"),
+                message=f"Live certificate uses weak algorithm: {algo}.",
+                evidence=[{"signature_algorithm": algo}],
+                source_sections=["certificate_intelligence"],
+                confidence=0.95
+            ))
+
+        key_type = live.get("key_type")
+        key_size = live.get("key_size") or 0
+        try:
+            key_size = int(key_size)
+        except Exception:
+            key_size = 0
+        if key_type == "RSA" and key_size and key_size < 2048:
+            anomalies.append(_anomaly(
+                category="cert",
+                subtype="weak_key_size",
+                severity=classify_anomaly("cert", "weak_key_size"),
+                message=f"Live certificate uses weak RSA key size: {key_size}.",
+                evidence=[{"key_type": key_type, "key_size": key_size}],
+                source_sections=["certificate_intelligence"],
+                confidence=0.95
+            ))
+
+    # Relationships
+    relationships = cert.get("relationships", {}) or {}
+
+    if relationships.get("expired_certs"):
+        anomalies.append(_anomaly(
+            category="cert",
+            subtype="expired",
+            severity=classify_anomaly("cert", "expired"),
+            message=f"{len(relationships['expired_certs'])} expired certificate(s) found.",
+            evidence=relationships["expired_certs"],
+            source_sections=["certificate_intelligence"],
+            confidence=0.9
+        ))
+
+    if relationships.get("weak_algo_certs"):
+        anomalies.append(_anomaly(
+            category="cert",
+            subtype="weak_algorithm",
+            severity=classify_anomaly("cert", "weak_algorithm"),
+            message=f"{len(relationships['weak_algo_certs'])} certificate(s) use weak algorithms.",
+            evidence=relationships["weak_algo_certs"],
+            source_sections=["certificate_intelligence"],
+            confidence=0.9
+        ))
+
+    wildcards = relationships.get("wildcard_certs", []) or []
+    if len(wildcards) > 5:
+        anomalies.append(_anomaly(
+            category="cert",
+            subtype="wildcard_overuse",
+            severity=classify_anomaly("cert", "wildcard_overuse"),
+            message=f"{len(wildcards)} wildcard certificates detected.",
+            evidence=wildcards,
+            source_sections=["certificate_intelligence"],
+            confidence=0.85
+        ))
+
+    # Live cert not in CT
+    correlation = cert.get("correlation", {}) or {}
+    if correlation.get("private_certificate"):
+        anomalies.append(_anomaly(
+            category="cert",
+            subtype="live_not_in_ct",
+            severity=classify_anomaly("cert", "live_not_in_ct"),
+            message="Live certificate was not found in CT logs (private or internal).",
+            evidence=[{"fingerprint": correlation.get("live_fingerprint")}],
+            source_sections=["certificate_intelligence"],
+            confidence=0.8
+        ))
+
+    # Shared SAN across many certs
+    for entry in relationships.get("by_shared_san", []) or []:
+        if isinstance(entry, dict) and len(entry.get("certificates", []) or []) > 3:
+            anomalies.append(_anomaly(
+                category="cert",
+                subtype="shared_san_many",
+                severity=classify_anomaly("cert", "shared_san_many"),
+                message=f"SAN '{entry.get('san')}' appears in {len(entry['certificates'])} certificates.",
+                evidence=[entry],
+                source_sections=["certificate_intelligence"],
+                confidence=0.85
+            ))
+
+    return anomalies
+
+
+def _check_asn(report: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    anomalies: List[Dict[str, Any]] = []
+    infra = report.get("infrastructure_intelligence", {}) or {}
+    if not infra:
+        return anomalies
+
+    asn = infra.get("asn", {}) or {}
+    org = infra.get("organization", {}) or {}
+    rdap = infra.get("rdap", {}) or {}
+    attack = report.get("attack_surface_intelligence", {}) or {}
+
+    asn_type = asn.get("type", "unknown")
+
+    # ASN type vs service type mismatch
+    for svc in attack.get("services", []) or []:
+        if not isinstance(svc, dict):
+            continue
+        service = svc.get("service", "")
+        # DNS on non-hosting/non-isp ASN
+        if service == "dns" and asn_type not in ("hosting", "isp", "education", "government"):
+            anomalies.append(_anomaly(
+                category="asn",
+                subtype="type_service_mismatch",
+                severity=classify_anomaly("asn", "type_service_mismatch"),
+                message=f"DNS service on ASN type '{asn_type}'.",
+                evidence=[{"port": svc.get("port"), "service": service, "asn_type": asn_type}],
+                source_sections=["infrastructure_intelligence", "attack_surface_intelligence"],
+                confidence=0.7
+            ))
+        # Mail on residential ASN
+        if service in ("smtp", "imap", "pop3") and asn_type == "isp":
+            anomalies.append(_anomaly(
+                category="asn",
+                subtype="type_service_mismatch",
+                severity=classify_anomaly("asn", "type_service_mismatch"),
+                message="Mail service on ISP ASN — may be residential mail host.",
+                evidence=[{"port": svc.get("port"), "service": service, "asn_type": asn_type}],
+                source_sections=["infrastructure_intelligence", "attack_surface_intelligence"],
+                confidence=0.6
+            ))
+
+    # ASN country vs RDAP/WHOIS country mismatch
+    asn_country = (asn.get("country") or "").upper()
+    rdap_country = (org.get("country") or rdap.get("country") or "").upper()
+    if asn_country and rdap_country and asn_country != rdap_country:
+        anomalies.append(_anomaly(
+            category="asn",
+            subtype="country_mismatch",
+            severity=classify_anomaly("asn", "country_mismatch"),
+            message=f"ASN country ({asn_country}) differs from RDAP/WHOIS country ({rdap_country}).",
+            evidence=[{"asn_country": asn_country, "rdap_country": rdap_country}],
+            source_sections=["infrastructure_intelligence"],
+            confidence=0.8
+        ))
+
+    # ASN name vs org name mismatch (basic)
+    asn_name = (asn.get("asn_name") or "").lower()
+    org_name = (org.get("name") or "").lower()
+    if asn_name and org_name:
+        # Simple heuristic: check if any word from org_name appears in asn_name
+        words = [w for w in re.split(r"\W+", org_name) if len(w) > 3]
+        if words and not any(w in asn_name for w in words):
+            anomalies.append(_anomaly(
+                category="asn",
+                subtype="name_org_mismatch",
+                severity=classify_anomaly("asn", "name_org_mismatch"),
+                message="ASN name and organization name do not appear related.",
+                evidence=[{"asn_name": asn.get("asn_name"), "org_name": org.get("name")}],
+                source_sections=["infrastructure_intelligence"],
+                confidence=0.6
+            ))
+
+    return anomalies
+
+
+def _history_key_to_subtype(key: str) -> str:
+    if "certificate.fingerprint" in key:
+        return "certificate_change"
+    if key.startswith("asn."):
+        return "asn_change"
+    if key.startswith("dns.NS"):
+        return "ns_change"
+    if key.startswith("whois.abuse_email"):
+        return "abuse_contact_change"
+    if key.startswith("threat."):
+        return "threat_score_change"
+    if key.startswith("whois.org"):
+        return "org_change"
+    if ".added" in key:
+        return "record_added"
+    if ".removed" in key:
+        return "record_removed"
+    return "unknown"
+
+
+def _extract_delta(change: Dict[str, Any]) -> Optional[float]:
+    try:
+        old = float(change.get("old") or 0)
+        new = float(change.get("new") or 0)
+        return abs(new - old)
+    except Exception:
+        return None
+
+
+def _check_history(report: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    anomalies: List[Dict[str, Any]] = []
+    history = report.get("historical_intelligence", {}) or {}
+    if history.get("status") != "COMPARED":
+        return anomalies
+
+    detection = history.get("detection", {}) or {}
+    for change in detection.get("changes", []) or []:
+        if not isinstance(change, dict):
+            continue
+        key = change.get("key", "")
+        severity = str(change.get("severity", "informational")).upper()
+        if severity not in ANOMALY_SEVERITY_ORDER:
+            severity = "INFORMATIONAL"
+
+        # Map key -> subtype
+        subtype = _history_key_to_subtype(key)
+
+        anomalies.append(_anomaly(
+            category="history",
+            subtype=subtype,
+            severity=severity,
+            message=f"Historical change detected: {key}",
+            evidence=[{
+                "key": key,
+                "old": change.get("old"),
+                "new": change.get("new"),
+                "change_type": change.get("change_type")
+            }],
+            source_sections=["historical_intelligence"],
+            confidence=0.9,
+            metadata={"delta": _extract_delta(change)}
+        ))
+
+    return anomalies
+
+
+def _check_infra(report: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    anomalies: List[Dict[str, Any]] = []
+    corr = report.get("correlation_intelligence", {}) or {}
+    graph = corr.get("graph", {}) or {}
+
+    # Shared certificate across unrelated ASNs
+    for entry in (corr.get("shared", {}) or {}).get("shared_certificates", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        shared_by = entry.get("shared_by", []) or []
+        if len(shared_by) < 2:
+            continue
+        # Check if the shared IPs belong to different ASNs
+        asns = set()
+        for ip_id in shared_by:
+            for edge in graph.get("edges", []) or []:
+                if isinstance(edge, dict) and edge.get("source") == ip_id and edge.get("type") == "belongs_to_asn":
+                    asns.add(edge.get("target"))
+        if len(asns) > 1:
+            anomalies.append(_anomaly(
+                category="infra",
+                subtype="shared_cert_unrelated_asn",
+                severity=classify_anomaly("infra", "shared_cert_unrelated_asn"),
+                message=f"Certificate shared across {len(asns)} different ASNs.",
+                evidence=[{"certificate": entry.get("entity"), "asns": sorted(asns), "shared_by": shared_by}],
+                source_sections=["correlation_intelligence"],
+                confidence=0.8
+            ))
+
+    # Shared nameserver across unrelated organizations
+    for entry in (corr.get("shared", {}) or {}).get("shared_nameservers", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        shared_by = entry.get("shared_by", []) or []
+        if len(shared_by) < 2:
+            continue
+        orgs = set()
+        for ip_id in shared_by:
+            for edge in graph.get("edges", []) or []:
+                if isinstance(edge, dict) and edge.get("source") == ip_id and edge.get("type") == "belongs_to_asn":
+                    asn_id = edge.get("target")
+                    for e2 in graph.get("edges", []) or []:
+                        if isinstance(e2, dict) and e2.get("source") == asn_id and e2.get("type") == "owned_by":
+                            orgs.add(e2.get("target"))
+        if len(orgs) > 1:
+            anomalies.append(_anomaly(
+                category="infra",
+                subtype="shared_ns_unrelated_org",
+                severity=classify_anomaly("infra", "shared_ns_unrelated_org"),
+                message=f"Nameserver shared across {len(orgs)} different organizations.",
+                evidence=[{"nameserver": entry.get("entity"), "orgs": sorted(orgs)}],
+                source_sections=["correlation_intelligence"],
+                confidence=0.75
+            ))
+
+    return anomalies
+
+
+def _check_provider(report: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    anomalies: List[Dict[str, Any]] = []
+    ti = report.get("threat_intelligence", {}) or {}
+    if not ti:
+        return anomalies
+
+    normalized = ti.get("normalized", []) or []
+    ok = [r for r in normalized if isinstance(r, dict) and r.get("status") == "OK"]
+
+    # Low coverage
+    coverage = ti.get("evidence_coverage", 1.0)
+    try:
+        coverage = float(coverage)
+    except Exception:
+        coverage = 1.0
+    if coverage < 0.5 and len(normalized) > 0:
+        anomalies.append(_anomaly(
+            category="provider",
+            subtype="low_coverage",
+            severity=classify_anomaly("provider", "low_coverage"),
+            message=f"Threat intelligence coverage is low: {coverage * 100:.1f}%.",
+            evidence=[{"coverage": coverage, "ok_count": len(ok), "total": len(normalized)}],
+            source_sections=["threat_intelligence"],
+            confidence=0.9
+        ))
+
+    # Failed providers
+    failed_count = ti.get("failed_count", 0)
+    try:
+        failed_count = int(failed_count)
+    except Exception:
+        failed_count = 0
+    if failed_count > 0:
+        anomalies.append(_anomaly(
+            category="provider",
+            subtype="failed_providers",
+            severity=classify_anomaly("provider", "failed_providers"),
+            message=f"{failed_count} provider(s) failed. Absence of data is not absence of threat.",
+            evidence=[ti.get("failures", {})],
+            source_sections=["threat_intelligence"],
+            confidence=0.95
+        ))
+
+    # Score disagreement
+    if len(ok) >= 2:
+        try:
+            scores = [float(r.get("threat_score", 0.0) or 0.0) for r in ok]
+        except Exception:
+            scores = []
+        if scores:
+            min_s = min(scores)
+            max_s = max(scores)
+            delta = (max_s - min_s) * 100  # to 0-100 scale
+            if delta >= 20:
+                anomalies.append(_anomaly(
+                    category="provider",
+                    subtype="score_disagreement",
+                    severity=classify_anomaly("provider", "score_disagreement",
+                                               context={"delta": delta}),
+                    message=f"Providers disagree on threat score (delta={delta:.1f}).",
+                    evidence=[{"scores": scores, "providers": [r.get("source") for r in ok]}],
+                    source_sections=["threat_intelligence"],
+                    confidence=0.85,
+                    metadata={"delta": delta}
+                ))
+
+            # High variance
+            mean = sum(scores) / len(scores)
+            variance = sum((s - mean) ** 2 for s in scores) / len(scores)
+            if variance > 0.05:
+                anomalies.append(_anomaly(
+                    category="provider",
+                    subtype="high_variance",
+                    severity=classify_anomaly("provider", "high_variance"),
+                    message=f"High variance in provider scores: {variance:.4f}.",
+                    evidence=[{"variance": variance, "scores": scores}],
+                    source_sections=["threat_intelligence"],
+                    confidence=0.8
+                ))
+
+            # Single provider flag
+            flagged = [r for r in ok if float(r.get("threat_score", 0.0) or 0.0) >= 0.5]
+            if len(flagged) == 1 and len(ok) >= 3:
+                anomalies.append(_anomaly(
+                    category="provider",
+                    subtype="single_provider_flag",
+                    severity=classify_anomaly("provider", "single_provider_flag"),
+                    message=f"Only 1 of {len(ok)} providers flagged this target.",
+                    evidence=[{"flagged_provider": flagged[0].get("source"),
+                               "score": flagged[0].get("threat_score")}],
+                    source_sections=["threat_intelligence"],
+                    confidence=0.7
+                ))
+
+    return anomalies
+
+
+def _check_stale(report: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    anomalies: List[Dict[str, Any]] = []
+    anomaly_cfg = (config or {}).get("anomaly", {}) if isinstance(config, dict) else {}
+    max_stale_seconds = anomaly_cfg.get("max_stale_seconds", 86400)
+    try:
+        max_stale_seconds = int(max_stale_seconds)
+    except Exception:
+        max_stale_seconds = 86400
+    now = datetime.now(timezone.utc)
+
+    # Check evidence freshness
+    all_evidence: List[Dict[str, Any]] = []
+    for section in ("dns_intelligence", "certificate_intelligence", "passive_dns_intelligence"):
+        sec = report.get(section, {}) or {}
+        for ev in sec.get("evidence", []) or []:
+            if isinstance(ev, dict):
+                all_evidence.append(ev)
+
+    stale_count = 0
+    for ev in all_evidence:
+        ts = ev.get("timestamp")
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age = (now - dt).total_seconds()
+            if age > max_stale_seconds:
+                stale_count += 1
+        except Exception:
+            continue
+
+    if stale_count > 0:
+        anomalies.append(_anomaly(
+            category="stale",
+            subtype="evidence_stale",
+            severity=classify_anomaly("stale", "evidence_stale"),
+            message=f"{stale_count} evidence item(s) are older than {max_stale_seconds}s.",
+            evidence=[{"stale_count": stale_count, "max_stale_seconds": max_stale_seconds}],
+            source_sections=["dns_intelligence", "certificate_intelligence", "passive_dns_intelligence"],
+            confidence=0.9
+        ))
+
+    # Threat data stale
+    ti = report.get("threat_intelligence", {}) or {}
+    freshness = ti.get("data_freshness", 1.0)
+    try:
+        freshness = float(freshness)
+    except Exception:
+        freshness = 1.0
+    if freshness < 0.5:
+        anomalies.append(_anomaly(
+            category="stale",
+            subtype="threat_data_stale",
+            severity=classify_anomaly("stale", "threat_data_stale"),
+            message=f"Threat data freshness is low: {freshness * 100:.1f}%.",
+            evidence=[{"data_freshness": freshness}],
+            source_sections=["threat_intelligence"],
+            confidence=0.85
+        ))
+
+    # Snapshot stale
+    history = report.get("historical_intelligence", {}) or {}
+    prev_ts = history.get("previous_timestamp")
+    if prev_ts:
+        try:
+            dt = datetime.fromisoformat(str(prev_ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_days = (now - dt).days
+            if age_days > 30:
+                anomalies.append(_anomaly(
+                    category="stale",
+                    subtype="snapshot_stale",
+                    severity=classify_anomaly("stale", "snapshot_stale"),
+                    message=f"Previous snapshot is {age_days} days old.",
+                    evidence=[{"previous_timestamp": prev_ts, "age_days": age_days}],
+                    source_sections=["historical_intelligence"],
+                    confidence=0.9
+                ))
+        except Exception:
+            pass
+
+    return anomalies
+
+
+def anomaly_checks(report: Dict[str, Any],
+                   config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Run all enabled anomaly checks.
+    Returns:
+    {
+        "checks_executed": [...],
+        "anomalies": [...],
+        "by_severity": {...},
+        "by_category": {...}
+    }
+    """
+    anomaly_cfg = (config or {}).get("anomaly", {}) if isinstance(config, dict) else {}
+    enabled_checks = anomaly_cfg.get("checks",
+                                     ["dns", "cert", "asn", "history", "infra", "provider", "stale"])
+
+    check_map = {
+        "dns": _check_dns,
+        "cert": _check_cert,
+        "asn": _check_asn,
+        "history": _check_history,
+        "infra": _check_infra,
+        "provider": _check_provider,
+        "stale": _check_stale,
+    }
+
+    executed: List[str] = []
+    anomalies: List[Dict[str, Any]] = []
+
+    for name in enabled_checks or []:
+        fn = check_map.get(name)
+        if not fn:
+            continue
+        try:
+            results = fn(report, config)
+            anomalies.extend(results or [])
+            executed.append(name)
+        except Exception as e:
+            # A failed check is not an anomaly — it is a check error.
+            # Record it but do not fabricate anomalies.
+            anomalies.append(_anomaly(
+                category=name,
+                subtype="check_error",
+                severity="INFORMATIONAL",
+                message=f"Anomaly check '{name}' raised an error: {e}",
+                evidence=[],
+                source_sections=[],
+                confidence=0.0
+            ))
+            executed.append(name)
+
+    return {
+        "checks_executed": executed,
+        "anomalies": anomalies
+    }
+
+
+def anomaly_report(report: Dict[str, Any],
+                   config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Full anomaly detection pipeline.
+    """
+    anomaly_cfg = (config or {}).get("anomaly", {}) if isinstance(config, dict) else {}
+    if not anomaly_cfg.get("enabled", True):
+        return {"enabled": False}
+
+    # Step 1: Run checks
+    result = anomaly_checks(report, config)
+    executed = result["checks_executed"]
+    anomalies = result["anomalies"]
+
+    # Step 2: Sort by severity (HIGH first)
+    anomalies.sort(key=lambda a: -ANOMALY_SEVERITY_ORDER.get(a.get("severity"), 0))
+
+    # Step 3: Aggregate
+    by_severity = {s: 0 for s in ANOMALY_SEVERITIES}
+    by_category: Dict[str, int] = defaultdict(int)
+    for a in anomalies:
+        by_severity[a["severity"]] = by_severity.get(a["severity"], 0) + 1
+        by_category[a["category"]] += 1
+
+    # Step 4: Cap report size
+    max_in_report = anomaly_cfg.get("max_anomalies_in_report", 200)
+    try:
+        max_in_report = int(max_in_report)
+    except Exception:
+        max_in_report = 200
+    capped = anomalies[:max_in_report] if max_in_report and max_in_report > 0 else anomalies
+
+    # Step 5: Notes
+    notes = [
+        "An anomaly is a deviation from expectation, not a verdict.",
+        "An anomaly is evidence, not a conclusion.",
+        "An anomaly requires interpretation.",
+        "Severity reflects deviation level, not threat level.",
+        "A clean report means checks were executed and no deviations were found.",
+        "A check error is not an anomaly — it is a check failure."
+    ]
+
+    return {
+        "enabled": True,
+        "checks_executed": executed,
+        "checks_executed_count": len(executed),
+        "total_anomalies": len(anomalies),
+        "by_severity": by_severity,
+        "by_category": dict(by_category),
+        "anomalies": capped,
+        "notes": notes,
+        "summary": {
+            "checks_executed": len(executed),
+            "total_anomalies": len(anomalies),
+            "informational": by_severity.get("INFORMATIONAL", 0),
+            "low": by_severity.get("LOW", 0),
+            "moderate": by_severity.get("MODERATE", 0),
+            "high": by_severity.get("HIGH", 0)
+        }
+    }
 # ============================================================
 #  THREAT INTEL PROVIDERS
 # ============================================================
@@ -3172,22 +8030,30 @@ def normalize_result(source: str, raw: Optional[Dict[str, Any]]) -> Dict[str, An
     if raw_status in ("FAILED", "NOT_CONFIGURED"):
         status = raw_status
     raw_score = raw.get("threat_score")
-    normalized = 0.0
-    try:
-        if raw_score is not None and status == "OK":
-            val = float(raw_score)
-            if val > 1.0:
-                val = val / 100.0
-            normalized = max(0.0, min(1.0, val))
-        elif status != "OK":
-            normalized = 0.0
-    except (TypeError, ValueError):
+    if raw_score is None and status == "OK":
+        # "not in list" — this is a valid answer, not a threat and not a failure
         normalized = 0.0
+        tags = raw.get("tags", []) or []
+        if not tags:
+            tags = ["not_listed"]
+    else:
+        normalized = 0.0
+        try:
+            if raw_score is not None and status == "OK":
+                val = float(raw_score)
+                if val > 1.0:
+                    val = val / 100.0
+                normalized = max(0.0, min(1.0, val))
+            elif status != "OK":
+                normalized = 0.0
+        except (TypeError, ValueError):
+            normalized = 0.0
+        tags = raw.get("tags", []) or []
     return {
         "source": source,
         "threat_score": round(normalized, 4),
         "raw_score": raw_score,
-        "tags": raw.get("tags", []) or [],
+        "tags": tags,
         "first_seen": raw.get("first_seen"),
         "last_seen": raw.get("last_seen"),
         "evidence": raw.get("evidence", "") or "",
@@ -3220,7 +8086,7 @@ def detect_provider_failure(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         )
     }
 
-def threat_confidence(normalized_results: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Any]:
+def _threat_confidence_stage4(normalized_results: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Compute threat confidence and related metrics (Stage 4).
     Returns {observed_threat_score 0-100, evidence_coverage 0-1, provider_agreement 0-1, data_freshness 0-1, threat_confidence 0-1, provider_count, ok_count, failed_count, not_configured_count}
@@ -3286,7 +8152,7 @@ def aggregate(raw_results: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict
     """
     normalized = [normalize_result(r.get("source", "unknown"), r) for r in raw_results]
     failures = detect_provider_failure(normalized)
-    metrics = threat_confidence(normalized, config)
+    metrics = _threat_confidence_stage4(normalized, config)
     summary_parts = []
     summary_parts.append(f"Observed Threat Score: {metrics['observed_threat_score']}/100")
     summary_parts.append(f"Coverage: {metrics['evidence_coverage'] * 100:.1f}%")
@@ -3313,6 +8179,1200 @@ def data_confidence_evidence(evidences: List[Evidence]) -> float:
     avg_conf = sum(float(getattr(e, 'confidence', 0)) for e in ok) / len(ok)
     coverage = len(ok) / len(evidences)
     return round(avg_conf * coverage, 4)
+
+# ============================================================
+#  CONFIDENCE ENGINE — v41 (Stage 15)
+#  Four distinct, explainable metrics:
+#    Data Confidence, Threat Confidence, Geo Confidence, Assessment Confidence.
+#  Confidence is not accuracy. Confidence is not certainty.
+#  Confidence is the tool's own estimation of how much it knows.
+# ============================================================
+def _conf_get(ev: Any, key: str, default: Any = None) -> Any:
+    """Get key from dict or attribute from Evidence/Ev objects."""
+    try:
+        if isinstance(ev, dict):
+            return ev.get(key, default)
+        if hasattr(ev, "to_dict"):
+            try:
+                d = ev.to_dict()
+                if isinstance(d, dict) and key in d:
+                    return d.get(key, default)
+            except Exception:
+                pass
+        if hasattr(ev, key):
+            return getattr(ev, key)
+    except Exception:
+        pass
+    return default
+
+def _conf_to_dict(ev: Any) -> Dict[str, Any]:
+    """Normalize evidence (dict or object) to dict for scoring."""
+    if isinstance(ev, dict):
+        return ev
+    if hasattr(ev, "to_dict"):
+        try:
+            d = ev.to_dict()
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+    try:
+        return {
+            "source": getattr(ev, "source", getattr(ev, "provider", "unknown")),
+            "status": getattr(ev, "status", "UNKNOWN"),
+            "confidence": float(getattr(ev, "confidence", getattr(ev, "reliability", 0.0)) or 0.0),
+            "freshness": getattr(ev, "freshness", "UNKNOWN"),
+        }
+    except Exception:
+        return {"source": "unknown", "status": "UNKNOWN", "confidence": 0.0, "freshness": "UNKNOWN"}
+
+def data_confidence(report: Optional[Dict[str, Any]] = None,
+                    config: Optional[Dict[str, Any]] = None,
+                    *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """
+    Compute Data Confidence.
+
+    Inputs:
+      - Evidence objects across all sections
+      - Evidence freshness
+      - Evidence status (OK / FAILED / PARTIAL / NOT_CONFIGURED)
+      - Provider reliability (if available)
+
+    Output:
+    {
+        "score": float 0.0 – 1.0,
+        "components": {...},
+        "explanation": str
+    }
+    """
+    # Backward compatibility: legacy call data_confidence(evs, trusted, cs, _ps)
+    # where first arg is a list of Ev/Evidence. Dispatch to Stage 14 logic.
+    if args or kwargs or isinstance(report, list):
+        try:
+            evs = report if isinstance(report, list) else []
+            trusted = config if isinstance(config, dict) else {}
+            cs = args[0] if len(args) >= 1 else kwargs.get("cs", [])
+            _ps = args[1] if len(args) >= 2 else kwargs.get("_ps", None)
+            if cs is None:
+                cs = []
+            return _data_confidence_legacy(evs, trusted, cs, _ps)
+        except Exception:
+            pass
+        # Fall through to Stage 15 if legacy fails and report looks like dict
+        if not isinstance(report, dict):
+            return {
+                "score": 0.0,
+                "components": {"total_evidence": 0, "ok_count": 0, "freshness_avg": 0.0, "status_avg": 0.0, "coverage": 0.0},
+                "explanation": "No evidence collected. Data confidence is undefined."
+            }
+    if report is None:
+        report = {}
+    if config is None:
+        config = CFG if isinstance(CFG, dict) else {}
+    conf_cfg = config.get("confidence", {}) if isinstance(config, dict) else {}
+    weight_freshness = conf_cfg.get("data_weights", {}).get("freshness", 0.4)
+    weight_status = conf_cfg.get("data_weights", {}).get("status", 0.3)
+    weight_coverage = conf_cfg.get("data_weights", {}).get("coverage", 0.3)
+
+    # Collect all evidence
+    evidences: List[Dict[str, Any]] = []
+    try:
+        for section in (
+            "dns_intelligence",
+            "certificate_intelligence",
+            "passive_dns_intelligence",
+            "threat_intelligence",
+        ):
+            sec = report.get(section, {}) if isinstance(report, dict) else {}
+            if not isinstance(sec, dict):
+                continue
+            for ev in sec.get("evidence", []) or []:
+                try:
+                    evidences.append(_conf_to_dict(ev))
+                except Exception:
+                    continue
+
+        # Include provider evidence explicitly
+        ti = report.get("threat_intelligence", {}) if isinstance(report, dict) else {}
+        if isinstance(ti, dict):
+            for norm in ti.get("normalized", []) or []:
+                try:
+                    nd = _conf_to_dict(norm) if not isinstance(norm, dict) else norm
+                    evidences.append({
+                        "source": nd.get("source"),
+                        "status": nd.get("status"),
+                        "confidence": nd.get("confidence", 0.0),
+                        "freshness": nd.get("freshness", "UNKNOWN")
+                    })
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    total = len(evidences)
+    if total == 0:
+        return {
+            "score": 0.0,
+            "components": {
+                "total_evidence": 0,
+                "ok_count": 0,
+                "freshness_avg": 0.0,
+                "status_avg": 0.0,
+                "coverage": 0.0
+            },
+            "explanation": "No evidence collected. Data confidence is undefined."
+        }
+
+    ok = [e for e in evidences if _conf_get(e, "status") == "OK"]
+    freshness_map = {"FRESH": 1.0, "STALE": 0.5, "EXPIRED": 0.1, "UNKNOWN": 0.0}
+
+    # Freshness score
+    freshness_scores = [freshness_map.get(_conf_get(e, "freshness", "UNKNOWN"), 0.0) for e in ok]
+    freshness_avg = sum(freshness_scores) / len(freshness_scores) if freshness_scores else 0.0
+
+    # Status score
+    status_scores = [1.0 if _conf_get(e, "status") == "OK" else 0.0 for e in evidences]
+    status_avg = sum(status_scores) / total if total > 0 else 0.0
+
+    # Coverage
+    coverage = len(ok) / total if total > 0 else 0.0
+
+    # Weighted score
+    score = (
+        freshness_avg * weight_freshness +
+        status_avg * weight_status +
+        coverage * weight_coverage
+    )
+    score = round(max(0.0, min(1.0, score)), 4)
+
+    return {
+        "score": score,
+        "components": {
+            "total_evidence": total,
+            "ok_count": len(ok),
+            "freshness_avg": round(freshness_avg, 4),
+            "status_avg": round(status_avg, 4),
+            "coverage": round(coverage, 4)
+        },
+        "explanation": (
+            f"Data confidence based on {total} evidence item(s), "
+            f"{len(ok)} OK, freshness={freshness_avg:.2f}, "
+            f"coverage={coverage:.2f}."
+        )
+    }
+
+def threat_confidence(report: Optional[Any] = None,
+                      config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Compute Threat Confidence.
+
+    Inputs:
+      - Provider agreement
+      - Normalized threat scores
+      - Coverage
+      - Failure rate
+
+    Output:
+    {
+        "score": float 0.0 – 1.0,
+        "components": {...},
+        "explanation": str
+    }
+    """
+    # Backward compatibility: legacy call threat_confidence(normalized_list, config)
+    if isinstance(report, list):
+        try:
+            return _threat_confidence_stage4(report, config if isinstance(config, dict) else {})
+        except Exception as e:
+            return {
+                "observed_threat_score": 0.0, "evidence_coverage": 0.0,
+                "provider_agreement": 0.0, "data_freshness": 0.0,
+                "threat_confidence": 0.0, "provider_count": len(report),
+                "ok_count": 0, "failed_count": 0, "not_configured_count": 0
+            }
+    if report is None:
+        report = {}
+    if config is None:
+        config = CFG if isinstance(CFG, dict) else {}
+    ti = report.get("threat_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(ti, dict):
+        ti = {}
+    normalized = ti.get("normalized", []) or []
+    # Normalize entries that may be objects
+    norm_list: List[Dict[str, Any]] = []
+    for r in normalized:
+        if isinstance(r, dict):
+            norm_list.append(r)
+        else:
+            try:
+                norm_list.append(_conf_to_dict(r))
+            except Exception:
+                continue
+    normalized = norm_list
+    total = len(normalized)
+    if total == 0:
+        return {
+            "score": 0.0,
+            "components": {
+                "provider_count": 0,
+                "ok_count": 0,
+                "coverage": 0.0,
+                "agreement": 0.0,
+                "observed_score": 0.0,
+                "freshness": 0.0
+            },
+            "explanation": "No threat providers configured or executed."
+        }
+
+    ok = [r for r in normalized if _conf_get(r, "status") == "OK"]
+    failed = [r for r in normalized if _conf_get(r, "status") == "FAILED"]
+    not_configured = [r for r in normalized if _conf_get(r, "status") == "NOT_CONFIGURED"]
+
+    coverage = len(ok) / total if total > 0 else 0.0
+    failure_rate = (len(failed) + len(not_configured)) / total if total > 0 else 0.0
+
+    # Observed score (weighted)
+    if ok:
+        try:
+            weighted_sum = sum(float(_conf_get(r, "threat_score", 0) or 0) * float(_conf_get(r, "weight", 1.0) or 0) * float(_conf_get(r, "confidence", 0.5) or 0) for r in ok)
+            weight_sum = sum(float(_conf_get(r, "weight", 1.0) or 0) * float(_conf_get(r, "confidence", 0.5) or 0) for r in ok)
+            observed = (weighted_sum / weight_sum) if weight_sum > 0 else 0.0
+        except Exception:
+            observed = 0.0
+    else:
+        observed = 0.0
+
+    # Agreement
+    if len(ok) > 1:
+        try:
+            scores = [float(_conf_get(r, "threat_score", 0) or 0) for r in ok]
+            mean = sum(scores) / len(scores)
+            variance = sum((s - mean) ** 2 for s in scores) / len(scores)
+            normalized_variance = min(variance / 0.25, 1.0)
+            agreement = 1.0 - normalized_variance
+        except Exception:
+            agreement = 0.0
+    elif len(ok) == 1:
+        agreement = 0.5
+    else:
+        agreement = 0.0
+
+    # Freshness
+    freshness_map = {"FRESH": 1.0, "STALE": 0.5, "EXPIRED": 0.1, "UNKNOWN": 0.0}
+    if ok:
+        try:
+            freshness_avg = sum(freshness_map.get(_conf_get(r, "freshness", "UNKNOWN"), 0.0) for r in ok) / len(ok)
+        except Exception:
+            freshness_avg = 0.0
+    else:
+        freshness_avg = 0.0
+
+    # Confidence
+    try:
+        score = observed * coverage * freshness_avg * (1.0 - failure_rate)
+    except Exception:
+        score = 0.0
+
+    # Agreement bonus / penalty
+    conf_cfg = config.get("threat_intelligence", {}) if isinstance(config, dict) else {}
+    try:
+        agreement_bonus = float(conf_cfg.get("agreement_bonus", 0.1))
+    except Exception:
+        agreement_bonus = 0.1
+    try:
+        disagreement_penalty = float(conf_cfg.get("disagreement_penalty", 0.2))
+    except Exception:
+        disagreement_penalty = 0.2
+    if agreement > 0.75:
+        score += agreement_bonus
+    elif agreement < 0.4 and len(ok) > 1:
+        score -= disagreement_penalty
+
+    score = round(max(0.0, min(1.0, score)), 4)
+
+    return {
+        "score": score,
+        "components": {
+            "provider_count": total,
+            "ok_count": len(ok),
+            "failed_count": len(failed),
+            "not_configured_count": len(not_configured),
+            "coverage": round(coverage, 4),
+            "failure_rate": round(failure_rate, 4),
+            "agreement": round(agreement, 4),
+            "observed_score": round(observed * 100, 2),
+            "freshness": round(freshness_avg, 4)
+        },
+        "explanation": (
+            f"Threat confidence based on {len(ok)}/{total} providers, "
+            f"coverage={coverage:.2f}, agreement={agreement:.2f}, "
+            f"failure_rate={failure_rate:.2f}."
+        )
+    }
+
+def geo_confidence(report: Optional[Dict[str, Any]] = None,
+                   config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Compute Geo Confidence.
+
+    Inputs:
+      - Anycast detection
+      - CDN detection
+      - Source agreement (country/region/city)
+      - Availability of each field
+
+    Output:
+    {
+        "score": float 0.0 – 1.0,
+        "components": {...},
+        "explanation": str
+    }
+    """
+    if report is None:
+        report = {}
+    if config is None:
+        config = CFG if isinstance(CFG, dict) else {}
+    infra = report.get("infrastructure_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(infra, dict):
+        infra = {}
+    asn = infra.get("asn", {}) if isinstance(infra, dict) else {}
+    rdap = infra.get("rdap", {}) if isinstance(infra, dict) else {}
+    org = infra.get("organization", {}) if isinstance(infra, dict) else {}
+    if not isinstance(asn, dict):
+        asn = {}
+    if not isinstance(rdap, dict):
+        rdap = {}
+    if not isinstance(org, dict):
+        org = {}
+
+    # Anycast detection
+    anycast = report.get("anycast", False) if isinstance(report, dict) else False
+    # Normalize to bool
+    anycast = bool(anycast) if isinstance(anycast, bool) else (str(anycast).lower() == "true" if isinstance(anycast, str) else bool(anycast))
+    asn_type = asn.get("type", "unknown")
+
+    # Sources of geo
+    sources = []
+    if asn.get("country"):
+        sources.append(("asn", asn["country"]))
+    if rdap.get("country"):
+        sources.append(("rdap", rdap["country"]))
+    if org.get("country"):
+        sources.append(("organization", org["country"]))
+
+    countries = [c for _, c in sources if c]
+    unique_countries = set(countries)
+
+    # Country agreement
+    if len(sources) == 0:
+        country_agreement = 0.0
+    elif len(unique_countries) == 1:
+        country_agreement = 1.0
+    else:
+        country_agreement = 1.0 / len(unique_countries)
+
+    # Field availability
+    fields_present = 0
+    if asn.get("country"):
+        fields_present += 1
+    if rdap.get("country"):
+        fields_present += 1
+    if org.get("country"):
+        fields_present += 1
+    field_availability = fields_present / 3.0
+
+    # Penalties
+    penalty_anycast = 0.5 if anycast else 0.0
+    penalty_cdn = 0.3 if asn_type == "hosting" and anycast else 0.0
+    penalty_disagreement = 0.0 if country_agreement >= 0.99 else (1.0 - country_agreement) * 0.5
+
+    score = (
+        country_agreement * 0.5 +
+        field_availability * 0.5
+    )
+    score = max(0.0, score - penalty_anycast - penalty_cdn - penalty_disagreement)
+    score = round(min(1.0, score), 4)
+
+    return {
+        "score": score,
+        "components": {
+            "sources": [{"name": n, "country": c} for n, c in sources],
+            "unique_countries": sorted(unique_countries),
+            "country_agreement": round(country_agreement, 4),
+            "field_availability": round(field_availability, 4),
+            "anycast": anycast,
+            "asn_type": asn_type,
+            "penalty_anycast": round(penalty_anycast, 4),
+            "penalty_cdn": round(penalty_cdn, 4),
+            "penalty_disagreement": round(penalty_disagreement, 4)
+        },
+        "explanation": (
+            f"Geo confidence based on {len(sources)} source(s), "
+            f"agreement={country_agreement:.2f}, "
+            f"anycast={anycast}, "
+            f"penalties applied."
+        )
+    }
+
+def assessment_confidence(data: Optional[Dict[str, Any]] = None,
+                          threat: Optional[Dict[str, Any]] = None,
+                          geo: Optional[Dict[str, Any]] = None,
+                          config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Compute overall Assessment Confidence.
+
+    Inputs:
+      - Data Confidence score
+      - Threat Confidence score
+      - Geo Confidence score
+      - Weights from config
+
+    Output:
+    {
+        "score": float 0.0 – 1.0,
+        "components": {...},
+        "explanation": str
+    }
+    """
+    if data is None:
+        data = {}
+    if threat is None:
+        threat = {}
+    if geo is None:
+        geo = {}
+    if config is None:
+        config = CFG if isinstance(CFG, dict) else {}
+    if not isinstance(data, dict):
+        data = {"score": 0.0}
+    if not isinstance(threat, dict):
+        threat = {"score": 0.0}
+    if not isinstance(geo, dict):
+        geo = {"score": 0.0}
+    conf_cfg = config.get("confidence", {}) if isinstance(config, dict) else {}
+    weights = conf_cfg.get("weights", {"data": 0.4, "threat": 0.3, "geo": 0.2, "assessment": 0.1})
+    if not isinstance(weights, dict):
+        weights = {"data": 0.4, "threat": 0.3, "geo": 0.2, "assessment": 0.1}
+
+    try:
+        w_data = float(weights.get("data", 0.4))
+    except Exception:
+        w_data = 0.4
+    try:
+        w_threat = float(weights.get("threat", 0.3))
+    except Exception:
+        w_threat = 0.3
+    try:
+        w_geo = float(weights.get("geo", 0.2))
+    except Exception:
+        w_geo = 0.2
+
+    # The "assessment" weight is reserved for future use; it is not
+    # applied to itself to avoid self-reference.
+    total_weight = w_data + w_threat + w_geo
+    if total_weight <= 0:
+        total_weight = 1.0
+
+    try:
+        d_score = float(data.get("score", 0.0) or 0.0)
+    except Exception:
+        d_score = 0.0
+    try:
+        t_score = float(threat.get("score", 0.0) or 0.0)
+    except Exception:
+        t_score = 0.0
+    try:
+        g_score = float(geo.get("score", 0.0) or 0.0)
+    except Exception:
+        g_score = 0.0
+
+    score = (
+        d_score * w_data +
+        t_score * w_threat +
+        g_score * w_geo
+    ) / total_weight
+
+    score = round(max(0.0, min(1.0, score)), 4)
+
+    # Human label (thresholds from config if present, else spec defaults)
+    try:
+        labels = conf_cfg.get("labels", {}) if isinstance(conf_cfg, dict) else {}
+        th_high = float(labels.get("high", 0.85))
+        th_mod = float(labels.get("moderate", 0.65))
+        th_low = float(labels.get("low", 0.40))
+    except Exception:
+        th_high, th_mod, th_low = 0.85, 0.65, 0.40
+    if score >= th_high:
+        label = "HIGH"
+    elif score >= th_mod:
+        label = "MODERATE"
+    elif score >= th_low:
+        label = "LOW"
+    else:
+        label = "VERY_LOW"
+
+    return {
+        "score": score,
+        "label": label,
+        "components": {
+            "data_confidence": d_score,
+            "threat_confidence": t_score,
+            "geo_confidence": g_score,
+            "weights": {"data": w_data, "threat": w_threat, "geo": w_geo}
+        },
+        "explanation": (
+            f"Assessment confidence {label} ({score:.2f}) "
+            f"= data({d_score:.2f})*{w_data} + "
+            f"threat({t_score:.2f})*{w_threat} + "
+            f"geo({g_score:.2f})*{w_geo}."
+        )
+    }
+
+def confidence_engine(report: Optional[Dict[str, Any]] = None,
+                      config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Full confidence pipeline.
+    """
+    if report is None:
+        report = {}
+    if config is None:
+        config = CFG if isinstance(CFG, dict) else {}
+    conf_cfg = config.get("confidence", {}) if isinstance(config, dict) else {}
+    if not conf_cfg.get("enabled", True):
+        return {"enabled": False}
+
+    data = data_confidence(report, config)
+    # Avoid recursion into legacy: data_confidence(report, config) with dict
+    # routes to Stage 15 path above.
+    threat = threat_confidence(report, config)
+    geo = geo_confidence(report, config)
+    assessment = assessment_confidence(data, threat, geo, config)
+
+    notes = [
+        "Confidence is not accuracy.",
+        "Confidence is not certainty.",
+        "Confidence is the tool's own estimation of how much it knows.",
+        "A low-confidence report is not a bad report — it is an honest one.",
+        "Data Confidence, Threat Confidence, and Geo Confidence answer different questions.",
+        "Assessment Confidence is a weighted combination, not a source of truth."
+    ]
+
+    return {
+        "enabled": True,
+        "data_confidence": data,
+        "threat_confidence": threat,
+        "geo_confidence": geo,
+        "assessment_confidence": assessment,
+        "separate": conf_cfg.get("separate", True),
+        "notes": notes,
+        "summary": {
+            "data": data.get("score", 0.0),
+            "threat": threat.get("score", 0.0),
+            "geo": geo.get("score", 0.0),
+            "assessment": assessment.get("score", 0.0),
+            "assessment_label": assessment.get("label", "UNKNOWN")
+        }
+    }
+
+# ============================================================
+#  INTELLIGENCE SCORING — v41.1 (Stage 16)
+#  Six distinct, explainable scores, each with WHY? breakdown.
+#  A score is not a verdict. A score is not a fact.
+#  A score is an explainable estimate.
+# ============================================================
+SCORE_LABELS = [
+    (0.0,  "VERY_LOW"),
+    (20.0, "LOW"),
+    (40.0, "MODERATE"),
+    (60.0, "HIGH"),
+    (80.0, "VERY_HIGH"),
+]
+
+
+def _score_label(score: float) -> str:
+    """
+    Map a 0–100 score to a human-readable label.
+    """
+    try:
+        s = float(score)
+    except Exception:
+        return "VERY_LOW"
+    label = "VERY_LOW"
+    for threshold, name in SCORE_LABELS:
+        if s >= threshold:
+            label = name
+    return label
+
+
+def _sfloat(v: Any, default: float = 0.0) -> float:
+    """Safe float conversion."""
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _sget(d: Any, key: str, default: Any = None) -> Any:
+    """Get key from dict or attribute from object."""
+    try:
+        if isinstance(d, dict):
+            return d.get(key, default)
+        if hasattr(d, key):
+            return getattr(d, key)
+    except Exception:
+        pass
+    return default
+
+
+def explain_score(score_name: str,
+                  components: List[Dict[str, Any]],
+                  config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build an explainable score from weighted components.
+
+    Each component:
+    {
+        "name": str,
+        "value": float 0.0 – 1.0,
+        "weight": float,
+        "evidence": str,
+        "source_section": str
+    }
+
+    Output:
+    {
+        "name": str,
+        "value": float 0.0 – 100.0,
+        "label": str,
+        "components": [...],
+        "explanation": str,
+        "contributions": [...]
+    }
+    """
+    try:
+        scoring_cfg = config.get("scoring", {}) if isinstance(config, dict) else {}
+    except Exception:
+        scoring_cfg = {}
+    explain = scoring_cfg.get("explain", True) if isinstance(scoring_cfg, dict) else True
+
+    comps = components or []
+    try:
+        total_weight = sum(_sfloat(c.get("weight", 1.0), 1.0) for c in comps)
+    except Exception:
+        total_weight = 1.0
+    if total_weight <= 0:
+        total_weight = 1.0
+
+    contributions = []
+    weighted_sum = 0.0
+    for c in comps:
+        try:
+            w = _sfloat(c.get("weight", 1.0), 1.0)
+            v = max(0.0, min(1.0, _sfloat(c.get("value", 0.0), 0.0)))
+            contribution = v * w
+            weighted_sum += contribution
+            contributions.append({
+                "name": c.get("name", "unknown"),
+                "value": round(v, 4),
+                "weight": round(w, 4),
+                "contribution": round(contribution, 4),
+                "evidence": c.get("evidence", ""),
+                "source_section": c.get("source_section", "")
+            })
+        except Exception:
+            continue
+
+    normalized = weighted_sum / total_weight if total_weight > 0 else 0.0
+    score_value = round(normalized * 100, 2)
+    label = _score_label(score_value)
+
+    if explain:
+        try:
+            parts = [f"{c['name']}={c['value']:.2f}*{c['weight']:.2f}" for c in contributions]
+            explanation = f"{score_name} = ({' + '.join(parts)}) / {total_weight:.2f} \u00d7 100 = {score_value}" if parts else f"{score_name} = {score_value}"
+        except Exception:
+            explanation = f"{score_name} = {score_value}"
+    else:
+        explanation = f"{score_name} = {score_value}"
+
+    return {
+        "name": score_name,
+        "value": score_value,
+        "label": label,
+        "components": contributions,
+        "explanation": explanation
+    }
+
+
+def _score_threat(report: Dict[str, Any],
+                  config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    THREAT SCORE: how likely is this target to be malicious?
+    """
+    ti = report.get("threat_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(ti, dict):
+        ti = {}
+    normalized = ti.get("normalized", []) or []
+    ok = [r for r in normalized if _sget(r, "status") == "OK"]
+
+    components: List[Dict[str, Any]] = []
+
+    # Component 1: observed threat score from providers
+    if ok:
+        try:
+            weighted_sum = sum(_sfloat(_sget(r, "threat_score", 0), 0) * _sfloat(_sget(r, "weight", 1.0), 1.0) * _sfloat(_sget(r, "confidence", 0.5), 0.5) for r in ok)
+            weight_sum = sum(_sfloat(_sget(r, "weight", 1.0), 1.0) * _sfloat(_sget(r, "confidence", 0.5), 0.5) for r in ok)
+            observed = (weighted_sum / weight_sum) if weight_sum > 0 else 0.0
+        except Exception:
+            observed = 0.0
+    else:
+        observed = 0.0
+    components.append({
+        "name": "observed_provider_score",
+        "value": max(0.0, min(1.0, observed)),
+        "weight": 0.5,
+        "evidence": f"{len(ok)} provider(s) responded",
+        "source_section": "threat_intelligence"
+    })
+
+    # Component 2: provider agreement
+    if len(ok) > 1:
+        try:
+            scores = [_sfloat(_sget(r, "threat_score", 0), 0) for r in ok]
+            mean = sum(scores) / len(scores)
+            variance = sum((s - mean) ** 2 for s in scores) / len(scores)
+            agreement = 1.0 - min(variance / 0.25, 1.0)
+        except Exception:
+            agreement = 0.0
+    else:
+        agreement = 0.5 if ok else 0.0
+    components.append({
+        "name": "provider_agreement",
+        "value": max(0.0, min(1.0, agreement)),
+        "weight": 0.2,
+        "evidence": f"agreement among {len(ok)} provider(s)",
+        "source_section": "threat_intelligence"
+    })
+
+    # Component 3: coverage
+    total = len(normalized)
+    coverage = len(ok) / total if total > 0 else 0.0
+    components.append({
+        "name": "provider_coverage",
+        "value": max(0.0, min(1.0, coverage)),
+        "weight": 0.3,
+        "evidence": f"{len(ok)}/{total} providers responded",
+        "source_section": "threat_intelligence"
+    })
+
+    return explain_score("THREAT SCORE", components, config)
+
+
+def _score_infrastructure(report: Dict[str, Any],
+                          config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    INFRASTRUCTURE SCORE: how significant is the infrastructure?
+    """
+    infra = report.get("infrastructure_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(infra, dict):
+        infra = {}
+    asn = infra.get("asn", {}) if isinstance(infra, dict) else {}
+    prefix = infra.get("prefix", {}) if isinstance(infra, dict) else {}
+    related = infra.get("related_infrastructure", {}) if isinstance(infra, dict) else {}
+    if not isinstance(asn, dict):
+        asn = {}
+    if not isinstance(prefix, dict):
+        prefix = {}
+    if not isinstance(related, dict):
+        related = {}
+
+    components: List[Dict[str, Any]] = []
+
+    # Component 1: ASN type
+    asn_type = asn.get("type", "unknown") or "unknown"
+    type_scores = {
+        "hosting":    0.7,
+        "isp":        0.5,
+        "education":  0.6,
+        "government": 0.8,
+        "unknown":    0.3
+    }
+    components.append({
+        "name": "asn_type",
+        "value": type_scores.get(asn_type, 0.3),
+        "weight": 0.3,
+        "evidence": f"ASN type = {asn_type}",
+        "source_section": "infrastructure_intelligence"
+    })
+
+    # Component 2: prefix size (larger = more significant)
+    try:
+        prefix_len = int(prefix.get("prefix_length", 24) or 24)
+    except Exception:
+        prefix_len = 24
+    if prefix_len <= 8:
+        prefix_score = 1.0
+    elif prefix_len <= 16:
+        prefix_score = 0.8
+    elif prefix_len <= 24:
+        prefix_score = 0.5
+    else:
+        prefix_score = 0.3
+    components.append({
+        "name": "prefix_size",
+        "value": prefix_score,
+        "weight": 0.2,
+        "evidence": f"prefix length = /{prefix_len}",
+        "source_section": "infrastructure_intelligence"
+    })
+
+    # Component 3: peering presence
+    peering = infra.get("peering", {}) if isinstance(infra, dict) else {}
+    if not isinstance(peering, dict):
+        peering = {}
+    peers = peering.get("peers", []) or []
+    try:
+        peer_count = len(peers)
+    except Exception:
+        peer_count = 0
+    peering_score = 0.5 if peering.get("peers") else 0.2
+    components.append({
+        "name": "peering",
+        "value": peering_score,
+        "weight": 0.15,
+        "evidence": f"peers = {peer_count}",
+        "source_section": "infrastructure_intelligence"
+    })
+
+    # Component 4: related infrastructure
+    try:
+        sibs = related.get("sibling_prefixes", []) or []
+        sibling_count = len(sibs)
+    except Exception:
+        sibling_count = 0
+    related_score = min(1.0, sibling_count / 5.0)
+    components.append({
+        "name": "related_infrastructure",
+        "value": related_score,
+        "weight": 0.15,
+        "evidence": f"{sibling_count} sibling prefix(es)",
+        "source_section": "infrastructure_intelligence"
+    })
+
+    # Component 5: allocation age (older = more established)
+    allocated = asn.get("allocated") or prefix.get("allocated")
+    age_score = 0.5
+    if allocated:
+        try:
+            dt = datetime.fromisoformat(str(allocated).replace("Z", "+00:00"))
+            years = (datetime.now(timezone.utc) - dt).days / 365.0
+            age_score = min(1.0, max(0.0, years / 20.0))
+        except Exception:
+            pass
+    components.append({
+        "name": "allocation_age",
+        "value": age_score,
+        "weight": 0.2,
+        "evidence": f"allocated = {allocated or 'unknown'}",
+        "source_section": "infrastructure_intelligence"
+    })
+
+    return explain_score("INFRASTRUCTURE SCORE", components, config)
+
+
+def _score_data_quality(report: Dict[str, Any],
+                        config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    DATA QUALITY SCORE: how reliable is the collected data?
+    """
+    conf = report.get("confidence_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(conf, dict):
+        conf = {}
+    data_conf = conf.get("data_confidence", {}) if isinstance(conf, dict) else {}
+    if not isinstance(data_conf, dict):
+        data_conf = {}
+    components_raw = data_conf.get("components", {}) if isinstance(data_conf, dict) else {}
+    if not isinstance(components_raw, dict):
+        components_raw = {}
+
+    components: List[Dict[str, Any]] = [
+        {
+            "name": "freshness",
+            "value": _sfloat(components_raw.get("freshness_avg", 0.0), 0.0),
+            "weight": 0.4,
+            "evidence": f"freshness_avg = {components_raw.get('freshness_avg', 0.0)}",
+            "source_section": "confidence_intelligence"
+        },
+        {
+            "name": "status",
+            "value": _sfloat(components_raw.get("status_avg", 0.0), 0.0),
+            "weight": 0.3,
+            "evidence": f"status_avg = {components_raw.get('status_avg', 0.0)}",
+            "source_section": "confidence_intelligence"
+        },
+        {
+            "name": "coverage",
+            "value": _sfloat(components_raw.get("coverage", 0.0), 0.0),
+            "weight": 0.3,
+            "evidence": f"coverage = {components_raw.get('coverage', 0.0)}",
+            "source_section": "confidence_intelligence"
+        }
+    ]
+
+    return explain_score("DATA QUALITY SCORE", components, config)
+
+
+def _score_exposure(report: Dict[str, Any],
+                    config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    EXPOSURE SCORE: how much is exposed to the internet?
+    """
+    as_intel = report.get("attack_surface_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(as_intel, dict):
+        as_intel = {}
+    services = as_intel.get("services", []) or []
+    sensitive = as_intel.get("sensitive_services", []) or []
+    exposure = as_intel.get("exposure", {}) or {}
+    if not isinstance(exposure, dict):
+        exposure = {}
+    try:
+        svc_len = len(services)
+    except Exception:
+        svc_len = 0
+    try:
+        sens_len = len(sensitive)
+    except Exception:
+        sens_len = 0
+
+    components: List[Dict[str, Any]] = []
+
+    # Component 1: number of services
+    svc_score = min(1.0, svc_len / 20.0)
+    components.append({
+        "name": "service_count",
+        "value": svc_score,
+        "weight": 0.25,
+        "evidence": f"{svc_len} service(s) exposed",
+        "source_section": "attack_surface_intelligence"
+    })
+
+    # Component 2: sensitive services
+    sensitive_score = min(1.0, sens_len / 5.0)
+    components.append({
+        "name": "sensitive_services",
+        "value": sensitive_score,
+        "weight": 0.4,
+        "evidence": f"{sens_len} sensitive service(s)",
+        "source_section": "attack_surface_intelligence"
+    })
+
+    # Component 3: external exposure
+    external_ratio = 0.0
+    try:
+        if exposure.get("external_count") is not None:
+            total = (exposure.get("external_count", 0) or 0) + (exposure.get("internal_count", 0) or 0)
+            if total > 0:
+                external_ratio = (exposure.get("external_count", 0) or 0) / total
+    except Exception:
+        external_ratio = 0.0
+    try:
+        ext_n = exposure.get("external_count", 0)
+    except Exception:
+        ext_n = 0
+    components.append({
+        "name": "external_exposure",
+        "value": max(0.0, min(1.0, external_ratio)),
+        "weight": 0.2,
+        "evidence": f"external = {ext_n}",
+        "source_section": "attack_surface_intelligence"
+    })
+
+    # Component 4: exposure classification
+    classification = exposure.get("classification", "unknown") or "unknown"
+    class_score = 1.0 if classification == "external" else 0.3
+    components.append({
+        "name": "classification",
+        "value": class_score,
+        "weight": 0.15,
+        "evidence": f"classification = {classification}",
+        "source_section": "attack_surface_intelligence"
+    })
+
+    return explain_score("EXPOSURE SCORE", components, config)
+
+
+def _score_anomaly(report: Dict[str, Any],
+                   config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ANOMALY SCORE: how many deviations were detected?
+    """
+    anomaly = report.get("anomaly_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(anomaly, dict):
+        anomaly = {}
+    by_severity = anomaly.get("by_severity", {}) or {}
+    if not isinstance(by_severity, dict):
+        by_severity = {}
+
+    components: List[Dict[str, Any]] = []
+
+    # Component 1: HIGH severity anomalies
+    try:
+        high = int(by_severity.get("HIGH", 0) or 0)
+    except Exception:
+        high = 0
+    components.append({
+        "name": "high_severity",
+        "value": min(1.0, high / 3.0),
+        "weight": 0.5,
+        "evidence": f"{high} HIGH severity anomaly(ies)",
+        "source_section": "anomaly_intelligence"
+    })
+
+    # Component 2: MODERATE severity anomalies
+    try:
+        moderate = int(by_severity.get("MODERATE", 0) or 0)
+    except Exception:
+        moderate = 0
+    components.append({
+        "name": "moderate_severity",
+        "value": min(1.0, moderate / 5.0),
+        "weight": 0.3,
+        "evidence": f"{moderate} MODERATE severity anomaly(ies)",
+        "source_section": "anomaly_intelligence"
+    })
+
+    # Component 3: LOW severity anomalies
+    try:
+        low = int(by_severity.get("LOW", 0) or 0)
+    except Exception:
+        low = 0
+    components.append({
+        "name": "low_severity",
+        "value": min(1.0, low / 10.0),
+        "weight": 0.15,
+        "evidence": f"{low} LOW severity anomaly(ies)",
+        "source_section": "anomaly_intelligence"
+    })
+
+    # Component 4: informational anomalies
+    try:
+        info = int(by_severity.get("INFORMATIONAL", 0) or 0)
+    except Exception:
+        info = 0
+    components.append({
+        "name": "informational",
+        "value": min(1.0, info / 20.0),
+        "weight": 0.05,
+        "evidence": f"{info} INFORMATIONAL anomaly(ies)",
+        "source_section": "anomaly_intelligence"
+    })
+
+    return explain_score("ANOMALY SCORE", components, config)
+
+
+def _score_coverage(report: Dict[str, Any],
+                    config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    INTELLIGENCE COVERAGE: how complete is the report?
+    """
+    sections = [
+        ("dns_intelligence", "evidence"),
+        ("infrastructure_intelligence", "asn"),
+        ("certificate_intelligence", "live_certificate"),
+        ("passive_dns_intelligence", "timeline"),
+        ("threat_intelligence", "normalized"),
+        ("attack_surface_intelligence", "services"),
+        ("technology_intelligence", "results"),
+        ("vulnerability_intelligence", "candidates"),
+        ("correlation_intelligence", "graph"),
+        ("historical_intelligence", "detection"),
+        ("anomaly_intelligence", "anomalies"),
+        ("confidence_intelligence", "summary"),
+    ]
+
+    components: List[Dict[str, Any]] = []
+    for section, key in sections:
+        try:
+            sec = report.get(section, {}) if isinstance(report, dict) else {}
+            has_data = bool(sec.get(key)) if isinstance(sec, dict) else False
+        except Exception:
+            has_data = False
+        components.append({
+            "name": f"section:{section}",
+            "value": 1.0 if has_data else 0.0,
+            "weight": 1.0,
+            "evidence": f"{'populated' if has_data else 'empty'}",
+            "source_section": section
+        })
+
+    # Provider coverage as separate component
+    try:
+        ti = report.get("threat_intelligence", {}) if isinstance(report, dict) else {}
+        if not isinstance(ti, dict):
+            ti = {}
+        normalized = ti.get("normalized", []) or []
+        ok = [r for r in normalized if _sget(r, "status") == "OK"]
+        provider_ratio = len(ok) / len(normalized) if normalized else 0.0
+    except Exception:
+        normalized = []
+        ok = []
+        provider_ratio = 0.0
+    components.append({
+        "name": "provider_coverage",
+        "value": max(0.0, min(1.0, provider_ratio)),
+        "weight": 2.0,
+        "evidence": f"{len(ok)}/{len(normalized)} providers OK",
+        "source_section": "threat_intelligence"
+    })
+
+    return explain_score("INTELLIGENCE COVERAGE", components, config)
+
+
+def compute_scores(report: Dict[str, Any],
+                   config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute all six intelligence scores.
+    """
+    try:
+        scoring_cfg = config.get("scoring", {}) if isinstance(config, dict) else {}
+    except Exception:
+        scoring_cfg = {}
+    if not scoring_cfg.get("enabled", True):
+        return {"enabled": False}
+
+    scores = {
+        "threat_score": _score_threat(report, config),
+        "infrastructure_score": _score_infrastructure(report, config),
+        "data_quality_score": _score_data_quality(report, config),
+        "exposure_score": _score_exposure(report, config),
+        "anomaly_score": _score_anomaly(report, config),
+        "intelligence_coverage": _score_coverage(report, config),
+    }
+
+    notes = [
+        "A score is not a verdict.",
+        "A score is not a fact.",
+        "A score is an explainable estimate.",
+        "Every score answers a different question.",
+        "Every score must be read alongside its components and evidence.",
+        "A high score in one dimension does not imply a high score in another."
+    ]
+
+    return {
+        "enabled": True,
+        "scores": scores,
+        "summary": {
+            "threat": scores["threat_score"]["value"],
+            "infrastructure": scores["infrastructure_score"]["value"],
+            "data_quality": scores["data_quality_score"]["value"],
+            "exposure": scores["exposure_score"]["value"],
+            "anomaly": scores["anomaly_score"]["value"],
+            "coverage": scores["intelligence_coverage"]["value"],
+        },
+        "notes": notes
+    }
+
 
 # ============================================================
 #  PHASE 2 — SUBDOMAIN ENUM + TYPOSQUATTING + CT DEEP + WHOIS
@@ -4386,7 +10446,7 @@ def infra_risk(ip, trusted, evs):
     if not f: f.append(SF("no_infra_indicators", 0.0, ""))
     return SD(sc, f"{sc}/100 infrastructure risk", f, {})
 
-def data_confidence(evs, trusted, cs, _ps):
+def _data_confidence_legacy(evs, trusted, cs, _ps):
     w = PB["data_confidence"]["weights"]; pen = PB["data_confidence"]["conflict_penalty"]
     f = []
     avg_rel = sum(e.reliability for e in evs) / len(evs) if evs else 0
@@ -4876,7 +10936,7 @@ class GE:
     confidence: float = 0.0
     sources: List[str] = field(default_factory=list)
 
-def build_graph(result):
+def build_graph_legacy(result):
     nodes = {}; edges = {}
     def an(etype, value, prov=""):
         if value is None: return None
@@ -4923,6 +10983,459 @@ def build_graph(result):
     for e in edges.values():
         e.confidence = min(95, 40 + (len(e.sources) - 1) * 20)
     return list(nodes.values()), list(edges.values())
+
+# ============================================================
+#  CORRELATION ENGINE — v36 (Stage 10)
+#  Single source of truth for correlation layer.
+#  Reads all intelligence layers; modifies none. No new providers.
+#  Relationship != maliciousness: shared infrastructure is evidence,
+#  not a verdict.
+# ============================================================
+def _node(node_id: str, node_type: str, **attrs) -> Dict[str, Any]:
+    return {
+        "id": node_id,
+        "type": node_type,
+        "attributes": attrs
+    }
+
+
+def _edge(source: str, target: str, edge_type: str, **attrs) -> Dict[str, Any]:
+    return {
+        "source": source,
+        "target": target,
+        "type": edge_type,
+        "attributes": attrs
+    }
+
+
+def _count_by_key(items: List[Dict[str, Any]], key: str) -> Dict[str, int]:
+    result: Dict[str, int] = defaultdict(int)
+    for item in items:
+        result[item.get(key, "unknown")] += 1
+    return dict(result)
+
+
+def build_graph(report: Dict[str, Any],
+                target: Optional[str] = None,
+                config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Build a logical graph from all intelligence layers in the report.
+
+    When called with a single argument (legacy phase_k usage), delegates
+    to build_graph_legacy and returns the legacy (nodes, edges) tuple.
+    Otherwise returns:
+    {
+        "nodes": [...],
+        "edges": [...],
+        "index": {node_id: node_dict}
+    }
+    """
+    if target is None and config is None:
+        return build_graph_legacy(report)
+    config = config or {}
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    node_ids: Set[str] = set()
+
+    def add_node(node: Dict[str, Any]) -> None:
+        if node["id"] not in node_ids:
+            node_ids.add(node["id"])
+            nodes.append(node)
+
+    def add_edge(edge: Dict[str, Any]) -> None:
+        edges.append(edge)
+
+    # ---- IP ----
+    ip = target
+    infra = report.get("infrastructure_intelligence", {}) or {}
+    if isinstance(infra, dict) and infra.get("ip"):
+        ip = infra["ip"]
+    ip_node_id = f"ip:{ip}"
+    add_node(_node(ip_node_id, "ip", value=ip))
+
+    # ---- ASN ----
+    asn = infra.get("asn", {}) or {}
+    if not isinstance(asn, dict):
+        asn = {}
+    if asn.get("asn"):
+        asn_id = f"asn:{asn['asn']}"
+        add_node(_node(asn_id, "asn",
+                       number=asn.get("asn"),
+                       name=asn.get("asn_name"),
+                       country=asn.get("country"),
+                       type=asn.get("type")))
+        add_edge(_edge(ip_node_id, asn_id, "belongs_to_asn"))
+
+    # ---- Prefix ----
+    prefix = infra.get("prefix", {}) or {}
+    if not isinstance(prefix, dict):
+        prefix = {}
+    if prefix.get("cidr"):
+        prefix_id = f"prefix:{prefix['cidr']}"
+        add_node(_node(prefix_id, "prefix",
+                       cidr=prefix.get("cidr"),
+                       rir=prefix.get("rir"),
+                       allocated=prefix.get("allocated")))
+        add_edge(_edge(ip_node_id, prefix_id, "in_prefix"))
+        if asn.get("asn"):
+            add_edge(_edge(f"asn:{asn['asn']}", prefix_id, "announces"))
+
+    # ---- Organization ----
+    org = infra.get("organization", {}) or {}
+    if not isinstance(org, dict):
+        org = {}
+    if org.get("name"):
+        org_id = f"org:{org['name']}"
+        add_node(_node(org_id, "organization",
+                       name=org.get("name"),
+                       country=org.get("country"),
+                       abuse_email=org.get("abuse_email")))
+        if asn.get("asn"):
+            add_edge(_edge(f"asn:{asn['asn']}", org_id, "owned_by"))
+
+    # ---- DNS ----
+    dns = report.get("dns_intelligence", {}) or {}
+    for ev in dns.get("evidence", []) or []:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("status") != "OK":
+            continue
+        rtype = (ev.get("metadata", {}) or {}).get("record_type", "UNKNOWN")
+        value = ev.get("normalized_value")
+        if not value:
+            continue
+
+        if rtype in ("A", "AAAA"):
+            ip_target_id = f"ip:{value}"
+            add_node(_node(ip_target_id, "ip", value=value))
+            add_edge(_edge(ip_node_id, ip_target_id, "resolves_to",
+                           record_type=rtype))
+
+        elif rtype == "PTR":
+            domain_id = f"domain:{value}"
+            add_node(_node(domain_id, "domain", value=value))
+            add_edge(_edge(ip_node_id, domain_id, "has_ptr"))
+
+        elif rtype == "NS":
+            ns_id = f"nameserver:{value}"
+            add_node(_node(ns_id, "nameserver", value=value))
+            add_edge(_edge(ip_node_id, ns_id, "has_nameserver"))
+
+        elif rtype == "MX":
+            parts = str(value).split()
+            host = parts[-1] if parts else value
+            mx_id = f"mailserver:{host}"
+            add_node(_node(mx_id, "mailserver", value=host))
+            add_edge(_edge(ip_node_id, mx_id, "has_mailserver"))
+
+        elif rtype == "CNAME":
+            domain_id = f"domain:{value}"
+            add_node(_node(domain_id, "domain", value=value))
+            add_edge(_edge(ip_node_id, domain_id, "has_cname"))
+
+    # ---- Certificate ----
+    cert_intel = report.get("certificate_intelligence", {}) or {}
+    live = cert_intel.get("live_certificate") or {}
+    if not isinstance(live, dict):
+        live = {}
+    fp = live.get("fingerprint_sha256")
+    if fp:
+        cert_id = f"certificate:{fp}"
+        add_node(_node(cert_id, "certificate",
+                       fingerprint=fp,
+                       issuer=live.get("issuer_cn"),
+                       not_after=live.get("not_after"),
+                       wildcard=live.get("wildcard")))
+        add_edge(_edge(ip_node_id, cert_id, "uses_certificate"))
+
+        for san in live.get("san_domains", []) or []:
+            san_id = f"san:{san}"
+            add_node(_node(san_id, "san", value=san))
+            add_edge(_edge(cert_id, san_id, "certificate_covers"))
+
+    for cert in cert_intel.get("ct_certificates", []) or []:
+        if not isinstance(cert, dict):
+            continue
+        ct_fp = cert.get("fingerprint_sha256")
+        if not ct_fp:
+            continue
+        ct_id = f"certificate:{ct_fp}"
+        add_node(_node(ct_id, "certificate",
+                       fingerprint=ct_fp,
+                       issuer=cert.get("issuer_cn"),
+                       not_after=cert.get("not_after"),
+                       wildcard=cert.get("wildcard")))
+        for san in cert.get("san_domains", []) or []:
+            san_id = f"san:{san}"
+            add_node(_node(san_id, "san", value=san))
+            add_edge(_edge(ct_id, san_id, "certificate_covers"))
+
+    # ---- Passive DNS ----
+    pdns = report.get("passive_dns_intelligence", {}) or {}
+    for entry in pdns.get("timeline", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        domain = entry.get("domain")
+        if not domain:
+            continue
+        pdns_id = f"passive_dns:{domain}"
+        add_node(_node(pdns_id, "passive_dns_domain",
+                       value=domain,
+                       lifecycle=entry.get("lifecycle"),
+                       first_seen=entry.get("first_seen"),
+                       last_seen=entry.get("last_seen")))
+        add_edge(_edge(ip_node_id, pdns_id, "appears_in_passive_dns"))
+
+    # ---- History ----
+    history = report.get("historical_intelligence", {}) or {}
+    if isinstance(history, dict) and history.get("status") == "COMPARED":
+        history_id = f"history:{ip}"
+        add_node(_node(history_id, "history",
+                       total_changes=(history.get("detection", {}) or {}).get("total_changes"),
+                       previous_timestamp=history.get("previous_timestamp"),
+                       current_timestamp=history.get("current_timestamp")))
+        add_edge(_edge(ip_node_id, history_id, "has_history"))
+
+    # ---- Threat Intel ----
+    ti = report.get("threat_intelligence", {}) or {}
+    if isinstance(ti, dict) and ti:
+        ti_id = f"threat:{ip}"
+        add_node(_node(ti_id, "threat_intel",
+                       observed_threat_score=ti.get("observed_threat_score"),
+                       threat_confidence=ti.get("threat_confidence"),
+                       coverage=ti.get("evidence_coverage")))
+        add_edge(_edge(ip_node_id, ti_id, "has_threat_intel"))
+
+    # Build index for fast lookup
+    index = {n["id"]: n for n in nodes}
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "index": index,
+        "stats": {
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "node_types": _count_by_key(nodes, "type"),
+            "edge_types": _count_by_key(edges, "type")
+        }
+    }
+
+
+def find_shared(graph: Dict[str, Any],
+                min_shared: int = 1) -> Dict[str, Any]:
+    """
+    Find shared entities in the graph.
+
+    Two modes:
+      1. Within a single graph: entities connected to multiple IPs.
+      2. Across multiple graphs: pass a list of graphs.
+
+    For this stage, we support mode 1 (single graph) and mode 2 is
+    implemented in correlate() by merging graphs.
+    """
+    shared = {
+        "shared_asns": [],
+        "shared_prefixes": [],
+        "shared_certificates": [],
+        "shared_nameservers": [],
+        "shared_mailservers": [],
+        "shared_organizations": [],
+        "shared_san_domains": [],
+        "shared_passive_dns": []
+    }
+
+    # Build reverse index: entity_id -> set of ip_ids connected
+    entity_to_ips: Dict[str, Set[str]] = defaultdict(set)
+    entity_to_domains: Dict[str, Set[str]] = defaultdict(set)
+
+    for edge in graph.get("edges", []) or []:
+        src = edge["source"]
+        dst = edge["target"]
+
+        if src.startswith("ip:"):
+            entity_to_ips[dst].add(src)
+        elif dst.startswith("ip:"):
+            entity_to_ips[src].add(dst)
+
+        if src.startswith("domain:"):
+            entity_to_domains[dst].add(src)
+        elif dst.startswith("domain:"):
+            entity_to_domains[src].add(dst)
+
+    # Group by node type
+    index = graph.get("index", {}) or {}
+    for entity_id, ips in entity_to_ips.items():
+        if len(ips) < min_shared + 1:  # must be shared by more than one IP
+            continue
+        node = index.get(entity_id, {})
+        ntype = node.get("type")
+        entry = {
+            "entity": entity_id,
+            "type": ntype,
+            "shared_by": sorted(ips),
+            "attributes": node.get("attributes", {})
+        }
+        if ntype == "asn":
+            shared["shared_asns"].append(entry)
+        elif ntype == "prefix":
+            shared["shared_prefixes"].append(entry)
+        elif ntype == "certificate":
+            shared["shared_certificates"].append(entry)
+        elif ntype == "nameserver":
+            shared["shared_nameservers"].append(entry)
+        elif ntype == "mailserver":
+            shared["shared_mailservers"].append(entry)
+        elif ntype == "organization":
+            shared["shared_organizations"].append(entry)
+        elif ntype == "san":
+            shared["shared_san_domains"].append(entry)
+        elif ntype == "passive_dns_domain":
+            shared["shared_passive_dns"].append(entry)
+
+    return shared
+
+
+def _find_related_targets(graph: Dict[str, Any],
+                          targets: List[str]) -> List[Dict[str, Any]]:
+    """
+    Identify target pairs that share at least one entity.
+    """
+    # Map ip_node_id -> target
+    ip_to_target: Dict[str, str] = {}
+    for t in targets:
+        ip_to_target[f"ip:{t}"] = t
+
+    # Build reverse index: entity -> set of target IPs
+    entity_to_targets: Dict[str, Set[str]] = defaultdict(set)
+    for edge in graph.get("edges", []) or []:
+        src = edge["source"]
+        dst = edge["target"]
+        if src in ip_to_target:
+            entity_to_targets[dst].add(ip_to_target[src])
+        elif dst in ip_to_target:
+            entity_to_targets[src].add(ip_to_target[dst])
+
+    # Build target pairs
+    pairs: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    for entity_id, tset in entity_to_targets.items():
+        if len(tset) < 2:
+            continue
+        sorted_t = sorted(tset)
+        for i in range(len(sorted_t)):
+            for j in range(i + 1, len(sorted_t)):
+                pair = (sorted_t[i], sorted_t[j])
+                pairs[pair].add(entity_id)
+
+    related = []
+    for (a, b), shared_entities in pairs.items():
+        related.append({
+            "target_a": a,
+            "target_b": b,
+            "shared_entities": sorted(shared_entities),
+            "shared_count": len(shared_entities)
+        })
+
+    related.sort(key=lambda x: x["shared_count"], reverse=True)
+    return related
+
+
+def correlate(reports: List[Dict[str, Any]],
+              targets: List[str],
+              config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Correlate one or more reports into a single graph.
+
+    Input:
+      reports: list of report dicts (one per target)
+      targets: matching list of target strings
+
+    Output:
+    {
+        "enabled": bool,
+        "graph": {...},
+        "shared": {...},
+        "related_targets": [...],
+        "notes": [...]
+    }
+    """
+    corr_cfg = (config or {}).get("correlation", {}) if isinstance(config, dict) else {}
+    if not corr_cfg.get("enabled", True):
+        return {"enabled": False}
+
+    min_shared = corr_cfg.get("min_shared", 1)
+    try:
+        min_shared = int(min_shared)
+    except Exception:
+        min_shared = 1
+    max_shared = corr_cfg.get("max_shared_in_report", 100)
+    try:
+        max_shared = int(max_shared)
+    except Exception:
+        max_shared = 100
+    max_related = corr_cfg.get("max_related_targets", 50)
+    try:
+        max_related = int(max_related)
+    except Exception:
+        max_related = 50
+    notes = corr_cfg.get("notes", [
+        "A shared relationship indicates shared infrastructure, not shared intent.",
+        "Shared ASN, prefix, or nameserver may be normal for CDNs, hosting providers, or cloud platforms.",
+        "Shared certificate is a stronger signal of shared ownership, but can also be a shared CDN certificate.",
+        "Correlation is evidence, not a verdict. Always validate before drawing conclusions."
+    ])
+
+    # Merge graphs
+    merged_nodes: Dict[str, Dict[str, Any]] = {}
+    merged_edges: List[Dict[str, Any]] = []
+
+    for report, target in zip(reports or [], targets or []):
+        g = build_graph(report, target, config)
+        for node in g["nodes"]:
+            merged_nodes[node["id"]] = node
+        merged_edges.extend(g["edges"])
+
+    merged_graph = {
+        "nodes": list(merged_nodes.values()),
+        "edges": merged_edges,
+        "index": merged_nodes,
+        "stats": {
+            "node_count": len(merged_nodes),
+            "edge_count": len(merged_edges),
+            "node_types": _count_by_key(list(merged_nodes.values()), "type"),
+            "edge_types": _count_by_key(merged_edges, "type")
+        }
+    }
+
+    # Find shared entities
+    shared = find_shared(merged_graph, min_shared=min_shared)
+    if max_shared and max_shared > 0:
+        for k, v in list(shared.items()):
+            if isinstance(v, list):
+                shared[k] = v[:max_shared]
+
+    # Identify related targets
+    related_targets = _find_related_targets(merged_graph, targets or [])
+    if max_related and max_related > 0:
+        related_targets = related_targets[:max_related]
+
+    return {
+        "enabled": True,
+        "graph": merged_graph,
+        "shared": shared,
+        "related_targets": related_targets,
+        "notes": notes,
+        "summary": {
+            "targets_correlated": len(targets or []),
+            "total_nodes": merged_graph["stats"]["node_count"],
+            "total_edges": merged_graph["stats"]["edge_count"],
+            "shared_asns": len(shared["shared_asns"]),
+            "shared_prefixes": len(shared["shared_prefixes"]),
+            "shared_certificates": len(shared["shared_certificates"]),
+            "shared_nameservers": len(shared["shared_nameservers"]),
+            "shared_organizations": len(shared["shared_organizations"])
+        }
+    }
 
 # ============================================================
 #  DATABASE
@@ -5116,7 +11629,7 @@ INTEL_DB: Optional[DB] = None
 # ============================================================
 #  STIX / MISP EXPORT
 # ============================================================
-def export_stix(result):
+def _export_stix_legacy(result):
     ip = result.get("ip")
     pi = result.get("phase_i", {}) or {}
     out = {"type": "bundle", "id": f"bundle--{uuid.uuid4()}", "objects": []}
@@ -5141,7 +11654,7 @@ def export_stix(result):
                                 "id": f"domain-name--{uuid.uuid4()}", "value": sd})
     return out
 
-def export_misp(result):
+def _export_misp_legacy(result):
     ip = result.get("ip")
     pi = result.get("phase_i", {}) or {}
     pb = result.get("phase_b", {}) or {}
@@ -5167,6 +11680,2048 @@ def export_misp(result):
     return {"Event": {"info": f"ReconIP: {ip} ({fa.get('assessment','Unknown')})",
                        "distribution": "0", "threat_level_id": "2", "analysis": "2",
                        "Attribute": attrs}}
+
+# ============================================================
+#  FINAL INTELLIGENCE REPORT — v42 (Stage 17)
+#  18-section professional report + multi-format exporters.
+#  A report is not a verdict. Every claim traces to evidence.
+# ============================================================
+def _report_metadata(target: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build report-level metadata.
+    """
+    try:
+        version = config.get("version", "v44") if isinstance(config, dict) else "v44"
+    except Exception:
+        version = "v44"
+    try:
+        classification = config.get("reports", {}).get("classification", "UNCLASSIFIED") if isinstance(config, dict) else "UNCLASSIFIED"
+    except Exception:
+        classification = "UNCLASSIFIED"
+    try:
+        safe = str(target).replace('.', '-').replace(':', '-')
+    except Exception:
+        safe = "unknown"
+    try:
+        ts = int(datetime.now(timezone.utc).timestamp())
+    except Exception:
+        ts = 0
+    return {
+        "tool": "ReconIP",
+        "version": version,
+        "target": target,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "report_id": f"reconip-{safe}-{ts}",
+        "classification": classification,
+        "profile": config.get("_applied_profile", {"name": None, "description": "base config"}) if isinstance(config, dict) else {"name": None, "description": "base config"},
+        "disclaimer": (
+            "This report is evidence-driven and intended for authorized security "
+            "analysis only. It does not claim compromise, exploitation, or impact. "
+            "All findings must be validated in context."
+        )
+    }
+
+
+def _section_target_profile(target: str, report: Dict[str, Any]) -> Dict[str, Any]:
+    infra = report.get("infrastructure_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(infra, dict):
+        infra = {}
+    asn = infra.get("asn", {}) if isinstance(infra, dict) else {}
+    org = infra.get("organization", {}) if isinstance(infra, dict) else {}
+    prefix = infra.get("prefix", {}) if isinstance(infra, dict) else {}
+    if not isinstance(asn, dict):
+        asn = {}
+    if not isinstance(org, dict):
+        org = {}
+    if not isinstance(prefix, dict):
+        prefix = {}
+    return {
+        "target": target,
+        "ip": infra.get("ip"),
+        "asn": asn.get("asn"),
+        "asn_name": asn.get("asn_name"),
+        "country": org.get("country"),
+        "organization": org.get("name"),
+        "prefix": prefix.get("cidr"),
+        "rir": prefix.get("rir"),
+        "anycast": report.get("anycast", False) if isinstance(report, dict) else False
+    }
+
+
+def _executive_headline(report: Dict[str, Any]) -> str:
+    try:
+        anomaly = report.get("anomaly_intelligence", {}) if isinstance(report, dict) else {}
+        by_sev = anomaly.get("by_severity", {}) if isinstance(anomaly, dict) else {}
+        threat = report.get("threat_intelligence", {}) if isinstance(report, dict) else {}
+        observed = float(threat.get("observed_threat_score", 0.0) or 0.0) if isinstance(threat, dict) else 0.0
+    except Exception:
+        by_sev = {}
+        observed = 0.0
+    try:
+        if int(by_sev.get("HIGH", 0) or 0) > 0:
+            return "HIGH severity anomalies detected. Manual review recommended."
+        if observed >= 50:
+            return "Elevated threat indicators observed. Validate before concluding."
+        if int(by_sev.get("MODERATE", 0) or 0) > 0:
+            return "Moderate deviations detected. Review recommended."
+        return "No significant deviations detected. Continue routine monitoring."
+    except Exception:
+        return "No significant deviations detected. Continue routine monitoring."
+
+
+def _section_executive_summary(report: Dict[str, Any]) -> Dict[str, Any]:
+    scoring = report.get("intelligence_scoring", {}) if isinstance(report, dict) else {}
+    confidence = report.get("confidence_intelligence", {}) if isinstance(report, dict) else {}
+    anomaly = report.get("anomaly_intelligence", {}) if isinstance(report, dict) else {}
+    threat = report.get("threat_intelligence", {}) if isinstance(report, dict) else {}
+    exposure = report.get("attack_surface_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(scoring, dict):
+        scoring = {}
+    if not isinstance(confidence, dict):
+        confidence = {}
+    if not isinstance(anomaly, dict):
+        anomaly = {}
+    if not isinstance(threat, dict):
+        threat = {}
+    if not isinstance(exposure, dict):
+        exposure = {}
+    summary = scoring.get("summary", {}) if isinstance(scoring, dict) else {}
+    assessment = confidence.get("assessment_confidence", {}) if isinstance(confidence, dict) else {}
+    if not isinstance(summary, dict):
+        summary = {}
+    if not isinstance(assessment, dict):
+        assessment = {}
+    return {
+        "assessment_confidence": assessment.get("label", "UNKNOWN"),
+        "assessment_score": assessment.get("score", 0.0),
+        "scores": {
+            "threat": summary.get("threat", 0.0),
+            "infrastructure": summary.get("infrastructure", 0.0),
+            "data_quality": summary.get("data_quality", 0.0),
+            "exposure": summary.get("exposure", 0.0),
+            "anomaly": summary.get("anomaly", 0.0),
+            "coverage": summary.get("coverage", 0.0)
+        },
+        "threat_confidence": threat.get("threat_confidence", 0.0),
+        "observed_threat_score": threat.get("observed_threat_score", 0.0),
+        "anomaly_summary": anomaly.get("by_severity", {}),
+        "exposed_services": exposure.get("service_count", 0),
+        "sensitive_services": exposure.get("sensitive_count", 0),
+        "headline": _executive_headline(report)
+    }
+
+
+def _section_data_quality(report: Dict[str, Any]) -> Dict[str, Any]:
+    conf = report.get("confidence_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(conf, dict):
+        conf = {}
+    data_conf = conf.get("data_confidence", {}) if isinstance(conf, dict) else {}
+    if not isinstance(data_conf, dict):
+        data_conf = {}
+    return {
+        "score": data_conf.get("score", 0.0),
+        "components": data_conf.get("components", {}),
+        "explanation": data_conf.get("explanation", "")
+    }
+
+
+def _section_network(report: Dict[str, Any]) -> Dict[str, Any]:
+    infra = report.get("infrastructure_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(infra, dict):
+        infra = {}
+    return {
+        "asn": infra.get("asn", {}),
+        "prefix": infra.get("prefix", {}),
+        "organization": infra.get("organization", {}),
+        "origin": infra.get("origin", {}),
+        "related_infrastructure": infra.get("related_infrastructure", {}),
+        "peering": infra.get("peering", {})
+    }
+
+
+def _section_dns(report: Dict[str, Any]) -> Dict[str, Any]:
+    dns = report.get("dns_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(dns, dict):
+        dns = {}
+    return {
+        "evidence": dns.get("evidence", []),
+        "analysis": dns.get("analysis", {})
+    }
+
+
+def _section_certificate(report: Dict[str, Any]) -> Dict[str, Any]:
+    cert = report.get("certificate_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(cert, dict):
+        cert = {}
+    return {
+        "live_certificate": cert.get("live_certificate"),
+        "ct_certificates": cert.get("ct_certificates", []),
+        "correlation": cert.get("correlation", {}),
+        "relationships": cert.get("relationships", {}),
+        "summary": cert.get("summary", {})
+    }
+
+
+def _section_passive_dns(report: Dict[str, Any]) -> Dict[str, Any]:
+    pdns = report.get("passive_dns_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(pdns, dict):
+        pdns = {}
+    return {
+        "timeline": pdns.get("timeline", []),
+        "stats": pdns.get("stats", {}),
+        "related_domains": pdns.get("related_domains", [])
+    }
+
+
+def _section_history(report: Dict[str, Any]) -> Dict[str, Any]:
+    hist = report.get("historical_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(hist, dict):
+        hist = {}
+    return {
+        "status": hist.get("status"),
+        "previous_timestamp": hist.get("previous_timestamp"),
+        "current_timestamp": hist.get("current_timestamp"),
+        "detection": hist.get("detection", {})
+    }
+
+
+def _section_threat(report: Dict[str, Any]) -> Dict[str, Any]:
+    ti = report.get("threat_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(ti, dict):
+        ti = {}
+    return {
+        "observed_threat_score": ti.get("observed_threat_score"),
+        "evidence_coverage": ti.get("evidence_coverage"),
+        "provider_agreement": ti.get("provider_agreement"),
+        "data_freshness": ti.get("data_freshness"),
+        "threat_confidence": ti.get("threat_confidence"),
+        "provider_count": ti.get("provider_count"),
+        "ok_count": ti.get("ok_count"),
+        "failed_count": ti.get("failed_count"),
+        "not_configured_count": ti.get("not_configured_count"),
+        "failures": ti.get("failures", {}),
+        "normalized": ti.get("normalized", [])
+    }
+
+
+def _section_correlation(report: Dict[str, Any]) -> Dict[str, Any]:
+    corr = report.get("correlation_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(corr, dict):
+        corr = {}
+    graph = corr.get("graph", {}) if isinstance(corr, dict) else {}
+    if not isinstance(graph, dict):
+        graph = {}
+    return {
+        "graph_stats": graph.get("stats", {}),
+        "shared": corr.get("shared", {}),
+        "related_targets": corr.get("related_targets", []),
+        "notes": corr.get("notes", [])
+    }
+
+
+def _section_attack_surface(report: Dict[str, Any]) -> Dict[str, Any]:
+    as_intel = report.get("attack_surface_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(as_intel, dict):
+        as_intel = {}
+    return {
+        "services": as_intel.get("services", []),
+        "sensitive_services": as_intel.get("sensitive_services", []),
+        "service_count": as_intel.get("service_count", 0),
+        "sensitive_count": as_intel.get("sensitive_count", 0),
+        "exposure": as_intel.get("exposure", {}),
+        "notes": as_intel.get("notes", [])
+    }
+
+
+def _section_technology(report: Dict[str, Any]) -> Dict[str, Any]:
+    tech = report.get("technology_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(tech, dict):
+        tech = {}
+    return {
+        "results": tech.get("results", []),
+        "by_class": tech.get("by_class", {}),
+        "summary": tech.get("summary", {}),
+        "notes": tech.get("notes", [])
+    }
+
+
+def _section_vulnerability(report: Dict[str, Any]) -> Dict[str, Any]:
+    vuln = report.get("vulnerability_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(vuln, dict):
+        vuln = {}
+    return {
+        "candidates": vuln.get("candidates", []),
+        "cpes_built": vuln.get("cpes_built", []),
+        "summary": vuln.get("summary", {}),
+        "notes": vuln.get("notes", [])
+    }
+
+
+def _section_anomalies(report: Dict[str, Any]) -> Dict[str, Any]:
+    anomaly = report.get("anomaly_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(anomaly, dict):
+        anomaly = {}
+    return {
+        "checks_executed": anomaly.get("checks_executed", []),
+        "checks_executed_count": anomaly.get("checks_executed_count", 0),
+        "by_severity": anomaly.get("by_severity", {}),
+        "by_category": anomaly.get("by_category", {}),
+        "anomalies": anomaly.get("anomalies", []),
+        "notes": anomaly.get("notes", [])
+    }
+
+
+def _section_evidence(report: Dict[str, Any],
+                      config: Dict[str, Any],
+                      include_raw: bool = False) -> Dict[str, Any]:
+    """
+    Aggregate all Evidence objects across sections.
+    If include_raw is False, only summary metadata is included.
+    """
+    all_evidence: List[Dict[str, Any]] = []
+
+    for section in (
+        "dns_intelligence",
+        "certificate_intelligence",
+        "passive_dns_intelligence",
+    ):
+        try:
+            sec = report.get(section, {}) if isinstance(report, dict) else {}
+            if not isinstance(sec, dict):
+                continue
+            for ev in sec.get("evidence", []) or []:
+                if not isinstance(ev, dict):
+                    continue
+                all_evidence.append({
+                    "section": section,
+                    "source": ev.get("source"),
+                    "timestamp": ev.get("timestamp"),
+                    "status": ev.get("status"),
+                    "confidence": ev.get("confidence"),
+                    "freshness": ev.get("freshness"),
+                    "value": ev.get("value") if include_raw else None,
+                    "normalized_value": ev.get("normalized_value") if include_raw else None,
+                })
+        except Exception:
+            continue
+
+    # Provider evidence
+    try:
+        ti = report.get("threat_intelligence", {}) if isinstance(report, dict) else {}
+        if isinstance(ti, dict):
+            for norm in ti.get("normalized", []) or []:
+                if not isinstance(norm, dict):
+                    continue
+                all_evidence.append({
+                    "section": "threat_intelligence",
+                    "source": norm.get("source"),
+                    "timestamp": None,
+                    "status": norm.get("status"),
+                    "confidence": norm.get("confidence"),
+                    "freshness": norm.get("freshness"),
+                    "value": norm.get("threat_score") if include_raw else None,
+                    "normalized_value": None,
+                })
+    except Exception:
+        pass
+
+    # Stats
+    by_status = defaultdict(int)
+    by_source = defaultdict(int)
+    for ev in all_evidence:
+        try:
+            by_status[ev.get("status", "UNKNOWN")] += 1
+            by_source[ev.get("source", "unknown")] += 1
+        except Exception:
+            continue
+
+    return {
+        "total": len(all_evidence),
+        "by_status": dict(by_status),
+        "by_source": dict(by_source),
+        "include_raw": include_raw,
+        "items": all_evidence if include_raw else []
+    }
+
+
+def _section_confidence(report: Dict[str, Any]) -> Dict[str, Any]:
+    conf = report.get("confidence_intelligence", {}) if isinstance(report, dict) else {}
+    if not isinstance(conf, dict):
+        conf = {}
+    return {
+        "data_confidence": conf.get("data_confidence", {}),
+        "threat_confidence": conf.get("threat_confidence", {}),
+        "geo_confidence": conf.get("geo_confidence", {}),
+        "assessment_confidence": conf.get("assessment_confidence", {}),
+        "summary": conf.get("summary", {}),
+        "notes": conf.get("notes", [])
+    }
+
+
+def _section_limitations(report: Dict[str, Any],
+                         config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Explicitly state what the report does NOT claim.
+    """
+    limitations = [
+        "This report is evidence-driven. It does not claim compromise, exploitation, or impact.",
+        "An open port is exposure, not a vulnerability.",
+        "A detected service is a fingerprint, not a confirmed vulnerability.",
+        "A CVE candidate is not a confirmed vulnerability.",
+        "A shared relationship is not shared intent.",
+        "A score is not a verdict.",
+        "A confidence value is not accuracy.",
+        "Historical changes are evidence, not conclusions.",
+        "Geolocation is approximate, especially for anycast and CDN IPs.",
+        "Passive DNS data depends on third-party sources and may be incomplete.",
+        "Threat intelligence depends on provider coverage and freshness.",
+        "Technology fingerprinting depends on available evidence; UNKNOWN is honest.",
+    ]
+
+    # Add configuration-specific limitations
+    try:
+        as_cfg = config.get("attack_surface", {}) if isinstance(config, dict) else {}
+        if not as_cfg.get("port_scan", False):
+            limitations.append("Active port scanning was disabled. Service list is passive-only.")
+        fp_cfg = config.get("fingerprinting", {}) if isinstance(config, dict) else {}
+        if not fp_cfg.get("active_banner_grab", False):
+            limitations.append("Active banner grabbing was disabled. Technology versions may be UNKNOWN.")
+        vuln_cfg = config.get("vulnerability", {}) if isinstance(config, dict) else {}
+        if vuln_cfg.get("require_validation", True):
+            limitations.append("Vulnerability validation is required. Candidates are not confirmations.")
+        if not config.get("history", {}).get("enabled", True):
+            limitations.append("Historical comparison was disabled. No change detection available.")
+    except Exception:
+        pass
+
+    return {"limitations": limitations}
+
+
+def _section_next_investigation(report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Suggest actionable next steps based on findings.
+    Never suggests exploitation.
+    """
+    steps: List[Dict[str, Any]] = []
+
+    # Anomalies
+    try:
+        anomaly = report.get("anomaly_intelligence", {}) if isinstance(report, dict) else {}
+        by_sev = anomaly.get("by_severity", {}) if isinstance(anomaly, dict) else {}
+        if int(by_sev.get("HIGH", 0) or 0) > 0:
+            steps.append({
+                "priority": "high",
+                "action": "Review HIGH severity anomalies in detail.",
+                "reason": f"{by_sev['HIGH']} HIGH severity anomaly(ies) detected."
+            })
+        if int(by_sev.get("MODERATE", 0) or 0) > 0:
+            steps.append({
+                "priority": "moderate",
+                "action": "Investigate MODERATE severity anomalies.",
+                "reason": f"{by_sev['MODERATE']} MODERATE severity anomaly(ies) detected."
+            })
+    except Exception:
+        pass
+
+    # Threat
+    try:
+        ti = report.get("threat_intelligence", {}) if isinstance(report, dict) else {}
+        if isinstance(ti, dict):
+            if int(ti.get("failed_count", 0) or 0) > 0:
+                steps.append({
+                    "priority": "moderate",
+                    "action": "Resolve failed threat intelligence providers.",
+                    "reason": f"{ti['failed_count']} provider(s) failed. Absence of data is not absence of threat."
+                })
+            if float(ti.get("observed_threat_score", 0) or 0) >= 50:
+                steps.append({
+                    "priority": "high",
+                    "action": "Validate threat indicators with additional sources.",
+                    "reason": f"Observed threat score {ti['observed_threat_score']}/100."
+                })
+    except Exception:
+        pass
+
+    # Attack surface
+    try:
+        as_intel = report.get("attack_surface_intelligence", {}) if isinstance(report, dict) else {}
+        if isinstance(as_intel, dict) and int(as_intel.get("sensitive_count", 0) or 0) > 0:
+            steps.append({
+                "priority": "high",
+                "action": "Review sensitive exposed services.",
+                "reason": f"{as_intel['sensitive_count']} sensitive service(s) exposed."
+            })
+    except Exception:
+        pass
+
+    # Vulnerability candidates
+    try:
+        vuln = report.get("vulnerability_intelligence", {}) if isinstance(report, dict) else {}
+        if isinstance(vuln, dict) and vuln.get("candidates"):
+            steps.append({
+                "priority": "high",
+                "action": "Validate vulnerability candidates in an authorized environment.",
+                "reason": f"{len(vuln['candidates'])} candidate(s) require validation."
+            })
+    except Exception:
+        pass
+
+    # Historical changes
+    try:
+        hist = report.get("historical_intelligence", {}) if isinstance(report, dict) else {}
+        detection = hist.get("detection", {}) if isinstance(hist, dict) else {}
+        by_sev_h = detection.get("by_severity", {}) if isinstance(detection, dict) else {}
+        if int(by_sev_h.get("critical", 0) or 0) > 0:
+            steps.append({
+                "priority": "high",
+                "action": "Review critical historical changes.",
+                "reason": f"{by_sev_h['critical']} critical change(s) detected."
+            })
+    except Exception:
+        pass
+
+    # Certificate
+    try:
+        cert = report.get("certificate_intelligence", {}) if isinstance(report, dict) else {}
+        summary = cert.get("summary", {}) if isinstance(cert, dict) else {}
+        if int(summary.get("expired_count", 0) or 0) > 0:
+            steps.append({
+                "priority": "moderate",
+                "action": "Renew expired certificates.",
+                "reason": f"{summary['expired_count']} expired certificate(s)."
+            })
+        if int(summary.get("weak_algo_count", 0) or 0) > 0:
+            steps.append({
+                "priority": "high",
+                "action": "Replace weak certificate algorithms.",
+                "reason": f"{summary['weak_algo_count']} certificate(s) with weak algorithms."
+            })
+    except Exception:
+        pass
+
+    # Coverage
+    try:
+        scoring = report.get("intelligence_scoring", {}) if isinstance(report, dict) else {}
+        coverage = scoring.get("summary", {}).get("coverage", 0) if isinstance(scoring, dict) else 0
+        if float(coverage or 0) < 60:
+            steps.append({
+                "priority": "moderate",
+                "action": "Improve intelligence coverage.",
+                "reason": f"Coverage is {coverage}/100."
+            })
+    except Exception:
+        pass
+
+    if not steps:
+        steps.append({
+            "priority": "informational",
+            "action": "Continue routine monitoring.",
+            "reason": "No actionable findings at this time."
+        })
+
+    # Sort by priority
+    order = {"high": 0, "moderate": 1, "low": 2, "informational": 3}
+    try:
+        steps.sort(key=lambda s: order.get(s.get("priority", "informational"), 99))
+    except Exception:
+        pass
+
+    return {"next_investigation": steps}
+
+
+def generate_report(target: str,
+                    report: Dict[str, Any],
+                    config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Assemble the full 18-section professional intelligence report.
+    """
+    try:
+        reports_cfg = config.get("reports", {}) if isinstance(config, dict) else {}
+    except Exception:
+        reports_cfg = {}
+    include_raw = reports_cfg.get("include_raw", False) if isinstance(reports_cfg, dict) else False
+    if report is None:
+        report = {}
+    if config is None:
+        config = CFG if isinstance(CFG, dict) else {}
+
+    return {
+        "metadata": _report_metadata(target, config),
+        "01_target_profile":       _section_target_profile(target, report),
+        "02_executive_summary":    _section_executive_summary(report),
+        "03_data_quality":         _section_data_quality(report),
+        "04_network_intelligence": _section_network(report),
+        "05_dns_intelligence":     _section_dns(report),
+        "06_certificate_intelligence": _section_certificate(report),
+        "07_passive_dns":          _section_passive_dns(report),
+        "08_historical_intelligence": _section_history(report),
+        "09_threat_intelligence":  _section_threat(report),
+        "10_infrastructure_correlation": _section_correlation(report),
+        "11_attack_surface":       _section_attack_surface(report),
+        "12_technology":           _section_technology(report),
+        "13_vulnerability_candidates": _section_vulnerability(report),
+        "14_anomalies":            _section_anomalies(report),
+        "15_evidence":             _section_evidence(report, config, include_raw=include_raw),
+        "16_confidence":           _section_confidence(report),
+        "17_limitations":          _section_limitations(report, config),
+        "18_next_investigation":   _section_next_investigation(report),
+    }
+
+
+def _ensure_output_dir(config: Dict[str, Any]) -> str:
+    try:
+        out_dir = config.get("reports", {}).get("output_dir", "reports/") if isinstance(config, dict) else "reports/"
+    except Exception:
+        out_dir = "reports/"
+    if not out_dir:
+        out_dir = "reports/"
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+
+def _report_filename(target: str, ext: str) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_target = re.sub(r"[^a-zA-Z0-9._-]", "_", str(target or "unknown"))
+    return f"{safe_target}_{ts}.{ext}"
+
+
+def export_json(final_report: Dict[str, Any],
+                config: Dict[str, Any]) -> str:
+    """
+    Export the final report as JSON.
+    The output is SIEM-compatible: flat keys, ISO timestamps, no NaN.
+    """
+    out_dir = _ensure_output_dir(config)
+    target = final_report.get("metadata", {}).get("target", "unknown") if isinstance(final_report, dict) else "unknown"
+    path = os.path.join(out_dir, _report_filename(target, "json"))
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(final_report, f, indent=2, default=str, ensure_ascii=False)
+
+    return path
+
+
+def export_csv(final_report: Dict[str, Any],
+               config: Dict[str, Any]) -> str:
+    """
+    Export a flat CSV suitable for spreadsheets.
+
+    Each row represents one finding:
+      section, category, severity, value, evidence, source
+    """
+    out_dir = _ensure_output_dir(config)
+    target = final_report.get("metadata", {}).get("target", "unknown") if isinstance(final_report, dict) else "unknown"
+    path = os.path.join(out_dir, _report_filename(target, "csv"))
+
+    rows: List[Dict[str, Any]] = []
+
+    # Anomalies
+    try:
+        for a in final_report.get("14_anomalies", {}).get("anomalies", []) or []:
+            if not isinstance(a, dict):
+                continue
+            rows.append({
+                "section": "anomaly",
+                "category": a.get("category"),
+                "severity": a.get("severity"),
+                "value": a.get("subtype"),
+                "evidence": json.dumps(a.get("evidence", []), default=str),
+                "source": ",".join(a.get("source_sections", []) or [])
+            })
+    except Exception:
+        pass
+
+    # Vulnerability candidates
+    try:
+        for c in final_report.get("13_vulnerability_candidates", {}).get("candidates", []) or []:
+            if not isinstance(c, dict):
+                continue
+            rows.append({
+                "section": "vulnerability",
+                "category": "candidate",
+                "severity": str(c.get("severity")),
+                "value": c.get("cve"),
+                "evidence": json.dumps(c.get("evidence", []), default=str),
+                "source": "vulnerability_intelligence"
+            })
+    except Exception:
+        pass
+
+    # Services
+    try:
+        for s in final_report.get("11_attack_surface", {}).get("services", []) or []:
+            if not isinstance(s, dict):
+                continue
+            rows.append({
+                "section": "attack_surface",
+                "category": s.get("service"),
+                "severity": s.get("risk_class"),
+                "value": f"{s.get('port')}/{s.get('protocol')}",
+                "evidence": s.get("evidence", ""),
+                "source": s.get("source", "")
+            })
+    except Exception:
+        pass
+
+    # History changes
+    try:
+        for ch in final_report.get("08_historical_intelligence", {}).get("detection", {}).get("changes", []) or []:
+            if not isinstance(ch, dict):
+                continue
+            rows.append({
+                "section": "history",
+                "category": ch.get("change_type"),
+                "severity": ch.get("severity"),
+                "value": ch.get("key"),
+                "evidence": json.dumps({"old": ch.get("old"), "new": ch.get("new")}, default=str),
+                "source": "historical_intelligence"
+            })
+    except Exception:
+        pass
+
+    # Write CSV
+    fieldnames = ["section", "category", "severity", "value", "evidence", "source"]
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            try:
+                writer.writerow(row)
+            except Exception:
+                continue
+
+    return path
+
+
+def export_html(final_report: Dict[str, Any],
+                config: Dict[str, Any]) -> str:
+    """
+    Export a readable HTML report.
+    """
+    out_dir = _ensure_output_dir(config)
+    target = final_report.get("metadata", {}).get("target", "unknown") if isinstance(final_report, dict) else "unknown"
+    path = os.path.join(out_dir, _report_filename(target, "html"))
+
+    def esc(v):
+        try:
+            return _html.escape(str(v)) if v is not None else ""
+        except Exception:
+            return str(v) if v is not None else ""
+
+    md = final_report.get("metadata", {}) if isinstance(final_report, dict) else {}
+    ex = final_report.get("02_executive_summary", {}) if isinstance(final_report, dict) else {}
+    an = final_report.get("14_anomalies", {}) if isinstance(final_report, dict) else {}
+    conf = final_report.get("16_confidence", {}) if isinstance(final_report, dict) else {}
+    if not isinstance(md, dict):
+        md = {}
+    if not isinstance(ex, dict):
+        ex = {}
+    if not isinstance(an, dict):
+        an = {}
+    if not isinstance(conf, dict):
+        conf = {}
+
+    parts = []
+    parts.append("<!DOCTYPE html>")
+    parts.append("<html lang='en'><head><meta charset='utf-8'>")
+    parts.append(f"<title>ReconIP Report \u2014 {esc(target)}</title>")
+    parts.append("<style>")
+    parts.append("body{font-family:Arial,sans-serif;margin:2em;color:#222}")
+    parts.append("h1,h2,h3{color:#003366}")
+    parts.append("table{border-collapse:collapse;width:100%;margin:1em 0}")
+    parts.append("th,td{border:1px solid #ccc;padding:6px;text-align:left}")
+    parts.append("th{background:#f0f0f0}")
+    parts.append(".HIGH{color:#b30000;font-weight:bold}")
+    parts.append(".MODERATE{color:#cc6600;font-weight:bold}")
+    parts.append(".LOW{color:#806600}")
+    parts.append(".INFORMATIONAL{color:#555}")
+    parts.append("</style></head><body>")
+
+    parts.append(f"<h1>ReconIP Intelligence Report</h1>")
+    parts.append(f"<p><b>Target:</b> {esc(md.get('target'))}<br>")
+    parts.append(f"<b>Generated:</b> {esc(md.get('generated_at'))}<br>")
+    parts.append(f"<b>Version:</b> {esc(md.get('version'))}<br>")
+    parts.append(f"<b>Classification:</b> {esc(md.get('classification'))}</p>")
+    parts.append(f"<p><i>{esc(md.get('disclaimer'))}</i></p>")
+
+    # Executive Summary
+    parts.append("<h2>Executive Summary</h2>")
+    parts.append(f"<p><b>Assessment Confidence:</b> {esc(ex.get('assessment_confidence'))} "
+                 f"({esc(ex.get('assessment_score'))})</p>")
+    parts.append(f"<p>{esc(ex.get('headline'))}</p>")
+
+    scores = ex.get("scores", {}) if isinstance(ex.get("scores", {}), dict) else {}
+    parts.append("<table><tr><th>Score</th><th>Value</th></tr>")
+    for k, v in scores.items():
+        parts.append(f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>")
+    parts.append("</table>")
+
+    # Anomalies
+    parts.append("<h2>Anomalies</h2>")
+    by_sev = an.get("by_severity", {}) if isinstance(an.get("by_severity", {}), dict) else {}
+    parts.append("<table><tr><th>Severity</th><th>Count</th></tr>")
+    for sev in ("HIGH", "MODERATE", "LOW", "INFORMATIONAL"):
+        parts.append(f"<tr><td class='{sev}'>{sev}</td><td>{esc(by_sev.get(sev, 0))}</td></tr>")
+    parts.append("</table>")
+
+    if an.get("anomalies"):
+        try:
+            parts.append("<table><tr><th>Category</th><th>Severity</th><th>Message</th></tr>")
+            for a in (an.get("anomalies", []) or [])[:100]:
+                if not isinstance(a, dict):
+                    continue
+                parts.append(
+                    f"<tr><td>{esc(a.get('category'))}</td>"
+                    f"<td class='{esc(a.get('severity'))}'>{esc(a.get('severity'))}</td>"
+                    f"<td>{esc(a.get('message'))}</td></tr>"
+                )
+            parts.append("</table>")
+        except Exception:
+            pass
+
+    # Confidence
+    parts.append("<h2>Confidence</h2>")
+    parts.append("<table><tr><th>Metric</th><th>Score</th></tr>")
+    for k in ("data_confidence", "threat_confidence", "geo_confidence", "assessment_confidence"):
+        sec = conf.get(k, {}) if isinstance(conf.get(k, {}), dict) else {}
+        parts.append(f"<tr><td>{esc(k)}</td><td>{esc(sec.get('score'))}</td></tr>")
+    parts.append("</table>")
+
+    # Limitations
+    parts.append("<h2>Limitations</h2><ul>")
+    try:
+        for lim in final_report.get("17_limitations", {}).get("limitations", []) or []:
+            parts.append(f"<li>{esc(lim)}</li>")
+    except Exception:
+        pass
+    parts.append("</ul>")
+
+    # Next investigation
+    parts.append("<h2>Next Investigation</h2><ul>")
+    try:
+        for step in final_report.get("18_next_investigation", {}).get("next_investigation", []) or []:
+            if not isinstance(step, dict):
+                continue
+            parts.append(
+                f"<li><b>[{esc(step.get('priority'))}]</b> "
+                f"{esc(step.get('action'))} \u2014 <i>{esc(step.get('reason'))}</i></li>"
+            )
+    except Exception:
+        pass
+    parts.append("</ul>")
+    parts.append("<hr><p style='color:#888;font-size:12px;text-align:center'>X7 &bull; X7&Lambda;&dagger;&Xi;X</p>")
+
+    parts.append("</body></html>")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+
+    return path
+
+
+def export_markdown(final_report: Dict[str, Any],
+                    config: Dict[str, Any]) -> str:
+    """
+    Export a Markdown report suitable for wikis and documentation.
+    """
+    out_dir = _ensure_output_dir(config)
+    target = final_report.get("metadata", {}).get("target", "unknown") if isinstance(final_report, dict) else "unknown"
+    path = os.path.join(out_dir, _report_filename(target, "md"))
+
+    md = final_report.get("metadata", {}) if isinstance(final_report, dict) else {}
+    ex = final_report.get("02_executive_summary", {}) if isinstance(final_report, dict) else {}
+    an = final_report.get("14_anomalies", {}) if isinstance(final_report, dict) else {}
+    conf = final_report.get("16_confidence", {}) if isinstance(final_report, dict) else {}
+    if not isinstance(md, dict):
+        md = {}
+    if not isinstance(ex, dict):
+        ex = {}
+    if not isinstance(an, dict):
+        an = {}
+    if not isinstance(conf, dict):
+        conf = {}
+
+    lines = []
+    lines.append(f"# ReconIP Intelligence Report \u2014 `{target}`")
+    lines.append("")
+    lines.append(f"- **Generated:** {md.get('generated_at')}")
+    lines.append(f"- **Version:** {md.get('version')}")
+    lines.append(f"- **Classification:** {md.get('classification')}")
+    lines.append(f"- **Report ID:** {md.get('report_id')}")
+    lines.append("")
+    lines.append(f"> {md.get('disclaimer')}")
+    lines.append("")
+
+    lines.append("## Executive Summary")
+    lines.append("")
+    lines.append(f"- **Assessment Confidence:** {ex.get('assessment_confidence')} ({ex.get('assessment_score')})")
+    lines.append(f"- **Headline:** {ex.get('headline')}")
+    lines.append("")
+    lines.append("| Score | Value |")
+    lines.append("|-------|-------|")
+    try:
+        for k, v in (ex.get("scores", {}) or {}).items():
+            lines.append(f"| {k} | {v} |")
+    except Exception:
+        pass
+    lines.append("")
+
+    lines.append("## Anomalies")
+    lines.append("")
+    lines.append("| Severity | Count |")
+    lines.append("|----------|-------|")
+    try:
+        for sev in ("HIGH", "MODERATE", "LOW", "INFORMATIONAL"):
+            lines.append(f"| {sev} | {(an.get('by_severity', {}) or {}).get(sev, 0)} |")
+    except Exception:
+        pass
+    lines.append("")
+
+    if an.get("anomalies"):
+        lines.append("### Anomaly Details")
+        lines.append("")
+        lines.append("| Category | Severity | Message |")
+        lines.append("|----------|----------|---------|")
+        try:
+            for a in (an.get("anomalies", []) or [])[:100]:
+                if not isinstance(a, dict):
+                    continue
+                lines.append(f"| {a.get('category')} | {a.get('severity')} | {a.get('message')} |")
+        except Exception:
+            pass
+        lines.append("")
+
+    lines.append("## Confidence")
+    lines.append("")
+    lines.append("| Metric | Score |")
+    lines.append("|--------|-------|")
+    for k in ("data_confidence", "threat_confidence", "geo_confidence", "assessment_confidence"):
+        try:
+            sec = conf.get(k, {}) if isinstance(conf, dict) else {}
+            lines.append(f"| {k} | {(sec or {}).get('score')} |")
+        except Exception:
+            continue
+    lines.append("")
+
+    lines.append("## Limitations")
+    lines.append("")
+    try:
+        for lim in final_report.get("17_limitations", {}).get("limitations", []) or []:
+            lines.append(f"- {lim}")
+    except Exception:
+        pass
+    lines.append("")
+
+    lines.append("## Next Investigation")
+    lines.append("")
+    try:
+        for step in final_report.get("18_next_investigation", {}).get("next_investigation", []) or []:
+            if not isinstance(step, dict):
+                continue
+            lines.append(f"- **[{step.get('priority')}]** {step.get('action')} \u2014 _{step.get('reason')}_")
+    except Exception:
+        pass
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("<sub>X7 \u2022 X7\u039b\u2020\u039eX</sub>")
+    lines.append("")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return path
+
+
+def _stix_uuid() -> str:
+    import uuid
+    return str(uuid.uuid4())
+
+
+def export_stix(final_report: Optional[Any] = None,
+                config: Optional[Any] = None) -> Any:
+    """
+    Export a minimal STIX 2.1 bundle (Stage 17) or legacy dict (Stage 14 compat).
+
+    New: export_stix(final_report, config) -> path str (writes file).
+    Legacy: export_stix(result) -> dict (returns bundle).
+    """
+    # Legacy path: single arg, raw recon result with 'ip' and no 'metadata'
+    if config is None:
+        try:
+            if isinstance(final_report, dict) and "metadata" not in final_report:
+                return _export_stix_legacy(final_report)
+        except Exception:
+            pass
+        # Fallback: if it looks like final_report but no config, return bundle dict without writing
+        try:
+            if isinstance(final_report, dict) and "metadata" in final_report:
+                target = final_report.get("metadata", {}).get("target", "unknown")
+                now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                target_type = "ipv4-addr" if re.match(r"^\d+\.\d+\.\d+\.\d+$", str(target)) else "domain-name"
+                return {
+                    "type": "bundle",
+                    "id": f"bundle--{_stix_uuid()}",
+                    "spec_version": "2.1",
+                    "objects": [
+                        {"type": "identity", "id": f"identity--{_stix_uuid()}", "spec_version": "2.1", "created": now, "modified": now, "name": "ReconIP", "identity_class": "system", "description": "Evidence-driven OSINT platform"},
+                        {"type": "indicator", "id": f"indicator--{_stix_uuid()}", "spec_version": "2.1", "created": now, "modified": now, "name": f"Target: {target}", "pattern": f"[{target_type}:value = '{target}']", "pattern_type": "stix", "valid_from": now, "description": final_report.get("02_executive_summary", {}).get("headline", ""), "confidence": 0, "labels": ["reconip", "osint", "assessment"]}
+                    ]
+                }
+        except Exception:
+            pass
+        return _export_stix_legacy(final_report if isinstance(final_report, dict) else {})
+    # New path: (final_report, config) -> write file, return path
+    try:
+        out_dir = _ensure_output_dir(config if isinstance(config, dict) else {})
+        target = final_report.get("metadata", {}).get("target", "unknown") if isinstance(final_report, dict) else "unknown"
+        path = os.path.join(out_dir, _report_filename(target, "stix.json"))
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        target_type = "ipv4-addr" if re.match(r"^\d+\.\d+\.\d+\.\d+$", str(target)) else "domain-name"
+        try:
+            conf_score = float(final_report.get("16_confidence", {}).get("summary", {}).get("assessment", 0) or 0) if isinstance(final_report, dict) else 0.0
+        except Exception:
+            conf_score = 0.0
+        bundle = {
+            "type": "bundle",
+            "id": f"bundle--{_stix_uuid()}",
+            "spec_version": "2.1",
+            "objects": [
+                {
+                    "type": "identity",
+                    "id": f"identity--{_stix_uuid()}",
+                    "spec_version": "2.1",
+                    "created": now,
+                    "modified": now,
+                    "name": "ReconIP",
+                    "identity_class": "system",
+                    "description": "Evidence-driven OSINT platform"
+                },
+                {
+                    "type": "indicator",
+                    "id": f"indicator--{_stix_uuid()}",
+                    "spec_version": "2.1",
+                    "created": now,
+                    "modified": now,
+                    "name": f"Target: {target}",
+                    "pattern": f"[{target_type}:value = '{target}']",
+                    "pattern_type": "stix",
+                    "valid_from": now,
+                    "description": final_report.get("02_executive_summary", {}).get("headline", "") if isinstance(final_report, dict) else "",
+                    "confidence": int(conf_score * 100),
+                    "labels": ["reconip", "osint", "assessment"]
+                }
+            ]
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(bundle, f, indent=2, default=str, ensure_ascii=False)
+        return path
+    except Exception as e:
+        raise e
+
+
+def export_misp(final_report: Optional[Any] = None,
+                config: Optional[Any] = None) -> Any:
+    """
+    Export a minimal MISP event JSON (Stage 17) or legacy dict (Stage 14 compat).
+
+    New: export_misp(final_report, config) -> path str (writes file).
+    Legacy: export_misp(result) -> dict (returns Event).
+    """
+    if config is None:
+        try:
+            if isinstance(final_report, dict) and "metadata" not in final_report:
+                return _export_misp_legacy(final_report)
+        except Exception:
+            pass
+        try:
+            if isinstance(final_report, dict) and "metadata" in final_report:
+                target = final_report.get("metadata", {}).get("target", "unknown")
+                now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                target_type = "ip-src" if re.match(r"^\d+\.\d+\.\d+\.\d+$", str(target)) else "domain"
+                return {"Event": {"info": f"ReconIP assessment for {target}", "date": now.split("T")[0], "timestamp": now, "published": False, "analysis": "1", "threat_level_id": "4", "distribution": "0", "Attribute": [{"type": target_type, "value": target, "category": "Network activity", "to_ids": False, "comment": "ReconIP target"}], "Tag": [{"name": "reconip:assessment"}, {"name": "reconip:evidence-driven"}]}}
+        except Exception:
+            pass
+        return _export_misp_legacy(final_report if isinstance(final_report, dict) else {})
+    try:
+        out_dir = _ensure_output_dir(config if isinstance(config, dict) else {})
+        target = final_report.get("metadata", {}).get("target", "unknown") if isinstance(final_report, dict) else "unknown"
+        path = os.path.join(out_dir, _report_filename(target, "misp.json"))
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        attributes: List[Dict[str, Any]] = []
+        target_type = "ip-src" if re.match(r"^\d+\.\d+\.\d+\.\d+$", str(target)) else "domain"
+        attributes.append({
+            "type": target_type,
+            "value": target,
+            "category": "Network activity",
+            "to_ids": False,
+            "comment": "ReconIP target"
+        })
+        try:
+            for c in final_report.get("13_vulnerability_candidates", {}).get("candidates", []) or []:
+                if not isinstance(c, dict):
+                    continue
+                attributes.append({
+                    "type": "vulnerability",
+                    "value": c.get("cve"),
+                    "category": "External analysis",
+                    "to_ids": False,
+                    "comment": f"CANDIDATE \u2014 {c.get('cpe')} \u2014 requires validation"
+                })
+        except Exception:
+            pass
+        event = {
+            "Event": {
+                "info": f"ReconIP assessment for {target}",
+                "date": now.split("T")[0],
+                "timestamp": now,
+                "published": False,
+                "analysis": "1",
+                "threat_level_id": "4",
+                "distribution": "0",
+                "Attribute": attributes,
+                "Tag": [
+                    {"name": "reconip:assessment"},
+                    {"name": "reconip:evidence-driven"}
+                ]
+            }
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(event, f, indent=2, default=str, ensure_ascii=False)
+        return path
+    except Exception as e:
+        raise e
+
+
+def export_all(final_report: Dict[str, Any],
+               config: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Export the final report in all configured formats.
+    Returns a dict of {format: path}.
+    """
+    try:
+        reports_cfg = config.get("reports", {}) if isinstance(config, dict) else {}
+    except Exception:
+        reports_cfg = {}
+    formats = reports_cfg.get("formats", ["json", "html", "markdown", "csv", "stix", "misp"]) if isinstance(reports_cfg, dict) else ["json", "html", "markdown", "csv", "stix", "misp"]
+
+    exporters = {
+        "json":     export_json,
+        "csv":      export_csv,
+        "html":     export_html,
+        "markdown": export_markdown,
+        "stix":     export_stix,
+        "misp":     export_misp,
+    }
+
+    paths: Dict[str, str] = {}
+    for fmt in formats:
+        fn = exporters.get(fmt)
+        if not fn:
+            continue
+        try:
+            paths[fmt] = fn(final_report, config)
+        except Exception as e:
+            paths[fmt] = f"ERROR: {e}"
+    return paths
+
+
+# ============================================================
+#  BATCH INTELLIGENCE — v42.1 (Stage 18)
+#  Multi-target orchestration with isolation + correlation.
+#  Each target processed in isolation. Failure never propagates.
+# ============================================================
+_SQLITE_LOCK: Optional[threading.Lock] = None
+
+
+def _install_sqlite_lock(lock: threading.Lock) -> None:
+    """
+    Install a global lock used by snapshot writes.
+    """
+    global _SQLITE_LOCK
+    _SQLITE_LOCK = lock
+
+
+def _get_sqlite_lock() -> threading.Lock:
+    global _SQLITE_LOCK
+    if _SQLITE_LOCK is None:
+        _SQLITE_LOCK = threading.Lock()
+    return _SQLITE_LOCK
+
+
+def load_config(path: str = "config.yaml") -> Dict[str, Any]:
+    """
+    Load config from file merged over DEFAULTS.
+    Returns a fresh dict (safe to mutate per-target).
+    """
+    try:
+        file_cfg = load_cfg(path) if callable(globals().get("load_cfg")) else {}
+    except Exception:
+        file_cfg = {}
+    try:
+        base = json.loads(json.dumps(DEFAULTS))
+    except Exception:
+        base = {}
+    try:
+        return deep_merge(base, file_cfg or {})
+    except Exception:
+        return base
+
+
+# ============================================================
+#  SECURITY RESEARCH MODE — v44 (Stage 21)
+#  Named execution profiles: quick / standard / deep / forensic.
+#  A profile is an override, not a rewrite. Base config is never mutated.
+# ============================================================
+# Canonical profile names. Do not add new names without updating docs.
+KNOWN_PROFILES = ["quick", "standard", "deep", "forensic"]
+
+# Mapping from profile keys to config paths.
+# Each entry: profile_key -> (config_section, config_key, transform)
+PROFILE_KEY_MAP = {
+    "dns":               ("dns", "enabled", bool),
+    "whois":             ("infrastructure", "enabled", bool),
+    "ct":                ("certificate", "enabled", bool),
+    "passive_dns":       ("passive_dns", "enabled", bool),
+    "history":           ("history", "enabled", bool),
+    "anomaly":           ("anomaly", "enabled", bool),
+    "attack_surface":    ("attack_surface", "enabled", bool),
+    "technology":        ("fingerprinting", "enabled", bool),
+    "vulnerability":     ("vulnerability", "enabled", bool),
+    "correlation":       ("correlation", "enabled", bool),
+    "confidence":        ("confidence", "enabled", bool),
+    "scoring":           ("scoring", "enabled", bool),
+    "timeline":          ("passive_dns", "timeline", bool),
+    "provider_comparison": ("threat_intelligence", "include_normalized", bool),
+}
+
+
+def load_profile(name: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Load a profile definition by name.
+
+    Rules:
+      - Name must be a known profile.
+      - Unknown profile raises ValueError (fail loudly).
+      - Returns the profile dict (empty dict if profile has no overrides).
+    """
+    if not name:
+        raise ValueError("Profile name is empty.")
+
+    profiles = config.get("profiles", {}) if isinstance(config, dict) else {}
+    if not isinstance(profiles, dict):
+        profiles = {}
+    if name not in profiles:
+        raise ValueError(
+            f"Unknown profile '{name}'. "
+            f"Available: {sorted(profiles.keys())}"
+        )
+
+    profile = profiles[name] or {}
+    if not isinstance(profile, dict):
+        raise ValueError(f"Profile '{name}' must be a mapping.")
+
+    # Attach the name for reporting
+    profile = dict(profile)
+    profile["_name"] = name
+    return profile
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> None:
+    """
+    Recursive merge of override into base (mutates base).
+    """
+    for k, v in (override or {}).items():
+        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+
+
+def apply_profile(profile: Dict[str, Any],
+                  base_config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Apply a profile as an override on top of the base config.
+
+    Returns a NEW config dict (deep copy). The base config is never mutated.
+    """
+    # Deep copy so nothing leaks back
+    try:
+        new_config: Dict[str, Any] = json.loads(json.dumps(base_config))
+    except Exception:
+        new_config = dict(base_config) if isinstance(base_config, dict) else {}
+    if not isinstance(profile, dict):
+        profile = {}
+
+    # 1. Providers
+    providers_spec = profile.get("providers")
+    if providers_spec is not None:
+        all_providers = new_config.setdefault("providers", {})
+        if not isinstance(all_providers, dict):
+            all_providers = {}
+            new_config["providers"] = all_providers
+        if providers_spec == "all":
+            for pname in all_providers:
+                try:
+                    all_providers[pname]["enabled"] = True
+                except Exception:
+                    all_providers[pname] = {"enabled": True}
+        elif isinstance(providers_spec, list):
+            for pname in all_providers:
+                try:
+                    all_providers[pname]["enabled"] = pname in providers_spec
+                except Exception:
+                    continue
+        else:
+            raise ValueError(
+                f"Profile '{profile.get('_name')}' has invalid 'providers' value: "
+                f"{providers_spec!r}. Must be 'all' or a list."
+            )
+
+    # 2. Section toggles
+    for pkey, (section, key, transform) in PROFILE_KEY_MAP.items():
+        if pkey in profile:
+            value = profile[pkey]
+            try:
+                value = transform(value)
+            except Exception as e:
+                raise ValueError(
+                    f"Profile '{profile.get('_name')}' has invalid value "
+                    f"for '{pkey}': {value!r} ({e})"
+                )
+            try:
+                sec = new_config.setdefault(section, {})
+                if not isinstance(sec, dict):
+                    sec = {}
+                    new_config[section] = sec
+                sec[key] = value
+            except Exception as e:
+                raise ValueError(
+                    f"Profile '{profile.get('_name')}' cannot set "
+                    f"'{section}.{key}': {e}"
+                )
+
+    # 3. Nested sections (deep merge)
+    for section in (
+        "performance",
+        "cache",
+        "reports",
+        "evidence",
+        "anomaly",
+        "history",
+        "attack_surface",
+        "fingerprinting",
+        "vulnerability",
+        "dns",
+        "certificate",
+        "passive_dns",
+        "threat_intelligence",
+        "confidence",
+        "scoring",
+        "correlation",
+        "infrastructure",
+    ):
+        if section in profile and isinstance(profile[section], dict):
+            try:
+                sec = new_config.setdefault(section, {})
+                if not isinstance(sec, dict):
+                    sec = {}
+                    new_config[section] = sec
+                _deep_merge(sec, profile[section])
+            except Exception:
+                continue
+
+    # 4. Record the applied profile for reporting
+    new_config["_applied_profile"] = {
+        "name": profile.get("_name", "custom"),
+        "description": profile.get("description", ""),
+    }
+
+    return new_config
+
+
+def resolve_effective_config(config: Dict[str, Any],
+                             cli_profile: Optional[str]) -> Dict[str, Any]:
+    """
+    Determine which profile to use and return the effective config.
+
+    Precedence:
+      1. CLI --profile
+      2. config.default_profile
+      3. No profile (base config)
+    """
+    try:
+        profile_name = cli_profile or (config.get("default_profile") if isinstance(config, dict) else None)
+    except Exception:
+        profile_name = cli_profile
+
+    if not profile_name:
+        # No profile requested; return base config untouched (as a fresh copy)
+        try:
+            new_config = json.loads(json.dumps(config))
+        except Exception:
+            new_config = dict(config) if isinstance(config, dict) else {}
+        new_config["_applied_profile"] = {"name": None, "description": "base config"}
+        return new_config
+
+    profile = load_profile(profile_name, config)
+    return apply_profile(profile, config)
+
+
+def _sync_global_config(effective: Dict[str, Any]) -> None:
+    """
+    Sync an effective (profile-resolved) config into the module-global
+    CFG and its derived section globals, so the recon() pipeline — which
+    reads globals — executes under the profile. The base config object
+    passed to apply_profile() is never mutated (apply works on a copy).
+    """
+    global CFG, PB, PC, PD, PE, PF, PG, PH, PI, PJ, PK, PM, PN, CACHE
+    if not isinstance(effective, dict):
+        return
+    try:
+        CFG.clear()
+        CFG.update(effective)
+    except Exception:
+        return
+    try:
+        PB, PC, PD, PE, PF, PG, PH, PI, PJ, PK = (CFG[k] for k in
+            ("phase_b", "phase_c", "phase_d", "phase_e", "phase_f",
+             "phase_g", "phase_h", "phase_i", "phase_j", "phase_k"))
+        PM, PN = CFG["phase_m"], CFG["phase_n"]
+    except Exception:
+        pass
+    # Honor cache.enabled for the shared HTTP cache (forensic queries live).
+    try:
+        cache_cfg = CFG.get("cache", {}) if isinstance(CFG, dict) else {}
+        if isinstance(cache_cfg, dict) and not cache_cfg.get("enabled", True):
+            CACHE = None
+        else:
+            try:
+                pd_cfg = CFG.get("phase_d", {}) if isinstance(CFG, dict) else {}
+                cache_cfg_pd = pd_cfg.get("cache", {}) if isinstance(pd_cfg, dict) else {}
+                if cache_cfg_pd.get("enabled", True):
+                    CACHE = Cache(cache_cfg_pd.get("db_path", "./reconip_cache.db"))
+                else:
+                    CACHE = None
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _is_valid_target(target: str) -> bool:
+    """
+    Validate that a target is a valid IP address or domain.
+    """
+    if not target or not isinstance(target, str):
+        return False
+    t = target.strip()
+    if not t:
+        return False
+    # IP
+    try:
+        ipaddress.ip_address(t)
+        return True
+    except ValueError:
+        pass
+    # CIDR (rejected for now — batch operates on single hosts)
+    if "/" in t:
+        return False
+    # Domain
+    if len(t) > 253:
+        return False
+    if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)+$", t):
+        return False
+    return True
+
+
+def _read_targets_file(path: str, config: Dict[str, Any]) -> List[str]:
+    """
+    Read targets from a file, one per line.
+    """
+    try:
+        batch_cfg = config.get("batch", {}) if isinstance(config, dict) else {}
+    except Exception:
+        batch_cfg = {}
+    max_lines = batch_cfg.get("max_targets", 1000) if isinstance(batch_cfg, dict) else 1000
+    try:
+        max_lines = int(max_lines)
+    except Exception:
+        max_lines = 1000
+
+    if not os.path.isfile(path):
+        logging.error(f"Input file not found: {path}")
+        return []
+
+    lines: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    logging.warning(
+                        f"Input file exceeds max_targets={max_lines}. Truncating."
+                    )
+                    break
+                lines.append(line.rstrip("\n"))
+    except Exception as e:
+        logging.error(f"Failed to read input file {path}: {e}")
+        return []
+
+    return lines
+
+
+def load_targets(cli_targets: Optional[List[str]],
+                 input_file: Optional[str],
+                 config: Dict[str, Any]) -> List[str]:
+    """
+    Load, validate, and deduplicate targets from CLI args and/or a file.
+
+    Rules:
+      - Comments (#) and blank lines are ignored.
+      - Trailing/leading whitespace is stripped.
+      - Duplicates are removed, preserving first-seen order.
+      - Invalid targets are skipped with a warning.
+    """
+    raw: List[str] = []
+
+    # CLI targets
+    if cli_targets:
+        try:
+            raw.extend(list(cli_targets))
+        except Exception:
+            pass
+
+    # File targets
+    if input_file:
+        try:
+            raw.extend(_read_targets_file(input_file, config))
+        except Exception as e:
+            logging.error(f"Failed to load file targets: {e}")
+
+    # Normalize + deduplicate
+    seen = set()
+    unique: List[str] = []
+    for t in raw:
+        try:
+            t = (t or "").strip()
+        except Exception:
+            continue
+        if not t:
+            continue
+        if t.startswith("#"):
+            continue
+        # Strip inline comments
+        if " #" in t:
+            t = t.split(" #", 1)[0].strip()
+        if not t:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        unique.append(t)
+
+    # Validate
+    valid: List[str] = []
+    for t in unique:
+        try:
+            if _is_valid_target(t):
+                valid.append(t)
+            else:
+                logging.warning(f"Skipping invalid target: {t}")
+        except Exception:
+            logging.warning(f"Skipping invalid target: {t}")
+
+    return valid
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """
+    Build the CLI argument parser.
+    """
+    parser = argparse.ArgumentParser(
+        prog="reconip",
+        description="ReconIP \u2014 evidence-driven OSINT platform",
+        epilog="Example: python3 reconip.py 8.8.8.8 1.1.1.1"
+    )
+
+    # Targets
+    parser.add_argument(
+        "targets",
+        nargs="*",
+        help="One or more IP addresses or domains."
+    )
+    parser.add_argument(
+        "--input", "-i",
+        metavar="FILE",
+        default=None,
+        help="File containing targets, one per line."
+    )
+
+    # Batch control
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=None,
+        help="Max parallel workers for batch mode. Default: from config."
+    )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="Force batch mode even for a single target."
+    )
+    parser.add_argument(
+        "--no-correlate",
+        action="store_true",
+        help="Skip cross-target correlation in batch mode."
+    )
+
+    # Output
+    parser.add_argument(
+        "--format",
+        choices=["json", "html", "markdown", "csv", "stix", "misp", "all"],
+        default=None,
+        help="Output format. Default: from config."
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Override report output directory."
+    )
+
+    # Verbosity
+    parser.add_argument("--quiet", "-q", action="store_true")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+
+    # Behavior
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--provider", default=None, help="Comma-separated provider list.")
+    parser.add_argument("--profile", choices=KNOWN_PROFILES, default=None,
+                        help="Execution profile: quick, standard, deep, forensic.")
+    parser.add_argument(
+        "--test-providers",
+        action="store_true",
+        help="Test all enabled providers against a target without running a full scan."
+    )
+    parser.add_argument(
+        "--show-auth",
+        action="store_true",
+        help="Print the authentication state of every provider and exit."
+    )
+    parser.add_argument(
+        "--list-providers",
+        action="store_true",
+        help="List all providers with their enabled state and remediation path."
+    )
+
+    # Legacy single-target / system flags (preserved for backward compat)
+    parser.add_argument("-o", "--output", choices=["text", "json"], default="text")
+    parser.add_argument("--parallel", action="store_true",
+                        help="Parallel collection (faster)")
+    parser.add_argument("--report", choices=["txt", "json", "html"], default=None)
+    parser.add_argument("--report-file", metavar="PATH", default=None)
+    parser.add_argument("--export", choices=["stix", "misp"], default=None)
+    parser.add_argument("--api", action="store_true")
+    parser.add_argument("--api-host", default=None)
+    parser.add_argument("--api-port", type=int, default=None)
+    parser.add_argument("--metrics", action="store_true")
+    parser.add_argument("--health", action="store_true")
+    parser.add_argument("--allow-private", action="store_true")
+    parser.add_argument("--no-db", action="store_true")
+    parser.add_argument("--timeout", type=int, default=None)
+
+    # Version
+    parser.add_argument("--version", action="version", version="ReconIP v42.1")
+
+    return parser
+
+
+def _deep_copy_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deep copy config to prevent cross-target state leakage.
+    Uses JSON round-trip (config must be JSON-serializable).
+    """
+    try:
+        return json.loads(json.dumps(config))
+    except Exception:
+        # Fallback shallow-ish copy
+        try:
+            import copy as _copy
+            return _copy.deepcopy(config)
+        except Exception:
+            return dict(config) if isinstance(config, dict) else {}
+
+
+def _apply_cli_overrides(config: Dict[str, Any],
+                         args: argparse.Namespace) -> None:
+    """
+    Apply CLI overrides to the local config copy.
+    """
+    try:
+        if getattr(args, "output_dir", None):
+            config.setdefault("reports", {})["output_dir"] = args.output_dir
+        fmt = getattr(args, "format", None)
+        if fmt and fmt != "all":
+            config.setdefault("reports", {})["formats"] = [fmt]
+        if fmt == "all":
+            config.setdefault("reports", {})["formats"] = ["json", "html", "markdown", "csv", "stix", "misp"]
+        provider = getattr(args, "provider", None)
+        if provider:
+            enabled = [p.strip() for p in provider.split(",") if p.strip()]
+            provs = config.get("providers", {})
+            if isinstance(provs, dict):
+                for name in provs:
+                    try:
+                        provs[name]["enabled"] = name in enabled
+                    except Exception:
+                        continue
+        if getattr(args, "no_cache", False):
+            config.setdefault("cache", {})["enabled"] = False
+    except Exception:
+        pass
+
+
+def _process_single_target(target: str,
+                           config: Dict[str, Any],
+                           args: argparse.Namespace) -> Dict[str, Any]:
+    """
+    Process a single target end-to-end.
+
+    This function:
+      - Does NOT mutate shared state.
+      - Does NOT depend on other targets.
+      - Returns a full report dict, or an error dict.
+    Delegates to the existing single-target pipeline (recon) to avoid
+    duplication and guarantee parity with single-target workflow.
+    """
+    try:
+        # Per-target config copy (avoid cross-target leakage)
+        try:
+            local_config = _deep_copy_config(config)
+        except Exception:
+            local_config = config
+        try:
+            _apply_cli_overrides(local_config, args)
+        except Exception:
+            pass
+
+        # Run the existing pipeline stages in order via recon().
+        # recon() internally runs DNS, infra, cert, pdns, threat,
+        # attack surface, technology, vuln, correlation, history,
+        # anomaly, confidence, scoring, final report + export.
+        # Use local output_dir/formats if overridden by re-exporting.
+        report = recon(target, enable_db=not bool(getattr(args, "no_db", False)))
+
+        if not isinstance(report, dict):
+            return {"target": target, "error": "empty report", "status": "FAILED"}
+        if report.get("error") and not report.get("ip"):
+            # recon returns {"input":..,"error":..} on validation/resolve failure
+            return {"target": target, "error": report.get("error"), "status": "FAILED"}
+        # Ensure target key present
+        report.setdefault("target", target)
+        # If CLI overrides changed export config, re-export with local config
+        try:
+            global_cfg_reports = (config.get("reports", {}) if isinstance(config, dict) else {})
+            local_reports = (local_config.get("reports", {}) if isinstance(local_config, dict) else {})
+            if local_reports != global_cfg_reports and report.get("final_report"):
+                try:
+                    re_paths = export_all(report["final_report"], local_config)
+                    # Merge: keep original paths, add/override with re-exported
+                    existing = report.get("export_paths", {})
+                    if isinstance(existing, dict):
+                        existing.update(re_paths)
+                        report["export_paths"] = existing
+                    else:
+                        report["export_paths"] = re_paths
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return report
+
+    except Exception as e:
+        logging.exception(f"Target {target} failed: {e}")
+        return {
+            "target": target,
+            "error": str(e),
+            "status": "FAILED"
+        }
+
+
+def _log_batch_progress(current: int, total: int,
+                        target: str, config: Dict[str, Any]) -> None:
+    try:
+        batch_cfg = config.get("batch", {}) if isinstance(config, dict) else {}
+    except Exception:
+        batch_cfg = {}
+    if isinstance(batch_cfg, dict) and batch_cfg.get("quiet", False):
+        return
+    try:
+        from rich.console import Console
+        console = Console()
+        console.log(f"[{current}/{total}] Processing {target}")
+    except Exception:
+        logging.info(f"[{current}/{total}] Processing {target}")
+
+
+def batch_process(targets: List[str],
+                  config: Dict[str, Any],
+                  args: argparse.Namespace,
+                  workers: int = 1) -> Dict[str, Any]:
+    """
+    Process multiple targets.
+
+    Returns:
+    {
+        "targets": [...],
+        "results": {target: report_or_error},
+        "stats": {...}
+    }
+    """
+    results: Dict[str, Any] = {}
+    started = datetime.now(timezone.utc)
+
+    # SQLite snapshot writes must be serialized
+    try:
+        db_lock = threading.Lock()
+        _install_sqlite_lock(db_lock)
+    except Exception:
+        pass
+
+    try:
+        workers = int(workers)
+    except Exception:
+        workers = 1
+    if workers < 1:
+        workers = 1
+
+    if workers <= 1 or len(targets) <= 1:
+        # Sequential
+        for i, target in enumerate(targets, 1):
+            try:
+                _log_batch_progress(i, len(targets), target, config)
+            except Exception:
+                pass
+            try:
+                results[target] = _process_single_target(target, config, args)
+            except Exception as e:
+                logging.exception(f"Target {target} raised: {e}")
+                results[target] = {"target": target, "error": str(e), "status": "FAILED"}
+    else:
+        # Parallel
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_target = {
+                executor.submit(_process_single_target, t, config, args): t
+                for t in targets
+            }
+            completed = 0
+            for future in as_completed(future_to_target):
+                target = future_to_target[future]
+                completed += 1
+                try:
+                    _log_batch_progress(completed, len(targets), target, config)
+                except Exception:
+                    pass
+                try:
+                    results[target] = future.result()
+                except Exception as e:
+                    logging.exception(f"Target {target} raised: {e}")
+                    results[target] = {
+                        "target": target,
+                        "error": str(e),
+                        "status": "FAILED"
+                    }
+
+    # Finalize
+    ended = datetime.now(timezone.utc)
+    try:
+        duration = (ended - started).total_seconds()
+    except Exception:
+        duration = 0.0
+
+    ok = sum(1 for r in results.values() if isinstance(r, dict) and r.get("status") != "FAILED")
+    failed = len(results) - ok
+
+    return {
+        "targets": list(targets),
+        "results": results,
+        "stats": {
+            "total": len(targets),
+            "ok": ok,
+            "failed": failed,
+            "duration_seconds": round(duration, 2),
+            "workers": workers,
+            "started_at": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ended_at": ended.strftime("%Y-%m-%dT%H:%M:%SZ")
+        }
+    }
+
+
+def batch_correlate(batch_result: Dict[str, Any],
+                    config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Run cross-target correlation across all successful targets.
+    """
+    try:
+        batch_cfg = config.get("batch", {}) if isinstance(config, dict) else {}
+    except Exception:
+        batch_cfg = {}
+    if isinstance(batch_cfg, dict) and not batch_cfg.get("correlate", True):
+        return {"enabled": False}
+
+    targets = []
+    reports = []
+    try:
+        for target, report in (batch_result.get("results", {}) or {}).items():
+            if not isinstance(report, dict):
+                continue
+            if report.get("status") == "FAILED":
+                continue
+            targets.append(target)
+            reports.append(report)
+    except Exception:
+        return {"enabled": False, "error": "invalid batch result"}
+
+    if len(targets) < 2:
+        return {
+            "enabled": True,
+            "status": "INSUFFICIENT_TARGETS",
+            "message": "At least 2 successful targets are required for cross-target correlation.",
+            "related_targets": []
+        }
+
+    try:
+        correlation = correlate(reports, targets, config)
+        if not isinstance(correlation, dict):
+            correlation = {"enabled": True}
+        correlation["status"] = "OK"
+        return correlation
+    except Exception as e:
+        logging.exception(f"batch correlate failed: {e}")
+        return {"enabled": True, "status": "ERROR", "error": str(e), "related_targets": []}
+
+
+def batch_summary_report(batch_result: Dict[str, Any],
+                         batch_corr: Dict[str, Any],
+                         config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a batch summary report.
+    """
+    stats = batch_result.get("stats", {}) if isinstance(batch_result, dict) else {}
+    results = batch_result.get("results", {}) if isinstance(batch_result, dict) else {}
+    if not isinstance(batch_corr, dict):
+        batch_corr = {}
+
+    # Aggregate scores
+    scores_agg = {
+        "threat": [],
+        "infrastructure": [],
+        "data_quality": [],
+        "exposure": [],
+        "anomaly": [],
+        "coverage": []
+    }
+    top_anomalies: List[Dict[str, Any]] = []
+    failed_targets: List[str] = []
+    ok_targets: List[str] = []
+
+    for target, report in results.items():
+        try:
+            if not isinstance(report, dict) or report.get("status") == "FAILED":
+                failed_targets.append(target)
+                continue
+            ok_targets.append(target)
+
+            scoring = report.get("intelligence_scoring", {}).get("summary", {}) if isinstance(report.get("intelligence_scoring", {}), dict) else {}
+            if not isinstance(scoring, dict):
+                scoring = {}
+            for k in scores_agg:
+                v = scoring.get(k)
+                if isinstance(v, (int, float)):
+                    scores_agg[k].append(float(v))
+
+            anomaly = report.get("anomaly_intelligence", {}) if isinstance(report.get("anomaly_intelligence", {}), dict) else {}
+            for a in anomaly.get("anomalies", []) or []:
+                if not isinstance(a, dict):
+                    continue
+                if a.get("severity") in ("HIGH", "MODERATE"):
+                    top_anomalies.append({
+                        "target": target,
+                        "category": a.get("category"),
+                        "subtype": a.get("subtype"),
+                        "severity": a.get("severity"),
+                        "message": a.get("message")
+                    })
+        except Exception:
+            continue
+
+    def _avg(lst):
+        try:
+            return round(sum(lst) / len(lst), 2) if lst else 0.0
+        except Exception:
+            return 0.0
+
+    try:
+        version = config.get("version", "v42.1") if isinstance(config, dict) else "v42.1"
+    except Exception:
+        version = "v42.1"
+
+    try:
+        shared = batch_corr.get("shared", {}) if isinstance(batch_corr.get("shared", {}), dict) else {}
+    except Exception:
+        shared = {}
+
+    def _slen(key):
+        try:
+            return len(shared.get(key, []) or [])
+        except Exception:
+            return 0
+
+    return {
+        "metadata": {
+            "tool": "ReconIP",
+            "version": version,
+            "type": "batch_summary",
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        },
+        "stats": stats,
+        "targets_ok": ok_targets,
+        "targets_failed": failed_targets,
+        "aggregate_scores": {
+            "threat": _avg(scores_agg["threat"]),
+            "infrastructure": _avg(scores_agg["infrastructure"]),
+            "data_quality": _avg(scores_agg["data_quality"]),
+            "exposure": _avg(scores_agg["exposure"]),
+            "anomaly": _avg(scores_agg["anomaly"]),
+            "coverage": _avg(scores_agg["coverage"])
+        },
+        "top_anomalies": sorted(top_anomalies,
+                                key=lambda x: {"HIGH": 0, "MODERATE": 1}.get(x.get("severity"), 2))[:50],
+        "cross_target_correlation": {
+            "status": batch_corr.get("status"),
+            "shared_asns": _slen("shared_asns"),
+            "shared_prefixes": _slen("shared_prefixes"),
+            "shared_certificates": _slen("shared_certificates"),
+            "shared_nameservers": _slen("shared_nameservers"),
+            "related_targets": batch_corr.get("related_targets", [])
+        },
+        "notes": [
+            "A shared relationship across targets is not shared intent.",
+            "Batch summaries aggregate scores \u2014 always read per-target reports for detail.",
+            "Failed targets are listed explicitly. Their absence is not absence of findings."
+        ]
+    }
+
+
+def export_batch_summary(summary: Dict[str, Any],
+                         config: Dict[str, Any]) -> str:
+    out_dir = _ensure_output_dir(config)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(out_dir, f"batch_summary_{ts}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, default=str, ensure_ascii=False)
+    return path
+
 
 # ============================================================
 #  RECON (MAIN FLOW) — v21.3 with Phase 2
@@ -5284,7 +13839,12 @@ def recon(target, enable_db=True, parallel=None):
     stage3_threat_evs: List[Evidence] = []
     try:
         cfg_providers = load_providers(CFG)
-        load_api_keys(cfg_providers)
+        try:
+            _set_providers_registry(cfg_providers)
+        except Exception:
+            pass
+        auth_info = load_api_keys(cfg_providers, CFG)
+        _log_auth_summary(auth_info, CFG)
         stage3_threat_evs = run_providers(ip, cfg_providers)
         # Keep for evidence_engine; also optionally extend evs for legacy scoring (as Ev)
         # Convert to Ev for downstream if needed, but keep separate to avoid double count
@@ -5390,7 +13950,7 @@ def recon(target, enable_db=True, parallel=None):
     threat_dim = threat_score([e for e in evs if e.data_type == "threat"],
                               phase_i=threat_agg)
     infra_dim = infra_risk(ip, trusted, evs)
-    dc = data_confidence(evs, trusted, cs, None)
+    dc = _data_confidence_legacy(evs, trusted, cs, None)
     cov = coverage({}, phase_i=threat_agg)
     eq = evidence_quality(evs, cs)
     ac = assess_confidence(threat_dim, infra_dim, dc, cov, eq, cs)
@@ -5399,6 +13959,50 @@ def recon(target, enable_db=True, parallel=None):
     ents = build_entities(evs, ip)
     rels = build_rels(ents, evs, ip)
     ni = network_intel(ip, domain, evs, trusted, cert_ci)
+
+    # Stage 7: Certificate Intelligence 2.0 — v34 (single source of truth)
+    try:
+        cert_intel = certificate_intelligence(target, CFG)
+    except Exception as e:
+        log.debug(f"certificate intelligence: {e}")
+        cert_intel = {"live_certificate": None, "ct_certificates": [],
+                      "correlation": {}, "metadata": [], "relationships": {},
+                      "anomalies": [], "summary": {}}
+    try:
+        _legacy_cert = cert_summary(cert_ci) if cert_ci is not None else {}
+    except Exception:
+        _legacy_cert = {}
+    if not isinstance(_legacy_cert, dict):
+        _legacy_cert = {}
+    if not isinstance(cert_intel, dict):
+        cert_intel = {"live_certificate": None, "ct_certificates": [],
+                      "correlation": {}, "metadata": [], "relationships": {},
+                      "anomalies": [], "summary": {}}
+    # Merge legacy summary keys (total, by_status, ...) for display compat.
+    # New Stage 7 keys take precedence; legacy keys fill display path.
+    _merged_cert_intel = dict(_legacy_cert)
+    _merged_cert_intel.update(cert_intel)
+
+    # Stage 8: Passive DNS Intelligence — v34.1 (single source of truth)
+    try:
+        pdns_intel = passive_dns_intelligence(target, CFG)
+    except Exception as e:
+        log.debug(f"passive dns intelligence: {e}")
+        pdns_intel = {"evidence": [], "timeline": [],
+                      "stats": {"total_domains": 0, "active_count": 0,
+                                "historical_count": 0, "unknown_count": 0,
+                                "churn_count": 0, "churn_domains": [],
+                                "avg_lifespan_days": None,
+                                "earliest_first_seen": None,
+                                "latest_last_seen": None,
+                                "churn_threshold": 5, "short_lived_days": 7},
+                      "related_domains": [], "anomalies": [],
+                      "summary": {"total_domains": 0, "active": 0,
+                                  "historical": 0, "churn": 0,
+                                  "avg_lifespan_days": None}}
+    if not isinstance(pdns_intel, dict):
+        pdns_intel = {"evidence": [], "timeline": [], "stats": {},
+                      "related_domains": [], "anomalies": [], "summary": {}}
 
     # Stage 6: Infrastructure Intelligence — v33.1
     try:
@@ -5569,7 +14173,8 @@ def recon(target, enable_db=True, parallel=None):
         "entities": [asdict(e) for e in ents.values()],
         "relationships": [asdict(r) for r in rels],
         "network_intelligence": ni,
-        "certificate_intelligence": cert_summary(cert_ci),
+        "certificate_intelligence": _merged_cert_intel,
+        "passive_dns_intelligence": pdns_intel,
         "phase_b": {
             "threat": {"score": threat_dim.score,
                        "classification": threat_dim.classification,
@@ -5588,6 +14193,163 @@ def recon(target, enable_db=True, parallel=None):
         },
         "execution_time": round(time.time() - t0, 2),
     })
+
+    # Stage 9: Historical Intelligence — v35 (single source of truth)
+    # Snapshot must be taken after all sections are built.
+    try:
+        history_intel = historical_intelligence(target, out, CFG)
+    except Exception as e:
+        log.debug(f"historical intelligence: {e}")
+        history_intel = {"enabled": True, "status": "ERROR",
+                         "message": str(e), "changes": [], "total_changes": 0}
+    if not isinstance(history_intel, dict):
+        history_intel = {"enabled": True, "status": "ERROR",
+                         "message": "invalid result", "changes": [], "total_changes": 0}
+    out["historical_intelligence"] = history_intel
+
+    # Stage 10: Correlation Engine — v36 (single source of truth)
+    # Called after all other sections; reads only, modifies none.
+    try:
+        correlation = correlate([out], [target], CFG)
+    except Exception as e:
+        log.debug(f"correlation engine: {e}")
+        correlation = {"enabled": True, "graph": {"nodes": [], "edges": [], "index": {}, "stats": {}},
+                       "shared": {}, "related_targets": [], "notes": [], "summary": {}}
+    if not isinstance(correlation, dict):
+        correlation = {"enabled": True, "graph": {"nodes": [], "edges": [], "index": {}, "stats": {}},
+                       "shared": {}, "related_targets": [], "notes": [], "summary": {}}
+    out["correlation_intelligence"] = correlation
+
+    # Stage 11: Attack Surface Intelligence — v37 (passive by default)
+    # Reads infrastructure/certificate sections; OPEN != VULNERABLE.
+    try:
+        as_intel = attack_surface(target, out, CFG)
+    except Exception as e:
+        log.debug(f"attack surface: {e}")
+        as_intel = {"enabled": True, "services": [], "service_count": 0,
+                    "sensitive_services": [], "sensitive_count": 0,
+                    "by_protocol": {}, "by_service": {}, "ports": [],
+                    "exposure": {}, "anomalies": [], "notes": [],
+                    "summary": {"total_services": 0, "sensitive_services": 0,
+                                "anomalies": 0, "scan_mode": "passive"}}
+    if not isinstance(as_intel, dict):
+        as_intel = {"enabled": True, "services": [], "service_count": 0,
+                    "sensitive_services": [], "sensitive_count": 0,
+                    "by_protocol": {}, "by_service": {}, "ports": [],
+                    "exposure": {}, "anomalies": [], "notes": [],
+                    "summary": {"total_services": 0, "sensitive_services": 0,
+                                "anomalies": 0, "scan_mode": "passive"}}
+    out["attack_surface_intelligence"] = as_intel
+
+    # Stage 12: Technology Fingerprinting — v38 (passive by default)
+    # Reads attack surface services; never guesses a version.
+    try:
+        tech_intel = technology_intelligence(out, CFG)
+    except Exception as e:
+        log.debug(f"technology intelligence: {e}")
+        tech_intel = {"enabled": True, "results": [], "by_class": {},
+                      "summary": {"services_analyzed": 0, "technologies_identified": 0,
+                                  "ok": 0, "insufficient_evidence": 0, "unknown": 0,
+                                  "min_confidence": 0.7}, "notes": []}
+    if not isinstance(tech_intel, dict):
+        tech_intel = {"enabled": True, "results": [], "by_class": {},
+                      "summary": {"services_analyzed": 0, "technologies_identified": 0,
+                                  "ok": 0, "insufficient_evidence": 0, "unknown": 0,
+                                  "min_confidence": 0.7}, "notes": []}
+    out["technology_intelligence"] = tech_intel
+
+    # Stage 13: Vulnerability Intelligence — v39 (candidates only)
+    # Reads technology fingerprints; candidate != confirmed.
+    try:
+        vuln_intel = vulnerability_candidates(out, CFG)
+    except Exception as e:
+        log.debug(f"vulnerability intelligence: {e}")
+        vuln_intel = {"enabled": True, "candidates": [], "cpes_built": [],
+                      "summary": {"technologies_analyzed": 0, "cpes_built": 0,
+                                  "candidates": 0,
+                                  "by_severity": {"critical": 0, "high": 0, "medium": 0,
+                                                  "low": 0, "unknown": 0},
+                                  "require_validation": True,
+                                  "min_technology_confidence": 0.7},
+                      "notes": []}
+    if not isinstance(vuln_intel, dict):
+        vuln_intel = {"enabled": True, "candidates": [], "cpes_built": [],
+                      "summary": {"technologies_analyzed": 0, "cpes_built": 0,
+                                  "candidates": 0,
+                                  "by_severity": {"critical": 0, "high": 0, "medium": 0,
+                                                  "low": 0, "unknown": 0},
+                                  "require_validation": True,
+                                  "min_technology_confidence": 0.7},
+                      "notes": []}
+    out["vulnerability_intelligence"] = vuln_intel
+
+    # Stage 14: Anomaly Detection Engine — v40 (deviation, not verdict)
+    # Reads all prior sections; must run last before persistence.
+    try:
+        anomaly_intel = anomaly_report(out, CFG)
+    except Exception as e:
+        log.debug(f"anomaly engine: {e}")
+        anomaly_intel = {"enabled": True, "checks_executed": [],
+                         "checks_executed_count": 0, "total_anomalies": 0,
+                         "by_severity": {}, "by_category": {}, "anomalies": [],
+                         "notes": [], "summary": {}}
+    if not isinstance(anomaly_intel, dict):
+        anomaly_intel = {"enabled": True, "checks_executed": [],
+                         "checks_executed_count": 0, "total_anomalies": 0,
+                         "by_severity": {}, "by_category": {}, "anomalies": [],
+                         "notes": [], "summary": {}}
+    out["anomaly_intelligence"] = anomaly_intel
+
+    # Stage 15: Confidence Engine — v41 (four separate metrics)
+    # Must be computed last, after all other sections are populated.
+    try:
+        confidence = confidence_engine(out, CFG)
+    except Exception as e:
+        log.debug(f"confidence engine: {e}")
+        confidence = {"enabled": False, "error": str(e)}
+    if not isinstance(confidence, dict):
+        confidence = {"enabled": False, "error": "invalid result"}
+    out["confidence_intelligence"] = confidence
+    # Backward-compatible aliases (canonical source is confidence_intelligence)
+    try:
+        if isinstance(confidence, dict) and confidence.get("enabled"):
+            out["data_confidence"] = confidence.get("data_confidence", {}).get("score", out.get("data_confidence", 0.0))
+            out["threat_confidence"] = confidence.get("threat_confidence", {}).get("score", 0.0)
+    except Exception:
+        pass
+
+    # Stage 16: Intelligence Scoring — v41.1 (six explainable scores)
+    # Must be computed last, after all other sections and confidence are populated.
+    try:
+        scoring = compute_scores(out, CFG)
+    except Exception as e:
+        log.debug(f"scoring engine: {e}")
+        scoring = {"enabled": False, "error": str(e)}
+    if not isinstance(scoring, dict):
+        scoring = {"enabled": False, "error": "invalid result"}
+    out["intelligence_scoring"] = scoring
+
+    # Stage 20: Cache Intelligence — attach cache health (memory, not truth)
+    try:
+        out["cache_intelligence"] = _section_cache(out, CFG)
+    except Exception as e:
+        log.debug(f"cache intelligence: {e}")
+        out["cache_intelligence"] = {"enabled": False, "error": str(e)}
+
+    # Stage 17: Final Intelligence Report — v42 (18 sections + exports)
+    # Must be computed last, after all intelligence and scoring.
+    try:
+        final_report = generate_report(target, out, CFG)
+    except Exception as e:
+        log.debug(f"report generation: {e}")
+        final_report = {"metadata": _report_metadata(target, CFG), "error": str(e)}
+    try:
+        export_paths = export_all(final_report, CFG)
+    except Exception as e:
+        log.debug(f"report export: {e}")
+        export_paths = {}
+    out["final_report"] = final_report
+    out["export_paths"] = export_paths
 
     if enable_db and INTEL_DB is not None:
         try:
@@ -6338,22 +15100,39 @@ def render_text(d):
             out.append(f"   {_c('No threat attribution evidence', C.OK)}")
         out.append(_section_footer())
 
-    # [06] CERTIFICATES
+    # [06] CERTIFICATES (Stage 7: Certificate Intelligence 2.0 — v34)
     ci = d.get("certificate_intelligence") or {}
-    if ci.get("total"):
+    _live = ci.get("live_certificate") if isinstance(ci, dict) else None
+    _ct_certs = ci.get("ct_certificates") if isinstance(ci, dict) else None
+    _corr = ci.get("correlation") if isinstance(ci, dict) else None
+    _rels = ci.get("relationships") if isinstance(ci, dict) else None
+    _csum = ci.get("summary") if isinstance(ci, dict) else None
+    _has_v34 = bool((_live and isinstance(_live, dict) and _live.get("fingerprint_sha256")) or _ct_certs or _corr or _rels or _csum)
+    if ci.get("total") or _has_v34:
         out.append(_section_header("06", "Certificate Intelligence"))
-        out.append(f"   {_c('TOTAL', C.KEY).ljust(14)} "
-                   f"{_c(ci.get('total', 0), C.BLD, C.VAL)}")
+        if ci.get("total"):
+            out.append(f"   {_c('TOTAL', C.KEY).ljust(14)} "
+                       f"{_c(ci.get('total', 0), C.BLD, C.VAL)}")
+        elif _csum and _csum.get("total_certificates") is not None:
+            out.append(f"   {_c('TOTAL', C.KEY).ljust(14)} "
+                       f"{_c(_csum.get('total_certificates', 0), C.BLD, C.VAL)}")
         bs = ci.get("by_status", {})
-        cur_n = bs.get("CURRENT", 0)
-        hist_n = bs.get("HISTORICAL", 0)
-        unreach_n = bs.get("UNREACHABLE", 0)
-        status_str = f"CURRENT={cur_n}  HISTORICAL={hist_n}  UNREACHABLE={unreach_n}"
-        out.append(f"   {_c('STATUS', C.KEY).ljust(14)} "
-                   f"{_c(status_str, C.VAL)}")
+        if bs:
+            cur_n = bs.get("CURRENT", 0)
+            hist_n = bs.get("HISTORICAL", 0)
+            unreach_n = bs.get("UNREACHABLE", 0)
+            status_str = f"CURRENT={cur_n}  HISTORICAL={hist_n}  UNREACHABLE={unreach_n}"
+            out.append(f"   {_c('STATUS', C.KEY).ljust(14)} "
+                       f"{_c(status_str, C.VAL)}")
         exp = ci.get("expired", 0)
         near = ci.get("near_expiry", 0)
         weak = ci.get("weak", 0)
+        if _csum:
+            try:
+                exp = _csum.get("expired_count", exp)
+                weak = _csum.get("weak_algo_count", weak)
+            except Exception:
+                pass
         exp_c = C.FAIL if exp else C.OK
         near_c = C.WARN if near else C.OK
         weak_c = C.FAIL if weak else C.OK
@@ -6364,9 +15143,33 @@ def render_text(d):
                    f"{_c('WEAK ALGO', C.KEY).ljust(14)} "
                    f"{_c(str(weak), C.BLD, weak_c)}")
         wc = ci.get("wildcards") or []
+        if not wc and _rels and _rels.get("wildcard_certs"):
+            wc = [str(f)[:16] for f in (_rels.get("wildcard_certs") or [])]
         if wc:
             out.append(f"   {_c('WILDCARDS', C.KEY).ljust(14)} "
-                       f"{_c(', '.join(wc[:5]), C.MAG)}")
+                       f"{_c(', '.join([str(x) for x in wc[:5]]), C.MAG)}")
+        # Stage 7 live certificate details
+        if isinstance(_live, dict) and _live.get("fingerprint_sha256"):
+            out.append(f"   {_c('LIVE CERT', C.KEY).ljust(14)} "
+                       f"{_c(str(_live.get('subject_cn') or 'n/a'), C.VAL)}")
+            if _live.get("issuer_cn") or _live.get("issuer_o"):
+                out.append(f"   {_c('ISSUER', C.KEY).ljust(14)} "
+                           f"{_c(str(_live.get('issuer_cn') or _live.get('issuer_o') or 'unknown')[:50], C.CYN)}")
+            sans = _live.get("san_domains") or []
+            if sans:
+                out.append(f"   {_c('SANs', C.KEY).ljust(14)} "
+                           f"{_c(', '.join([str(s) for s in sans[:4]]) + (f' +{len(sans)-4} more' if len(sans) > 4 else ''), C.VAL)}")
+            out.append(f"   {_c('FINGERPRINT', C.KEY).ljust(14)} "
+                       f"{_c(str(_live.get('fingerprint_sha256',''))[:32], C.GRY)}")
+            if _corr:
+                out.append(f"   {_c('LIVE IN CT', C.KEY).ljust(14)} "
+                           f"{_c(str(_corr.get('live_in_ct')), C.VAL)}")
+        if _ct_certs is not None:
+            try:
+                out.append(f"   {_c('CT CERTS', C.KEY).ljust(14)} "
+                           f"{_c(str(len(_ct_certs or [])), C.VAL)}")
+            except Exception:
+                pass
         out.append(_section_footer())
 
     # [09] EVIDENCE ENGINE (Stage 2) — traceable source, freshness, status
@@ -6547,31 +15350,685 @@ def run_single(target, output, report_fmt=None, report_file=None):
     else:
         print(render_text(data))
 
-def main():
+# ============================================================
+#  PROVIDER TEST HARNESS — v44.6 (Stage R5)
+#  Read-only diagnostics: no db, no reports, no cache.
+# ============================================================
+def _auth_label(provider: Any) -> str:
+    """
+    Return a short label describing the provider's auth mode.
+
+    Examples:
+      "none"
+      "header:Key"
+      "param:key"
+      "bearer"
+      "basic"
+      "header:Key (no key)"
+    """
+    try:
+        at = (getattr(provider, "auth_type", None) or "api_key_header").lower()
+    except Exception:
+        at = "api_key_header"
+    try:
+        has_key = bool(getattr(provider, "api_key", None))
+    except Exception:
+        has_key = False
+
+    if at == "none":
+        return "none"
+    if at == "api_key_header":
+        try:
+            h = getattr(provider, "auth_header", None) or "Authorization"
+        except Exception:
+            h = "Authorization"
+        return f"header:{h}" + ("" if has_key else " (no key)")
+    if at == "api_key_param":
+        try:
+            p = getattr(provider, "auth_param", None) or "key"
+        except Exception:
+            p = "key"
+        return f"param:{p}" + ("" if has_key else " (no key)")
+    if at == "bearer_token":
+        return "bearer" + ("" if has_key else " (no key)")
+    if at == "basic_auth":
+        return "basic" + ("" if has_key else " (no key)")
+    return at
+
+
+def _summarize_result(result: Dict[str, Any]) -> str:
+    """
+    Build a short, safe summary of a provider result for the diagnostic table.
+    Never includes secrets. Never truncates mid-word where possible.
+    """
+    if not isinstance(result, dict):
+        return "(empty result)"
+    parts: List[str] = []
+
+    score = result.get("threat_score")
+    if score is not None:
+        parts.append(f"score={score}")
+
+    tags = result.get("tags") or []
+    if tags:
+        try:
+            tag_preview = ",".join(str(t) for t in tags[:2])
+            if len(tags) > 2:
+                tag_preview += f",+{len(tags) - 2}"
+            parts.append(f"tags=[{tag_preview}]")
+        except Exception:
+            pass
+
+    evidence = result.get("evidence")
+    if evidence:
+        ev = _scrub(str(evidence))
+        if len(ev) > 60:
+            ev = ev[:57] + "..."
+        parts.append(ev)
+
+    if not parts:
+        return "(empty result)"
+
+    return " | ".join(parts)
+
+
+def _render_rich_table(console, table, rows: List[Dict[str, Any]]) -> None:
+    """
+    Populate and print a rich table.
+    """
+    status_style = {
+        "OK": "green",
+        "FAILED": "red",
+        "ERROR": "red",
+        "NOT_CONFIGURED": "yellow",
+        "DISABLED": "dim",
+    }
+
+    for row in rows:
+        style = status_style.get(row["status"], "white")
+        table.add_row(
+            row["name"],
+            row["auth"],
+            f"[{style}]{row['status']}[/{style}]",
+            row["latency"],
+            row["detail"],
+        )
+
+    console.print(table)
+
+
+def _render_plain_table(rows: List[Dict[str, Any]]) -> None:
+    """
+    Plain-text fallback renderer.
+    """
+    headers = ["Provider", "Auth", "Status", "Latency", "Evidence / Error"]
+    widths = [20, 20, 16, 10, 60]
+
+    def fmt_row(cells: List[str]) -> str:
+        return "  ".join(
+            str(c)[:w].ljust(w) for c, w in zip(cells, widths)
+        )
+
+    print(fmt_row(headers))
+    print("-" * (sum(widths) + 2 * (len(widths) - 1)))
+    for row in rows:
+        print(fmt_row([
+            row["name"],
+            row["auth"],
+            row["status"],
+            row["latency"],
+            row["detail"],
+        ]))
+
+
+def _render_auth_table(auth_info: Dict[str, Any],
+                       providers: Dict[str, Any],
+                       config: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Render the full provider auth state, including disabled (Stage A2).
+
+    Read-only: performs no network I/O and writes no files.
+    """
+    try:
+        declared = (config.get("providers", {}) or {}) if isinstance(config, dict) else {}
+    except Exception:
+        declared = {}
+    if not isinstance(declared, dict):
+        declared = {}
+    try:
+        provided = dict(providers or {})
+    except Exception:
+        provided = {}
+    try:
+        missing = set(auth_info.get("missing", []) or [])
+        misconfigured = set(auth_info.get("misconfigured", []) or [])
+        present = set(auth_info.get("present", []) or [])
+        disabled_info = set(auth_info.get("disabled", []) or [])
+    except Exception:
+        missing = set()
+        misconfigured = set()
+        present = set()
+        disabled_info = set()
+
+    rows: List[Dict[str, str]] = []
+    for name in sorted(set(declared.keys()) | set(provided.keys())):
+        p = provided.get(name)
+        pc = declared.get(name) if isinstance(declared.get(name), dict) else {}
+        try:
+            enabled = bool(getattr(p, "enabled", True)) if p is not None else bool(pc.get("enabled", True))
+        except Exception:
+            enabled = bool(pc.get("enabled", True))
+        try:
+            auth_type = str(getattr(p, "auth_type", None) or pc.get("auth_type") or "api_key_header")
+        except Exception:
+            auth_type = str(pc.get("auth_type", "api_key_header"))
+        try:
+            env = str(getattr(p, "auth_env", None) or pc.get("api_key_env") or "-")
+        except Exception:
+            env = str(pc.get("api_key_env", "-") or "-")
+        if not enabled or name in disabled_info and p is None:
+            state = "DISABLED"
+        elif auth_type.lower() == "none":
+            state = "NO_AUTH"
+        elif name in misconfigured:
+            state = "MISCONFIGURED"
+        elif name in missing:
+            state = "MISSING"
+        elif name in present:
+            state = "PRESENT"
+        elif env not in ("-", "", "None"):
+            state = "PRESENT" if bool(os.getenv(env)) else "MISSING"
+        else:
+            state = "MISCONFIGURED"
+        # Remediation hint for actionable states (Stage A3).
+        hint = ""
+        if state in ("MISSING", "MISCONFIGURED"):
+            try:
+                remediation = pc.get("remediation", {}) if isinstance(pc.get("remediation", {}), dict) else {}
+                hint_env = str(remediation.get("env_var", "") or env)
+                hint_url = str(remediation.get("signup_url", "") or "")
+                if state == "MISCONFIGURED" and hint_env in ("-", "", "None"):
+                    hint = "\n[dim]no env var declared[/dim]"
+                elif hint_env not in ("-", "", "None"):
+                    hint = f"\n[dim]set {hint_env}[/dim]"
+                if hint_url:
+                    hint += f"\n[dim]{hint_url}[/dim]"
+            except Exception:
+                hint = ""
+        rows.append({
+            "name": name,
+            "enabled": "yes" if enabled else "no",
+            "auth_type": auth_type,
+            "env": env,
+            "state": state,
+            "hint": hint,
+        })
+
+    try:
+        n_present = len(present)
+        n_missing = len(missing) + len(misconfigured)
+        n_disabled = sum(1 for r in rows if r["state"] == "DISABLED")
+        n_noauth = sum(1 for r in rows if r["state"] == "NO_AUTH")
+    except Exception:
+        n_present = n_missing = n_disabled = n_noauth = 0
+
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        console = Console()
+        table = Table(title="ReconIP Auth State", show_lines=False)
+        table.add_column("Provider", style="cyan", no_wrap=True)
+        table.add_column("Enabled", justify="center", no_wrap=True)
+        table.add_column("Auth Type", style="magenta", no_wrap=True)
+        table.add_column("Env Var", style="dim", no_wrap=True)
+        table.add_column("State", style="bold", no_wrap=True)
+        style_map = {
+            "DISABLED": "dim",
+            "NO_AUTH": "green",
+            "MISCONFIGURED": "yellow",
+            "MISSING": "yellow",
+            "PRESENT": "green",
+        }
+        for r in rows:
+            style = style_map.get(r["state"], "white")
+            table.add_row(r["name"], r["enabled"], r["auth_type"], r["env"], f"[{style}]{r['state']}[/{style}]{r.get('hint', '')}")
+        console.print(table)
+        console.print(
+            f"\nSummary: {n_present} present, {n_missing} missing, "
+            f"{n_disabled} disabled, {n_noauth} no-auth."
+        )
+    except ImportError:
+        headers = ["Provider", "Enabled", "Auth Type", "Env Var", "State"]
+        widths = [20, 10, 18, 24, 14]
+        print("  ".join(h[:w].ljust(w) for h, w in zip(headers, widths)))
+        print("-" * (sum(widths) + 2 * (len(widths) - 1)))
+        for r in rows:
+            cell = r["state"] + r.get("hint", "").replace("\n", " ").replace("[dim]", "").replace("[/dim]", "")
+            print("  ".join(str(c)[:w].ljust(w) for c, w in zip(
+                [r["name"], r["enabled"], r["auth_type"], r["env"], cell], widths)))
+        print(f"\nSummary: {n_present} present, {n_missing} missing, "
+              f"{n_disabled} disabled, {n_noauth} no-auth.")
+
+
+def _render_providers_table(providers: Dict[str, Any],
+                             config: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Render every provider with its state and remediation path (Stage A3).
+
+    Metadata comes from config.yaml `remediation` blocks; no URL is
+    hardcoded here. Read-only: no network I/O, no disk writes.
+    """
+    try:
+        declared = (config.get("providers", {}) or {}) if isinstance(config, dict) else {}
+    except Exception:
+        declared = {}
+    if not isinstance(declared, dict):
+        declared = {}
+    try:
+        provided = dict(providers or {})
+    except Exception:
+        provided = {}
+
+    rows: List[Dict[str, str]] = []
+    for name in sorted(set(declared.keys()) | set(provided.keys())):
+        p = provided.get(name)
+        pc = declared.get(name) if isinstance(declared.get(name), dict) else {}
+        remediation = pc.get("remediation", {}) if isinstance(pc.get("remediation", {}), dict) else {}
+        try:
+            enabled = bool(getattr(p, "enabled", True)) if p is not None else bool(pc.get("enabled", True))
+        except Exception:
+            enabled = bool(pc.get("enabled", True))
+        try:
+            auth_type = str(getattr(p, "auth_type", None) or pc.get("auth_type") or "api_key_header")
+        except Exception:
+            auth_type = str(pc.get("auth_type", "api_key_header"))
+        try:
+            env = str(getattr(p, "auth_env", None) or pc.get("api_key_env")
+                      or remediation.get("env_var") or "-")
+        except Exception:
+            env = "-"
+        why = str(remediation.get("why", "") or "-")
+        url = str(remediation.get("signup_url", "") or "")
+        free = str(remediation.get("free_tier", "") or "")
+        rows.append({
+            "name": name,
+            "state": "ENABLED" if enabled else "DISABLED",
+            "auth_type": auth_type,
+            "env": env,
+            "why": why,
+            "url": url,
+            "free": free,
+        })
+
+    try:
+        n_enabled = sum(1 for r in rows if r["state"] == "ENABLED")
+        n_disabled = len(rows) - n_enabled
+    except Exception:
+        n_enabled = n_disabled = 0
+
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        console = Console()
+        table = Table(title="ReconIP Providers", show_lines=False, expand=False)
+        table.add_column("Provider", style="cyan", no_wrap=True)
+        table.add_column("State", justify="center", no_wrap=True)
+        table.add_column("Auth", style="magenta", no_wrap=True)
+        table.add_column("Env Var", style="dim", no_wrap=True)
+        table.add_column("Remediation", overflow="fold")
+        for r in rows:
+            state = "[green]ENABLED[/green]" if r["state"] == "ENABLED" else "[yellow]DISABLED[/yellow]"
+            detail = r["why"]
+            if r["url"]:
+                detail += f"\n{r['url']}"
+            if r["free"]:
+                detail += f"\n[dim]{r['free']}[/dim]"
+            table.add_row(r["name"], state, r["auth_type"], r["env"], detail)
+        console.print(table)
+        console.print(f"\nSummary: {n_enabled} enabled, {n_disabled} disabled.")
+        console.print(
+            "[dim]To enable a disabled provider: "
+            "set its env var, then change enabled: false → true.[/dim]"
+        )
+    except ImportError:
+        headers = ["Provider", "State", "Auth", "Env Var", "Remediation"]
+        widths = [20, 10, 18, 24, 60]
+        print("  ".join(h[:w].ljust(w) for h, w in zip(headers, widths)))
+        print("-" * (sum(widths) + 2 * (len(widths) - 1)))
+        for r in rows:
+            detail = r["why"]
+            if r["url"]:
+                detail += f" {r['url']}"
+            print("  ".join(str(c)[:w].ljust(w) for c, w in zip(
+                [r["name"], r["state"], r["auth_type"], r["env"], detail], widths)))
+        print(f"\nSummary: {n_enabled} enabled, {n_disabled} disabled.")
+
+
+def test_providers(target: str, config: Dict[str, Any]) -> int:
+    """
+    Test every enabled provider against a single target.
+
+    Behavior:
+      - Does NOT use cache.
+      - Does NOT write to reconip.db.
+      - Does NOT write to reports/.
+      - Does NOT modify any persistent state.
+      - Prints a rich table with status, latency, and error/evidence.
+      - Returns an exit code (0 = clean, 2 = failures).
+
+    Args:
+      target: IP address or domain to test against.
+      config: Effective configuration (after profile resolution).
+
+    Returns:
+      int exit code
+    """
+    if not isinstance(config, dict):
+        config = {}
+    # ---- Force-disable cache for this run ----
+    try:
+        config.setdefault("cache", {})
+        config["cache"]["enabled"] = False
+    except Exception:
+        pass
+    try:
+        quiet = bool(config.get("batch", {}).get("quiet", False) or config.get("_quiet", False))
+    except Exception:
+        quiet = False
+
+    # ---- Load providers ----
+    try:
+        providers = load_providers(config)
+    except Exception as e:
+        print(f"Failed to load providers: {e}", file=sys.stderr)
+        return 2
+    # Providers with enabled:false are skipped by load_providers;
+    # list them as DISABLED rows from the declared config.
+    try:
+        declared = config.get("providers", {}) if isinstance(config, dict) else {}
+        if not isinstance(declared, dict):
+            declared = {}
+        disabled_names = sorted(
+            n for n, pc in declared.items()
+            if isinstance(pc, dict) and not pc.get("enabled", True)
+        )
+    except Exception:
+        disabled_names = []
+    if not providers and not disabled_names:
+        print("No providers configured.", file=sys.stderr)
+        return 2
+
+    # ---- Load auth state (secret registration only; no logging here) ----
+    try:
+        load_api_keys(providers, config)
+    except Exception:
+        pass
+
+    # ---- Prepare table ----
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        console = Console()
+        table = Table(
+            title=f"ReconIP Provider Test — {target}",
+            show_lines=False,
+        )
+        table.add_column("Provider", style="cyan", no_wrap=True)
+        table.add_column("Auth", style="magenta", no_wrap=True)
+        table.add_column("Status", style="bold", no_wrap=True)
+        table.add_column("Latency", justify="right", no_wrap=True)
+        table.add_column("Evidence / Error", style="dim")
+        use_rich = True
+    except ImportError:
+        use_rich = False
+        console = None
+        table = None
+
+    # ---- Counters ----
+    ok = 0
+    failed = 0
+    not_configured = 0
+    disabled = 0
+    rows: List[Dict[str, Any]] = []
+
+    # ---- Iterate providers (sequential: clean per-provider latency) ----
+    for name in sorted(set(providers.keys()) | set(disabled_names)):
+        if name not in providers:
+            disabled += 1
+            rows.append({
+                "name": name,
+                "auth": "-",
+                "status": "DISABLED",
+                "latency": "-",
+                "detail": "enabled: false",
+            })
+            continue
+        provider = providers[name]
+
+        try:
+            enabled = bool(getattr(provider, "enabled", True))
+        except Exception:
+            enabled = True
+        if not enabled:
+            disabled += 1
+            rows.append({
+                "name": name,
+                "auth": "-",
+                "status": "DISABLED",
+                "latency": "-",
+                "detail": "enabled: false",
+            })
+            continue
+
+        auth_label = _auth_label(provider)
+
+        try:
+            configured = bool(provider.is_configured()) if hasattr(provider, "is_configured") else True
+        except Exception:
+            configured = True
+        if not configured:
+            not_configured += 1
+            try:
+                _env = getattr(provider, "auth_env", None)
+            except Exception:
+                _env = None
+            rows.append({
+                "name": name,
+                "auth": auth_label,
+                "status": "NOT_CONFIGURED",
+                "latency": "-",
+                "detail": f"missing {_env}" if _env else "misconfigured: no api_key_env",
+            })
+            continue
+
+        # ---- Run the provider ----
+        start = time.time()
+        try:
+            result = provider.query(target)
+            latency = f"{time.time() - start:.2f}s"
+
+            if result is None:
+                failed += 1
+                try:
+                    detail = _scrub(getattr(provider, "last_error", None) or "no result")
+                except Exception:
+                    detail = "no result"
+                rows.append({
+                    "name": name,
+                    "auth": auth_label,
+                    "status": "FAILED",
+                    "latency": latency,
+                    "detail": detail,
+                })
+            else:
+                ok += 1
+                evidence = _summarize_result(result)
+                rows.append({
+                    "name": name,
+                    "auth": auth_label,
+                    "status": "OK",
+                    "latency": latency,
+                    "detail": evidence,
+                })
+        except Exception as e:
+            failed += 1
+            rows.append({
+                "name": name,
+                "auth": auth_label,
+                "status": "ERROR",
+                "latency": "-",
+                "detail": _scrub(str(e))[:80],
+            })
+
+    # ---- Render ----
+    if not quiet:
+        if use_rich:
+            _render_rich_table(console, table, rows)
+        else:
+            _render_plain_table(rows)
+
+    # ---- Summary (always printed) ----
+    summary = (
+        f"OK: {ok} | FAILED: {failed} | "
+        f"NOT_CONFIGURED: {not_configured} | DISABLED: {disabled}"
+    )
+    if not quiet:
+        if use_rich:
+            console.print(f"\n[bold]{summary}[/bold]")
+        else:
+            print(f"\n{summary}")
+    else:
+        print(summary)
+
+    # ---- Exit code (NOT_CONFIGURED never fails) ----
+    return 0 if failed == 0 else 2
+
+
+def main() -> int:
     global INTEL_DB
-    p = argparse.ArgumentParser(
-        description="ReconIP v21.3 — OSINT/CTI Platform")
-    p.add_argument("targets", nargs="*")
-    p.add_argument("-o", "--output", choices=["text", "json"], default="text")
-    p.add_argument("--parallel", action="store_true",
-                   help="Parallel collection (faster)")
-    p.add_argument("--report", choices=["txt", "json", "html"], default=None)
-    p.add_argument("--report-file", metavar="PATH")
-    p.add_argument("--export", choices=["stix", "misp"], default=None)
-    p.add_argument("--api", action="store_true")
-    p.add_argument("--api-host", default=None)
-    p.add_argument("--api-port", type=int, default=None)
-    p.add_argument("--metrics", action="store_true")
-    p.add_argument("--health", action="store_true")
-    p.add_argument("--allow-private", action="store_true")
-    p.add_argument("--no-db", action="store_true")
-    p.add_argument("--timeout", type=int, default=None)
-    args = p.parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
 
-    if args.allow_private: PN["allow_private_targets"] = True
-    if args.timeout: http.to = (2, args.timeout)
+    # Load config (fresh copy)
+    try:
+        config = load_config()
+    except Exception:
+        config = CFG if isinstance(CFG, dict) else {}
 
-    if not args.no_db and PE.get("enabled", True):
+    # Resolve profile (Stage 21: CLI --profile > default_profile > base).
+    # Unknown profiles fail loudly (argparse choices + ValueError here).
+    try:
+        config = resolve_effective_config(config, getattr(args, "profile", None))
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    # Execute the pipeline under the effective config.
+    try:
+        _sync_global_config(config)
+    except Exception as e:
+        log.debug(f"profile sync: {e}")
+
+    # ---- List-providers mode (Stage A3: instant, read-only discovery) ----
+    if getattr(args, "list_providers", False):
+        try:
+            _list_providers = load_providers(config)
+        except Exception as e:
+            print(f"Failed to load providers: {e}", file=sys.stderr)
+            return 2
+        try:
+            _set_providers_registry(_list_providers)
+        except Exception:
+            pass
+        try:
+            _render_providers_table(_list_providers, config)
+        except Exception as e:
+            print(f"Failed to render providers table: {e}", file=sys.stderr)
+            return 2
+        return 0
+
+    # ---- Show-auth mode (Stage A2: instant, read-only diagnostics) ----
+    if getattr(args, "show_auth", False):
+        try:
+            _show_providers = load_providers(config)
+        except Exception as e:
+            print(f"Failed to load providers: {e}", file=sys.stderr)
+            return 2
+        try:
+            _set_providers_registry(_show_providers)
+        except Exception:
+            pass
+        try:
+            _show_auth = load_api_keys(_show_providers, config)
+        except Exception as e:
+            print(f"Failed to inspect auth state: {e}", file=sys.stderr)
+            return 2
+        try:
+            _render_auth_table(_show_auth, _show_providers, config)
+        except Exception as e:
+            print(f"Failed to render auth table: {e}", file=sys.stderr)
+            return 2
+        return 0
+
+    # ---- Test providers mode (Stage R5: read-only diagnostics) ----
+    if getattr(args, "test_providers", False):
+        if getattr(args, "quiet", False):
+            try:
+                config.setdefault("batch", {})["quiet"] = True
+            except Exception:
+                pass
+        targets = load_targets(getattr(args, "targets", []), getattr(args, "input", None), config)
+        if not targets:
+            print("Error: --test-providers requires exactly one target.",
+                  file=sys.stderr)
+            return 1
+        if len(targets) > 1:
+            print(f"Warning: --test-providers uses only the first target "
+                  f"({targets[0]}). Ignoring {len(targets) - 1} additional target(s).",
+                  file=sys.stderr)
+        return test_providers(targets[0], config)
+
+    # Cache initialization (Stage 20: schema + purge expired)
+    try:
+        cache_cfg = config.get("cache", {}) if isinstance(config, dict) else {}
+        if not isinstance(cache_cfg, dict):
+            cache_cfg = {}
+        cache_init(cache_cfg.get("db_path", "reconip_cache.db"))
+        cache_purge_expired(config)
+    except Exception as e:
+        log.debug(f"cache init: {e}")
+
+    # Apply global CLI overrides
+    try:
+        if getattr(args, "verbose", False):
+            config.setdefault("logging", {})["level"] = "DEBUG"
+            try:
+                logging.getLogger().setLevel(logging.DEBUG)
+            except Exception:
+                pass
+        if getattr(args, "debug", False):
+            config.setdefault("logging", {})["level"] = "DEBUG"
+            config.setdefault("logging", {})["debug"] = True
+            try:
+                logging.getLogger().setLevel(logging.DEBUG)
+            except Exception:
+                pass
+        if getattr(args, "quiet", False):
+            config.setdefault("batch", {})["quiet"] = True
+    except Exception:
+        pass
+
+    if getattr(args, "allow_private", False):
+        try:
+            PN["allow_private_targets"] = True
+        except Exception:
+            pass
+    if getattr(args, "timeout", None):
+        try:
+            http.to = (2, args.timeout)
+        except Exception:
+            pass
+
+    if not getattr(args, "no_db", False) and PE.get("enabled", True):
         try:
             INTEL_DB = DB(PE["db_path"])
             with INTEL_DB._l:
@@ -6584,18 +16041,21 @@ def main():
         except Exception as e:
             log.error(f"db init: {e}")
             INTEL_DB = None
+    else:
+        # Respect --no-db: disable DB for recon()
+        INTEL_DB = None
 
-    if args.health:
+    if getattr(args, "health", False):
         print(json.dumps({"providers": {n: h.to_dict() for n, h in _health.items()},
                           "uptime": round(time.time() - _START_T, 1)},
                          indent=2, default=str))
-        return
-    if args.metrics:
+        return 0
+    if getattr(args, "metrics", False):
         print(json.dumps({"jobs": len(JOBS),
                           "cache": CACHE.stats() if CACHE else {},
                           "providers_health": len(_health)}, indent=2))
-        return
-    if args.api:
+        return 0
+    if getattr(args, "api", False):
         httpd = start_api(args.api_host, args.api_port)
         print(f"{C.OK}API running on "
               f"http://{httpd.server_address[0]}:{httpd.server_address[1]}{C.RST}")
@@ -6604,9 +16064,21 @@ def main():
             while True: time.sleep(1)
         except KeyboardInterrupt:
             httpd.shutdown()
-        return
+        return 0
 
-    if not args.targets:
+    # Load targets (positional + file, dedup + validate)
+    try:
+        targets = load_targets(getattr(args, "targets", []), getattr(args, "input", None), config)
+    except Exception as e:
+        logging.error(f"Failed to load targets: {e}")
+        targets = []
+
+    if not targets:
+        # Explicit file input with no valid targets -> help + error
+        if getattr(args, "input", None):
+            parser.print_help()
+            return 1
+        # Legacy interactive mode (preserved single-target workflow)
         print(render_text({"input": "?", "ip": "?", "scan_status": "IDLE",
                             "module_statuses": {}, "phase_b": {}, "phase_i": {},
                             "trusted": {}, "network_intelligence": {},
@@ -6618,17 +16090,143 @@ def main():
             except (EOFError, KeyboardInterrupt):
                 break
             if t.lower() in ("quit", "exit", ""): break
-            run_single(t, args.output, args.report, args.report_file)
-        return
+            run_single(t, getattr(args, "output", "text"), getattr(args, "report", None), getattr(args, "report_file", None))
+        return 0
 
-    for t in args.targets:
-        run_single(t, args.output, args.report, args.report_file)
-        if args.export:
-            data = recon(t)
-            if args.export == "stix":
-                print(json.dumps(export_stix(data), indent=2, default=str))
-            elif args.export == "misp":
-                print(json.dumps(export_misp(data), indent=2, default=str))
+    # Determine mode
+    try:
+        batch_cfg = config.get("batch", {}) if isinstance(config, dict) else {}
+    except Exception:
+        batch_cfg = {}
+    if not isinstance(batch_cfg, dict):
+        batch_cfg = {}
+    batch_enabled = batch_cfg.get("enabled", True)
+
+    if len(targets) == 1 and not getattr(args, "batch", False):
+        # Single-target mode (v42 behavior preserved via _process_single_target)
+        result = _process_single_target(targets[0], config, args)
+        if not isinstance(result, dict) or result.get("status") == "FAILED":
+            try:
+                print(f"Target {targets[0]} failed: {(result or {}).get('error', 'unknown')}")
+            except Exception:
+                pass
+            return 2
+        # Legacy display flags
+        try:
+            if getattr(args, "report", None):
+                rep = build_report(result)
+                content = render_report(rep, getattr(args, "report"))
+                if getattr(args, "report_file", None):
+                    open(getattr(args, "report_file"), "w", encoding="utf-8").write(content)
+                    if not getattr(args, "quiet", False):
+                        print(f"Written: {getattr(args, 'report_file')}")
+                else:
+                    print(content)
+            elif getattr(args, "output", "text") == "json":
+                print(json.dumps(redact(result), indent=2, ensure_ascii=False, default=str))
+            else:
+                # Text summary + export paths (recon already exported files)
+                if not getattr(args, "quiet", False):
+                    paths = result.get("export_paths", {})
+                    if isinstance(paths, dict) and paths:
+                        for fmt, p in paths.items():
+                            print(f"[{fmt}] {p}")
+                    else:
+                        print(render_text(result))
+        except Exception as e:
+            logging.error(f"Display failed: {e}")
+        # Legacy --export print
+        try:
+            if getattr(args, "export", None) == "stix":
+                print(json.dumps(export_stix(result), indent=2, default=str))
+            elif getattr(args, "export", None) == "misp":
+                print(json.dumps(export_misp(result), indent=2, default=str))
+        except Exception:
+            pass
+        return 0
+
+    if not batch_enabled:
+        logging.error("Batch mode is disabled in config.")
+        return 3
+
+    # Batch mode
+    workers = getattr(args, "workers", None) or batch_cfg.get("max_workers", 4)
+    try:
+        workers = int(workers)
+    except Exception:
+        workers = 4
+    try:
+        hard = int(batch_cfg.get("max_workers_hard_limit", 16))
+    except Exception:
+        hard = 16
+    # Legacy --parallel maps to default batch workers when --workers unset
+    if getattr(args, "parallel", False) and getattr(args, "workers", None) is None:
+        workers = int(batch_cfg.get("max_workers", 4))
+    workers = max(1, min(workers, hard))
+
+    batch_result = batch_process(targets, config, args, workers=workers)
+
+    # Cross-target correlation
+    batch_corr = {"enabled": False}
+    if not getattr(args, "no_correlate", False):
+        try:
+            batch_corr = batch_correlate(batch_result, config)
+        except Exception as e:
+            logging.exception(f"batch correlate failed: {e}")
+            batch_corr = {"enabled": True, "status": "ERROR", "error": str(e), "related_targets": []}
+
+    # Export per-target reports (reuse recon exports when present)
+    exported: Dict[str, Dict[str, str]] = {}
+    for target, report in (batch_result.get("results", {}) or {}).items():
+        if not isinstance(report, dict) or report.get("status") == "FAILED":
+            continue
+        try:
+            existing = report.get("export_paths")
+            if isinstance(existing, dict) and existing and not getattr(args, "format", None) and not getattr(args, "output_dir", None):
+                exported[target] = existing
+            else:
+                final_report = report.get("final_report", {})
+                if not final_report:
+                    continue
+                # Honor per-target overrides via local config copy
+                try:
+                    local_config = _deep_copy_config(config)
+                    _apply_cli_overrides(local_config, args)
+                except Exception:
+                    local_config = config
+                exported[target] = export_all(final_report, local_config)
+        except Exception as e:
+            logging.error(f"Export failed for {target}: {e}")
+            continue
+
+    # Batch summary
+    try:
+        summary = batch_summary_report(batch_result, batch_corr, config)
+    except Exception as e:
+        logging.exception(f"summary failed: {e}")
+        summary = {"error": str(e)}
+    try:
+        summary_path = export_batch_summary(summary, config)
+    except Exception as e:
+        logging.error(f"summary export failed: {e}")
+        summary_path = f"ERROR: {e}"
+
+    if not getattr(args, "quiet", False):
+        try:
+            print(f"\nBatch complete: {batch_result['stats']['ok']}/{batch_result['stats']['total']} OK")
+            print(f"Summary: {summary_path}")
+            for target, paths in exported.items():
+                print(f"\n{target}:")
+                if isinstance(paths, dict):
+                    for fmt, p in paths.items():
+                        print(f"  [{fmt}] {p}")
+        except Exception:
+            pass
+
+    try:
+        return 0 if batch_result["stats"]["failed"] == 0 else 2
+    except Exception:
+        return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

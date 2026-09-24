@@ -1,6 +1,32 @@
-requests
-rich
-pyyaml
-dnspython
-python-whois
-cryptography
+# ReconIP — Runtime Requirements
+# Python >= 3.10 required (3.11+ recommended)
+# Generated for ReconIP v44.1
+# Do not add dependencies without updating the import audit.
+#
+# Install with:
+#   python3 -m venv venv
+#   source venv/bin/activate
+#   pip install -r requirements.txt
+#
+# This file lists only direct third-party runtime dependencies.
+# Transitive dependencies (urllib3, idna, certifi, charset-normalizer,
+# cffi, pycparser, markdown-it-py, pygments, etc.) are resolved
+# automatically by pip and are intentionally not pinned here.
+
+# --- HTTP client (RDAP, CT, threat providers, passive DNS) ---
+requests==2.32.3
+
+# --- Configuration parsing ---
+PyYAML==6.0.2
+
+# --- DNS resolution (A, AAAA, PTR, NS, MX, TXT, CAA, SOA, CNAME) ---
+dnspython==2.6.1
+
+# --- WHOIS queries (legacy complement to RDAP) ---
+python-whois==0.9.5
+
+# --- X.509 certificate parsing and fingerprinting ---
+cryptography==43.0.3
+
+# --- Terminal output formatting (optional, but declared) ---
+rich==13.9.4

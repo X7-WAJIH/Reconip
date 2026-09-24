@@ -3,9 +3,35 @@ api_keys: {ipinfo: "", abuseipdb: "", virustotal: "", alienvault: "", greynoise:
 geo_validation:
   anycast_ips: ["8.8.8.8","8.8.4.4","1.1.1.1","1.0.0.1","9.9.9.9",
                 "149.112.112.112","208.67.222.222","208.67.220.220"]
-validation: {min_sources_for_trusted: 2, min_agreement_for_trusted: 60.0,
-             geo_conflict_km: {low: 25, moderate: 100, high: 500},
-             geo_precision_km: {tight: 50, moderate: 250, loose: 1000}}
+validation:
+  min_sources_for_trusted: 2
+  min_agreement_for_trusted: 60.0
+  geo_conflict_km: {low: 25, moderate: 100, high: 500}
+  geo_precision_km: {tight: 50, moderate: 250, loose: 1000}
+  # --- R6 release validation record (documentation only) ---
+  version: "v45"
+  invariants:
+    - "FAILED: 0 on a clean install without keys."
+    - "evidence_coverage > 0.5 without keys."
+    - "evidence_coverage == 1.0 with all keys."
+    - "No parse errors in reconip.log."
+    - "No secret leak in any report or log."
+    - "6 report formats produced per target."
+    - "Batch mode processes N targets and produces N reports."
+    - "Profiles change provider set and timeout budget."
+    - "Cache warm runs are faster than cold runs."
+    - "Determinism: two consecutive runs produce identical structure."
+  exit_codes:
+    ok: 0
+    usage_error: 1
+    provider_failure: 2
+    config_error: 3
+    batch_disabled: 4
+    partial_failure: 5
+  notes:
+    - "Validation is manual. No automated test suite is included."
+    - "Run V1 through V10 on a clean environment before release."
+    - "Freeze v45 only after two consecutive passing runs." 
 sources:
   geo: {enabled: [ip_api, ipinfo, freegeoip, maxmind_local],
         maxmind_db_path: "/usr/share/GeoIP/GeoLite2-City.mmdb"}
@@ -103,31 +129,237 @@ infrastructure:
     education: ["university", "college", "edu"]
     government: ["government", "gov", "ministry"]
     isp: ["telecom", "mobile", "broadband", "isp"]
+certificate:
+  include_expired: true
+  include_san: true
+  include_fingerprint: true
+  live_handshake: true
+  ct_source: "crt.sh"
+  ct_timeout: 15
+  near_expiry_days: 30
+  weak_algorithms: ["sha1", "md5"]
+  min_rsa_key_size: 2048
+  max_wildcards_before_warning: 5
+  max_shared_san_before_warning: 3
+  ignore_private_certs: false
+passive_dns:
+  timeline: true
+  churn_threshold: 5
+  active_window_days: 30
+  short_lived_days: 7
+  max_related_domains: 50
+  max_churn_domains: 20
+  sources: []
+history:
+  enabled: true
+  db_path: reconip.db
+  compare_fields: [dns, asn, prefix, certificate, whois, threat, domains]
+  severity_map:
+    certificate.fingerprint_sha256: critical
+    certificate.issuer_cn: high
+    asn.asn: critical
+    asn.asn_name: moderate
+    prefix.cidr: high
+    prefix.rir: moderate
+    dns.NS: high
+    dns.MX: moderate
+    dns.A: moderate
+    dns.AAAA: moderate
+    dns.TXT: low
+    dns.CAA: low
+    whois.abuse_email: critical
+    whois.org: moderate
+    whois.country: moderate
+    threat.observed_threat_score: high
+    threat.threat_confidence: high
+    domains: low
+  max_changes_in_report: 100
+attack_surface:
+  enabled: true
+  port_scan: false
+  authorized: false
+  authorized_targets: []
+  include_sensitive: true
+  max_services_in_report: 200
+  imported_services: []
+  notes:
+    - "OPEN ≠ VULNERABLE."
+    - "A detected service is not a confirmed vulnerability."
+    - "Active scanning is disabled by default."
+    - "No exploitation is performed."
+fingerprinting:
+  enabled: true
+  min_confidence: 0.7
+  active_banner_grab: false
+  passive_hints: true
+  http_head_request: false
+  tls_extension_probe: false
+  ssh_banner: false
+  smtp_banner: false
+  dns_version_probe: false
+  max_banner_length: 4096
+  notes:
+    - "A banner is a hint, not a fact."
+    - "A version is a claim, not a certainty."
+    - "If evidence is insufficient, the tool returns UNKNOWN."
+    - "Active banner grabbing is disabled by default."
+vulnerability:
+  enabled: true
+  require_validation: true
+  use_nvd_api: false
+  nvd_api_key_env: NVD_API_KEY
+  min_technology_confidence: 0.7
+  max_candidates: 50
+  severity_buckets:
+    critical: 9.0
+    high: 7.0
+    medium: 4.0
+    low: 0.0
+  notes:
+    - "A CVE matching a version is a CANDIDATE, not a confirmation."
+    - "A candidate is not a vulnerability."
+    - "A vulnerability is not an exploit."
+    - "An exploit is not an impact."
+    - "Validation on the target is required before any conclusion."
+anomaly:
+  enabled: true
+  checks: [dns, cert, asn, history, infra, provider, stale]
+  max_stale_seconds: 86400
+  max_anomalies_in_report: 200
+  severity_buckets:
+    informational: 0
+    low: 1
+    moderate: 2
+    high: 3
+  notes:
+    - "An anomaly is a deviation from expectation, not a verdict."
+    - "An anomaly is evidence, not a conclusion."
+    - "An anomaly requires interpretation."
+    - "Severity reflects deviation level, not threat level."
+correlation:
+  enabled: true
+  min_shared: 1
+  include_nodes: true
+  include_edges: true
+  max_shared_in_report: 100
+  max_related_targets: 50
+  node_types:
+    - ip
+    - asn
+    - prefix
+    - organization
+    - domain
+    - nameserver
+    - mailserver
+    - certificate
+    - san
+    - passive_dns_domain
+    - history
+    - threat_intel
+  edge_types:
+    - belongs_to_asn
+    - in_prefix
+    - announces
+    - owned_by
+    - resolves_to
+    - has_ptr
+    - has_nameserver
+    - has_mailserver
+    - has_cname
+    - uses_certificate
+    - certificate_covers
+    - appears_in_passive_dns
+    - has_history
+    - has_threat_intel
+  notes:
+    - "A shared relationship indicates shared infrastructure, not shared intent."
+    - "Shared ASN, prefix, or nameserver may be normal for CDNs, hosting providers, or cloud platforms."
+    - "Shared certificate is a stronger signal of shared ownership, but can also be a shared CDN certificate."
+    - "Correlation is evidence, not a verdict. Always validate before drawing conclusions."
+providers_help:
+  description: |
+    Provider state is controlled by a single flag: `enabled`.
+    Disabled providers are skipped entirely and emit no output.
+    To enable a provider:
+      1. Look up its `remediation.signup_url` in this file.
+      2. Obtain the API key.
+      3. Export the env var named in `remediation.env_var`.
+      4. Change `enabled: false` → `enabled: true`.
+      5. Verify with the command in `remediation.verification`.
+    No code change is required. No restart is required.
+  inspection:
+    show_auth: "python3 reconip.py --show-auth"
+    list_providers: "python3 reconip.py --list-providers"
+    test_providers: "python3 reconip.py 8.8.8.8 --test-providers"
+  invariants:
+    - "Disabled providers emit nothing."
+    - "Enabled providers without a key emit ONE summary warning."
+    - "Enabled providers with a key emit nothing unless they fail."
+    - "No secret is ever stored in this file."
 providers:
+  # ─────────────────────────────────────────────────────────────────
+  # Active providers (no API key required)
+  #   feodo, sslbl, spamhaus_drop, cins
+  #
+  # Disabled providers (require API keys)
+  #   abuseipdb, virustotal, threatfox, alienvault, greynoise, urlhaus
+  #
+  # To enable a provider:
+  #   1. Obtain the API key from the provider's website.
+  #   2. Export the env var declared in api_key_env.
+  #   3. Change enabled: false → enabled: true.
+  #
+  # No code change is required.
+  # ─────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────
+  # Disabling a provider (enabled: false):
+  #   - The provider will not be queried.
+  #   - It will not appear as NOT_CONFIGURED.
+  #   - It will not emit any warning.
+  #   - Use `python3 reconip.py --show-auth` to see its state.
+  #
+  # Enabling a provider (enabled: true):
+  #   - Requires the env var named in api_key_env (unless auth_type=none).
+  #   - If the key is missing, ONE summary warning is logged per run.
+  #   - The provider reports NOT_CONFIGURED in the report.
+  # ─────────────────────────────────────────────────────────────
   abuseipdb:
-    enabled: true
+    enabled: false
     type: http
-    url: "https://api.abuseipdb.com/api/v2/check?ipAddress={target}"
+    url: "https://api.abuseipdb.com/api/v2/check"
     method: GET
-    api_key_env: ABUSEIPDB_API_KEY
-    api_key_header: Key
+    response_format: "json"
+    auth_type: "api_key_header"
+    auth_header: "Key"
+    api_key_env: "ABUSEIPDB_API_KEY"
     timeout: 10
     reliability: 0.95
     weight: 1.0
     freshness_ttl: 1800
+    params:
+      ipAddress: "{target}"
+      maxAgeInDays: 90
     response_map:
       threat_score: "data.abuseConfidenceScore"
       tags: "data.usageType"
       first_seen: "data.lastReportedAt"
       last_seen: "data.lastReportedAt"
       evidence: "data.reports.0.comment"
+    remediation:
+      why: "Requires a free API key."
+      env_var: "ABUSEIPDB_API_KEY"
+      signup_url: "https://www.abuseipdb.com/account/api"
+      verification: "python3 reconip.py 8.8.8.8 --test-providers"
+      free_tier: "1000 requests/day"
+      notes: "Enable: set env var, then change enabled: false → true."
   virustotal:
-    enabled: true
+    enabled: false
     type: http
     url: "https://www.virustotal.com/api/v3/ip_addresses/{target}"
     method: GET
-    api_key_env: VIRUSTOTAL_API_KEY
-    api_key_header: x-apikey
+    auth_type: "api_key_header"
+    auth_header: "x-apikey"
+    api_key_env: "VIRUSTOTAL_API_KEY"
     timeout: 10
     reliability: 0.95
     weight: 1.0
@@ -138,30 +370,50 @@ providers:
       first_seen: "data.attributes.first_seen_itw"
       last_seen: "data.attributes.last_analysis_date"
       evidence: "data.attributes.reputation"
+    remediation:
+      why: "Requires a free API key."
+      env_var: "VIRUSTOTAL_API_KEY"
+      signup_url: "https://www.virustotal.com/gui/my-apikey"
+      verification: "python3 reconip.py 8.8.8.8 --test-providers"
+      free_tier: "500 requests/day, 4 requests/minute"
+      notes: "Public API key works; do not use a premium key with this config."
   threatfox:
-    enabled: true
+    enabled: false
     type: http
     url: "https://threatfox-api.abuse.ch/api/v1/"
     method: POST
-    api_key_env: THREATFOX_API_KEY
-    api_key_header: Auth-Key
+    response_format: "json"
+    auth_type: "api_key_header"
+    auth_header: "Auth-Key"
+    api_key_env: "THREATFOX_API_KEY"
     timeout: 10
     reliability: 0.85
     weight: 0.9
     freshness_ttl: 1800
+    body:
+      query: "search_ioc"
+      search_term: "{target}"
     response_map:
       threat_score: "data.0.confidence_level"
       tags: "data.0.threat_type"
       first_seen: "data.0.first_seen"
       last_seen: "data.0.last_seen"
       evidence: "data.0.malware"
+    remediation:
+      why: "Requires a free abuse.ch Auth-Key."
+      env_var: "THREATFOX_API_KEY"
+      signup_url: "https://auth.abuse.ch/"
+      verification: "python3 reconip.py 8.8.8.8 --test-providers"
+      free_tier: "Unlimited for personal use"
+      notes: "Same Auth-Key works with URLhaus and MalwareBazaar."
   alienvault:
-    enabled: true
+    enabled: false
     type: http
     url: "https://otx.alienvault.com/api/v1/indicators/IPv4/{target}/general"
     method: GET
-    api_key_env: ALIENVAULT_API_KEY
-    api_key_header: X-OTX-API-KEY
+    auth_type: "api_key_header"
+    auth_header: "X-OTX-API-KEY"
+    api_key_env: "ALIENVAULT_API_KEY"
     timeout: 10
     reliability: 0.8
     weight: 0.8
@@ -172,13 +424,21 @@ providers:
       first_seen: "pulse_info.pulses.0.created"
       last_seen: "pulse_info.pulses.0.modified"
       evidence: "pulse_info.pulses.0.name"
+    remediation:
+      why: "Requires a free OTX API key."
+      env_var: "ALIENVAULT_API_KEY"
+      signup_url: "https://otx.alienvault.com/settings"
+      verification: "python3 reconip.py 8.8.8.8 --test-providers"
+      free_tier: "Unlimited for community users"
+      notes: "OTX community access is free; no credit card required."
   greynoise:
-    enabled: true
+    enabled: false
     type: http
     url: "https://api.greynoise.io/v3/community/{target}"
     method: GET
-    api_key_env: GREYNOISE_API_KEY
-    api_key_header: key
+    auth_type: "api_key_header"
+    auth_header: "key"
+    api_key_env: "GREYNOISE_API_KEY"
     timeout: 10
     reliability: 0.7
     weight: 0.7
@@ -189,81 +449,143 @@ providers:
       first_seen: "last_seen"
       last_seen: "last_seen"
       evidence: "message"
+    remediation:
+      why: "Requires a free GreyNoise API key."
+      env_var: "GREYNOISE_API_KEY"
+      signup_url: "https://viz.greynoise.io/account/api-key"
+      verification: "python3 reconip.py 8.8.8.8 --test-providers"
+      free_tier: "50 requests/week (community)"
+      notes: "Community API does not require payment; rate limit is strict."
   spamhaus_drop:
     enabled: true
     type: http
-    url: "https://api.spamhaus.org/api/v1/data/drop"
+    url: "https://www.spamhaus.org/drop/drop.txt"
     method: GET
-    timeout: 10
+    auth_type: "none"
+    response_format: "text_lines"
+    timeout: 15
     reliability: 0.9
     weight: 0.9
-    freshness_ttl: 3600
-    response_map:
-      threat_score: "score"
-      tags: "tags"
-      first_seen: "first_seen"
-      last_seen: "last_seen"
-      evidence: "description"
+    freshness_ttl: 7200
+    remediation:
+      why: "No API key required."
+      env_var: null
+      signup_url: null
+      verification: "python3 reconip.py 8.8.8.8 --test-providers"
+      free_tier: "Public list"
+      notes: "Enabled by default."
   urlhaus:
-    enabled: true
+    enabled: false
     type: http
     url: "https://urlhaus-api.abuse.ch/v1/host/"
     method: POST
-    timeout: 10
-    reliability: 0.75
+    auth_type: "none"
+    response_format: "json"
+    timeout: 15
+    reliability: 0.8
     weight: 0.8
     freshness_ttl: 1800
+    body:
+      host: "{target}"
     response_map:
-      threat_score: "threat"
-      tags: "tags"
-      first_seen: "first_seen"
-      last_seen: "last_seen"
-      evidence: "url"
+      threat_score: "query_status"
+      tags: "urls.0.threat"
+      first_seen: "urls.0.date_added"
+      last_seen: "urls.0.date_added"
+      evidence: "urls.0.url"
+    remediation:
+      why: "Requires an abuse.ch Auth-Key (same as ThreatFox)."
+      env_var: "URLHAUS_API_KEY"
+      signup_url: "https://auth.abuse.ch/"
+      verification: "python3 reconip.py 8.8.8.8 --test-providers"
+      free_tier: "Unlimited for personal use"
+      notes: "One Auth-Key works for ThreatFox, URLhaus, MalwareBazaar."
   feodo:
     enabled: true
     type: http
-    url: "https://feodotracker.abuse.ch/blocklist/?download=ipblocklist"
+    url: "https://feodotracker.abuse.ch/downloads/ipblocklist.txt"
     method: GET
-    timeout: 10
-    reliability: 0.9
-    weight: 1.0
-    freshness_ttl: 1800
-    response_map:
-      threat_score: "score"
-      tags: "tags"
-      first_seen: "first_seen"
-      last_seen: "last_seen"
-      evidence: "evidence"
+    auth_type: "none"
+    response_format: "text_lines"
+    timeout: 15
+    reliability: 0.7
+    weight: 0.7
+    freshness_ttl: 3600
+    remediation:
+      why: "No API key required."
+      env_var: null
+      signup_url: null
+      verification: "python3 reconip.py 8.8.8.8 --test-providers"
+      free_tier: "Public list"
+      notes: "Enabled by default."
   sslbl:
     enabled: true
     type: http
     url: "https://sslbl.abuse.ch/blacklist/sslipblacklist.csv"
     method: GET
-    timeout: 10
-    reliability: 0.8
-    weight: 0.9
-    freshness_ttl: 1800
-    response_map:
-      threat_score: "score"
-      tags: "tags"
-      first_seen: "first_seen"
-      last_seen: "last_seen"
-      evidence: "reason"
+    auth_type: "none"
+    response_format: "csv"
+    timeout: 15
+    reliability: 0.7
+    weight: 0.7
+    freshness_ttl: 3600
+    csv_map:
+      ip: "IP"
+      tag: "Listing reason"
+      first_seen: "First seen (UTC)"
+      last_seen: "Last seen (UTC)"
+    csv_target_column: "IP"
+    remediation:
+      why: "No API key required."
+      env_var: null
+      signup_url: null
+      verification: "python3 reconip.py 8.8.8.8 --test-providers"
+      free_tier: "Public list"
+      notes: "Enabled by default."
   cins:
     enabled: true
     type: http
-    url: "http://cinsscore.com/list/ci-badguys.txt"
+    url: "https://cinsscore.com/list/ci-badguys.txt"
     method: GET
-    timeout: 10
-    reliability: 0.7
-    weight: 0.7
-    freshness_ttl: 1800
-    response_map:
-      threat_score: "score"
-      tags: "tags"
-      first_seen: "first_seen"
-      last_seen: "last_seen"
-      evidence: "description"
+    auth_type: "none"
+    response_format: "text_lines"
+    timeout: 15
+    reliability: 0.6
+    weight: 0.6
+    freshness_ttl: 3600
+    remediation:
+      why: "No API key required."
+      env_var: null
+      signup_url: null
+      verification: "python3 reconip.py 8.8.8.8 --test-providers"
+      free_tier: "Public list"
+      notes: "Enabled by default."
+auth:
+  notes:
+    - "Secrets are read from environment variables only."
+    - "Never write API keys into this file."
+    - "auth_type must be one of: api_key_header, api_key_param, bearer_token, basic_auth, none."
+    - "For api_key_header, set auth_header to the exact header name."
+    - "For api_key_param, set auth_param to the exact query parameter name."
+    - "For bearer_token and basic_auth, only api_key_env is required."
+    - "A provider without its key is reported as NOT_CONFIGURED, not FAILED."
+  supported_types:
+    - api_key_header
+    - api_key_param
+    - bearer_token
+    - basic_auth
+    - none
+providers_notes:
+  response_formats:
+    - "json: parsed via response_map (dot notation)"
+    - "csv: parsed via csv_map; target matched in csv_target_column"
+    - "text_lines: one IP or CIDR per line; inline comments after ';' or '#' are stripped"
+    - "text: raw diagnostic capture, not scored"
+  failure_semantics:
+    - "HTTP error → provider FAILED"
+    - "timeout → provider FAILED"
+    - "parse error → provider FAILED"
+    - "target not in list → provider OK with threat_score=None"
 weights:
   abuseipdb: 1.0
   virustotal: 1.0
@@ -281,15 +603,16 @@ phase_d:
           ttl: {geo: 7200, asn: 3600, rdap: 7200, dns: 600, cert: 3600, threat: 900}}
 phase_e: {enabled: true, db_path: ./reconip.db, retention: {evidence_days: 180}}
 phase_i:
+  # NOTE (A1): keep in sync with top-level providers.enabled — disabled providers must not be queried by the legacy collect_threat path either.
   providers:
-    abuseipdb: {enabled: true, weight: 1.0, reliability: 0.85, env_var: ABUSEIPDB_API_KEY, config_key: abuseipdb}
-    virustotal: {enabled: true, weight: 1.0, reliability: 0.90, env_var: VIRUSTOTAL_API_KEY, config_key: virustotal}
-    alienvault: {enabled: true, weight: 0.7, reliability: 0.70, env_var: ALIENVAULT_API_KEY, config_key: alienvault}
-    urlhaus: {enabled: true, weight: 0.8, reliability: 0.75}
-    threatfox: {enabled: true, weight: 1.0, reliability: 0.85}
+    abuseipdb: {enabled: false, weight: 1.0, reliability: 0.85, env_var: ABUSEIPDB_API_KEY, config_key: abuseipdb}
+    virustotal: {enabled: false, weight: 1.0, reliability: 0.90, env_var: VIRUSTOTAL_API_KEY, config_key: virustotal}
+    alienvault: {enabled: false, weight: 0.7, reliability: 0.70, env_var: ALIENVAULT_API_KEY, config_key: alienvault}
+    urlhaus: {enabled: false, weight: 0.8, reliability: 0.75}
+    threatfox: {enabled: false, weight: 1.0, reliability: 0.85}
     feodo: {enabled: true, weight: 1.0, reliability: 0.90}
     sslbl: {enabled: true, weight: 0.9, reliability: 0.80}
-    greynoise: {enabled: true, weight: 0.8, reliability: 0.80, env_var: GREYNOISE_API_KEY, config_key: greynoise}
+    greynoise: {enabled: false, weight: 0.8, reliability: 0.80, env_var: GREYNOISE_API_KEY, config_key: greynoise}
     cins: {enabled: true, weight: 0.7, reliability: 0.70}
     spamhaus_drop: {enabled: true, weight: 0.9, reliability: 0.85}
   disagreement: {confidence_penalty_per_conflict: 15.0, max_penalty: 40.0}
@@ -331,6 +654,12 @@ logging:
   level: INFO
   file: reconip.log
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  # A2: suppress per-provider auth warnings in favor of one summary line
+  auth_warnings: "summary"   # "summary" | "per_provider" | "off"
+  notes:
+    - "summary: one WARNING line listing all missing keys"
+    - "per_provider: one WARNING line per missing provider (legacy behavior)"
+    - "off: no warnings for missing keys (silent mode)"
 
 phase_n: {allow_private_targets: false, max_batch: 100, subprocess_timeout: 6.0}
 phase_p2:
@@ -359,3 +688,302 @@ phase_p2:
     enabled: true
     parse_dates: true
     extract_contacts: true
+confidence:
+  enabled: true
+  separate: true
+  weights:
+    data: 0.4
+    threat: 0.3
+    geo: 0.2
+    assessment: 0.1
+  data_weights:
+    freshness: 0.4
+    status: 0.3
+    coverage: 0.3
+  threat_weights:
+    coverage: 0.4
+    agreement: 0.3
+    freshness: 0.3
+  geo_weights:
+    country_agreement: 0.5
+    field_availability: 0.5
+  labels:
+    high: 0.85
+    moderate: 0.65
+    low: 0.40
+    very_low: 0.0
+  notes:
+    - "Confidence is not accuracy."
+    - "Confidence is not certainty."
+    - "Confidence is the tool's own estimation of how much it knows."
+    - "A low-confidence report is not a bad report — it is an honest one."
+scoring:
+  enabled: true
+  explain: true
+  weights:
+    threat: 1.0
+    infra: 0.8
+    data_quality: 0.6
+    exposure: 0.7
+    anomaly: 0.5
+    coverage: 0.4
+  labels:
+    very_low: 0.0
+    low: 20.0
+    moderate: 40.0
+    high: 60.0
+    very_high: 80.0
+  notes:
+    - "A score is not a verdict."
+    - "A score is not a fact."
+    - "A score is an explainable estimate."
+    - "Every score must answer: WHY this number?"
+
+
+reports:
+  default_format: html
+  output_dir: reports/
+  include_raw: false
+  classification: UNCLASSIFIED
+  formats: [json, html, markdown, csv, stix, misp]
+  sections: [target, executive, data_quality, network, dns, cert, passive_dns, history, threat, correlation, attack_surface, technology, vuln, anomalies, evidence, confidence, limitations, next]
+  max_anomalies_in_html: 100
+  max_candidates_in_html: 50
+  notes:
+    - "The report is evidence-driven."
+    - "It does not claim compromise, exploitation, or impact."
+    - "Every finding must be validated in context."
+batch:
+  enabled: true
+  max_workers: 4
+  max_workers_hard_limit: 16
+  max_targets: 1000
+  correlate: true
+  quiet: false
+  input_file:
+    allow_comments: true
+    allow_blank_lines: true
+    strip_whitespace: true
+  notes:
+    - "Each target is processed in isolation."
+    - "One target's failure does not affect another."
+    - "Cross-target correlation is evidence-driven."
+    - "A shared relationship across targets is not shared intent."
+performance:
+  parallel: true
+  max_workers: 8
+  timeout_budget: 30
+  min_timeout_budget: 10
+  max_timeout_budget: 120
+  default_min_interval: 0.0
+  rate_limits:
+    abuseipdb: 2.0
+    virustotal: 15.0
+    threatfox: 1.0
+    alienvault: 6.0
+    greynoise: 3.0
+    spamhaus_drop: 5.0
+    urlhaus: 2.0
+    feodo: 2.0
+    sslbl: 2.0
+    cins: 2.0
+  priority_weights:
+    reliability: 0.5
+    weight: 0.3
+    configured_bonus: 0.2
+  circuit_breaker:
+    error_rate_threshold: 0.8
+    penalty: 1.0
+  notes:
+    - "Speed is a property of execution, not a property of evidence."
+    - "Every provider still returns an Evidence object."
+    - "Failed providers are never silently skipped."
+    - "Rate limits are enforced locally per provider."
+    - "Timeout budget caps total provider time."
+cache:
+  enabled: true
+  db_path: reconip_cache.db
+  ttl_seconds: 3600
+  stale_threshold: 7200
+  expired_threshold: 86400
+  purge_expired: true
+  cache_failures: false
+  cache_provider_results: true
+  cache_dns: true
+  cache_whois: true
+  cache_certificates: true
+  cache_passive_dns: true
+  provider_ttls:
+    abuseipdb: 1800
+    virustotal: 3600
+    alienvault: 3600
+    greynoise: 1800
+    spamhaus_drop: 7200
+    threatfox: 1800
+    urlhaus: 1800
+    feodo: 3600
+    sslbl: 3600
+    cins: 3600
+  section_ttls:
+    dns: 3600
+    whois: 86400
+    certificate: 86400
+    passive_dns: 3600
+  notes:
+    - "Cache is a memory, not a source of truth."
+    - "FRESH cache may skip a query."
+    - "STALE cache is marked and used only as fallback."
+    - "EXPIRED cache is never used."
+    - "Failed providers are never cached."
+# Default profile used when --profile is not provided.
+# Set to null to use the base config without any profile.
+default_profile: standard
+
+profiles:
+  quick:
+    description: "Fast triage. Few providers, minimal sections, short budget."
+    # NOTE (A1): quick intentionally selects key-requiring providers; expect NOT_CONFIGURED without keys.
+    providers: [abuseipdb, virustotal, greynoise]
+    dns: true
+    whois: false
+    ct: false
+    passive_dns: false
+    history: false
+    anomaly: false
+    attack_surface: false
+    technology: false
+    vulnerability: false
+    correlation: false
+    confidence: true
+    scoring: true
+    timeline: false
+    provider_comparison: false
+    performance:
+      max_workers: 4
+      timeout_budget: 15
+    cache:
+      enabled: true
+    reports:
+      include_raw: false
+    evidence:
+      include_raw: false
+
+  standard:
+    description: "Balanced scan. All active providers (no key required), all sections, default budget."
+    # NOTE (A1): explicit list — `providers: all` force-enables disabled providers in apply_profile. Keep in sync with providers.enabled flags.
+    providers: [feodo, sslbl, spamhaus_drop, cins]
+    dns: true
+    whois: true
+    ct: true
+    passive_dns: true
+    history: true
+    anomaly: true
+    attack_surface: true
+    technology: true
+    vulnerability: true
+    correlation: true
+    confidence: true
+    scoring: true
+    timeline: true
+    provider_comparison: true
+    performance:
+      max_workers: 8
+      timeout_budget: 30
+    cache:
+      enabled: true
+    reports:
+      include_raw: false
+    evidence:
+      include_raw: false
+
+  deep:
+    description: "Extended scan. History and anomaly emphasis, longer budget."
+    # NOTE (A1): explicit list — `providers: all` force-enables disabled providers in apply_profile. Keep in sync with providers.enabled flags.
+    providers: [feodo, sslbl, spamhaus_drop, cins]
+    dns: true
+    whois: true
+    ct: true
+    passive_dns: true
+    history: true
+    anomaly: true
+    attack_surface: true
+    technology: true
+    vulnerability: true
+    correlation: true
+    confidence: true
+    scoring: true
+    timeline: true
+    provider_comparison: true
+    performance:
+      max_workers: 8
+      timeout_budget: 60
+    cache:
+      enabled: true
+    reports:
+      include_raw: false
+    evidence:
+      include_raw: true
+    anomaly:
+      enabled: true
+      checks: [dns, cert, asn, history, infra, provider, stale]
+    history:
+      enabled: true
+      compare_fields: [dns, asn, prefix, certificate, whois, threat, domains]
+
+  forensic:
+    description: "Maximum evidence. No cache, full raw evidence, longest budget."
+    # NOTE (A1): explicit list — `providers: all` force-enables disabled providers in apply_profile. Keep in sync with providers.enabled flags.
+    providers: [feodo, sslbl, spamhaus_drop, cins]
+    dns: true
+    whois: true
+    ct: true
+    passive_dns: true
+    history: true
+    anomaly: true
+    attack_surface: true
+    technology: true
+    vulnerability: true
+    correlation: true
+    confidence: true
+    scoring: true
+    timeline: true
+    provider_comparison: true
+    performance:
+      max_workers: 4
+      timeout_budget: 120
+    cache:
+      enabled: false
+    reports:
+      include_raw: true
+    evidence:
+      include_raw: true
+    anomaly:
+      enabled: true
+      checks: [dns, cert, asn, history, infra, provider, stale]
+    history:
+      enabled: true
+      compare_fields: [dns, asn, prefix, certificate, whois, threat, domains]
+    notes:
+      - "Forensic mode disables cache to ensure live evidence."
+      - "Forensic mode includes raw evidence for maximum traceability."
+      - "Forensic mode uses the longest timeout budget."
+test_providers:
+  # The harness is read-only. It never writes to reconip.db, reports/, or cache.
+  read_only: true
+  # Sequential execution for clean per-provider latency.
+  sequential: true
+  # If true, skip providers with enabled: false in the table entirely.
+  hide_disabled: false
+  # Maximum length of the evidence column.
+  max_evidence_length: 60
+  # Exit codes.
+  exit_codes:
+    ok: 0
+    usage_error: 1
+    provider_failure: 2
+  notes:
+    - "This mode does not use cache."
+    - "This mode does not write any files."
+    - "NOT_CONFIGURED is not a failure."
+    - "FAILED or ERROR cause exit code 2."
+    - "Use this before running a full scan to verify provider health."
