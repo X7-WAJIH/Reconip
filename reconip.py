@@ -19,6 +19,24 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from abc import ABC, abstractmethod
 import contextvars
 
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.layout import Layout
+    from rich.columns import Columns
+    from rich.tree import Tree
+    from rich.rule import Rule
+    from rich.align import Align
+    from rich.box import (
+        ROUNDED, HEAVY, DOUBLE, SIMPLE, MINIMAL,
+        SQUARE, ASCII, ASCII2, ASCII_DOUBLE_HEAD,
+    )
+    _RICH_AVAILABLE = True
+except ImportError:
+    _RICH_AVAILABLE = False
+
 import yaml, requests, dns.resolver, dns.reversename, dns.exception, dns.rdatatype
 try: import geoip2.database; GEOIP2 = True
 except ImportError: geoip2 = None; GEOIP2 = False
@@ -292,6 +310,13 @@ DEFAULTS = {
     "scoring": {"enabled": True, "explain": True, "weights": {"threat": 1.0, "infra": 0.8, "data_quality": 0.6, "exposure": 0.7, "anomaly": 0.5, "coverage": 0.4}, "labels": {"very_low": 0.0, "low": 20.0, "moderate": 40.0, "high": 60.0, "very_high": 80.0}, "notes": ["A score is not a verdict.", "A score is not a fact.", "A score is an explainable estimate.", "Every score must answer: WHY this number?"]},
     "reports": {"default_format": "html", "output_dir": "reports/", "include_raw": False, "classification": "UNCLASSIFIED", "formats": ["json", "html", "markdown", "csv", "stix", "misp"], "sections": ["target", "executive", "data_quality", "network", "dns", "cert", "passive_dns", "history", "threat", "correlation", "attack_surface", "technology", "vuln", "anomalies", "evidence", "confidence", "limitations", "next"], "max_anomalies_in_html": 100, "max_candidates_in_html": 50, "notes": ["The report is evidence-driven.", "It does not claim compromise, exploitation, or impact.", "Every finding must be validated in context."]},
     "version": "v42.1",
+    "display": {"enabled": True, "mode": "terminal", "show_banner": True,
+                "show_all_sections": True, "show_reports_summary": True,
+                "show_progress": True, "width": None, "box_style": "rounded",
+                "colors": {"primary": "cyan", "accent": "magenta", "success": "green",
+                           "warning": "yellow", "danger": "red", "muted": "dim",
+                           "highlight": "bold white", "border": "cyan",
+                           "label": "bold", "value": ""}},
     "batch": {"enabled": True, "max_workers": 4, "max_workers_hard_limit": 16, "max_targets": 1000, "correlate": True, "quiet": False, "input_file": {"allow_comments": True, "allow_blank_lines": True, "strip_whitespace": True}, "notes": ["Each target is processed in isolation.", "One target's failure does not affect another.", "Cross-target correlation is evidence-driven.", "A shared relationship across targets is not shared intent."]},
     "performance": {"parallel": True, "max_workers": 8, "timeout_budget": 30, "min_timeout_budget": 10, "max_timeout_budget": 120, "default_min_interval": 0.0, "rate_limits": {"abuseipdb": 2.0, "virustotal": 15.0, "threatfox": 1.0, "alienvault": 6.0, "greynoise": 3.0, "spamhaus_drop": 5.0, "urlhaus": 2.0, "feodo": 2.0, "sslbl": 2.0, "cins": 2.0}, "priority_weights": {"reliability": 0.5, "weight": 0.3, "configured_bonus": 0.2}, "circuit_breaker": {"error_rate_threshold": 0.8, "penalty": 1.0}, "cache": {"enabled": True, "ttl_seconds": 3600}, "notes": ["Speed is a property of execution, not a property of evidence.", "Every provider still returns an Evidence object.", "Failed providers are never silently skipped.", "Rate limits are enforced locally per provider.", "Timeout budget caps total provider time."]},
     "cache": {"enabled": True, "db_path": "reconip_cache.db", "ttl_seconds": 3600, "stale_threshold": 7200, "expired_threshold": 86400, "purge_expired": True, "cache_failures": False, "cache_provider_results": True, "cache_dns": True, "cache_whois": True, "cache_certificates": True, "cache_passive_dns": True, "provider_ttls": {"abuseipdb": 1800, "virustotal": 3600, "alienvault": 3600, "greynoise": 1800, "spamhaus_drop": 7200, "threatfox": 1800, "urlhaus": 1800, "feodo": 3600, "sslbl": 3600, "cins": 3600}, "section_ttls": {"dns": 3600, "whois": 86400, "certificate": 86400, "passive_dns": 3600}, "notes": ["Cache is a memory, not a source of truth.", "FRESH cache may skip a query.", "STALE cache is marked and used only as fallback.", "EXPIRED cache is never used.", "Failed providers are never cached."]},
@@ -13313,6 +13338,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List all providers with their enabled state and remediation path."
     )
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Generate reports without rendering to the terminal."
+    )
 
     # Legacy single-target / system flags (preserved for backward compat)
     parser.add_argument("-o", "--output", choices=["text", "json"], default="text")
@@ -15704,6 +15734,400 @@ def _render_providers_table(providers: Dict[str, Any],
         print(f"\nSummary: {n_enabled} enabled, {n_disabled} disabled.")
 
 
+# ============================================================
+#  TERMINAL DISPLAY INFRASTRUCTURE — Stage B1 (v46.1)
+#  Console singleton, palette, box style, panel/section wrappers,
+#  section registry with placeholders, and the render_all dispatcher.
+#  Stages B2–B5 fill in banner/header/sections. Display never blocks
+#  report generation, never writes to disk, and never raises.
+# ============================================================
+_CONSOLE: Optional["Console"] = None
+
+
+def _console(config: Optional[Dict[str, Any]] = None) -> Optional["Console"]:
+    """
+    Return the shared rich Console instance (Stage B1).
+
+    Rules:
+      - Created once.
+      - Width is derived from config (display.width) if provided.
+      - Returns None when rich is unavailable.
+    """
+    global _CONSOLE
+    if not _RICH_AVAILABLE:
+        return None
+    if _CONSOLE is None:
+        width = None
+        try:
+            if isinstance(config, dict):
+                width = (config.get("display", {}) or {}).get("width")
+        except Exception:
+            width = None
+        _CONSOLE = Console(width=width, force_terminal=None, soft_wrap=False)
+    return _CONSOLE
+
+
+class Palette:
+    """
+    Resolve colors from config into rich style strings (Stage B1).
+
+    Config shape:
+      display:
+        colors:
+          primary: "cyan"
+          ...
+    """
+
+    DEFAULTS = {
+        "primary": "cyan",
+        "accent": "magenta",
+        "success": "green",
+        "warning": "yellow",
+        "danger": "red",
+        "muted": "dim",
+        "highlight": "bold white",
+        "border": "cyan",
+        "label": "bold",
+        "value": "",
+    }
+
+    def __init__(self, config: Dict[str, Any]):
+        try:
+            colors = (config.get("display", {}) or {}).get("colors", {}) or {}
+        except Exception:
+            colors = {}
+        if not isinstance(colors, dict):
+            colors = {}
+        self._map: Dict[str, str] = dict(self.DEFAULTS)
+        try:
+            self._map.update({k: str(v) for k, v in colors.items() if v})
+        except Exception:
+            pass
+
+    def get(self, name: str) -> str:
+        try:
+            return self._map.get(name, "")
+        except Exception:
+            return ""
+
+    def style(self, *names: str) -> str:
+        """Return a composed style string, e.g. palette.style('accent', 'bold')."""
+        try:
+            parts = [self.get(n) for n in names if self.get(n)]
+        except Exception:
+            return ""
+        return " ".join(parts) if parts else ""
+
+
+def _resolve_box(config: Dict[str, Any]):
+    """
+    Return the rich box constant matching display.box_style (Stage B1).
+    Falls back to ROUNDED.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        name = ((config.get("display", {}) or {}).get("box_style") or "rounded").lower()
+    except Exception:
+        name = "rounded"
+    mapping = {
+        "rounded": ROUNDED,
+        "heavy": HEAVY,
+        "double": DOUBLE,
+        "simple": SIMPLE,
+        "minimal": MINIMAL,
+        "square": SQUARE,
+        "ascii": ASCII,
+    }
+    return mapping.get(name, ROUNDED)
+
+
+def panel(content, config: Dict[str, Any],
+          title: Optional[str] = None,
+          border: str = "border",
+          padding: Tuple[int, int] = (0, 1)) -> Optional["Panel"]:
+    """
+    Build a Panel with consistent styling (Stage B1).
+
+    Returns None when rich is unavailable.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        box = _resolve_box(config)
+        return Panel(
+            content,
+            title=title,
+            border_style=palette.get(border),
+            box=box,
+            padding=padding,
+            expand=True,
+        )
+    except Exception as e:
+        logging.debug(f"panel build failed: {e}")
+        return None
+
+
+def section(number: int, title: str,
+            body, config: Dict[str, Any],
+            border: str = "border") -> Optional["Panel"]:
+    """
+    Render a numbered section header + body inside a panel (Stage B1).
+
+    Example:
+      section(1, "TARGET PROFILE", table, config)
+      → ╭─ 01 │ TARGET PROFILE ─────────╮
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        header = Text.assemble(
+            (f" {number:02d} ", palette.get("accent")),
+            ("│ ", palette.get("muted")),
+            (title, palette.get("highlight")),
+            (" ", ""),
+        )
+        return Panel(
+            body,
+            title=header,
+            title_align="left",
+            border_style=palette.get(border),
+            box=_resolve_box(config),
+            padding=(0, 1),
+            expand=True,
+        )
+    except Exception as e:
+        logging.debug(f"section build failed: {e}")
+        return None
+
+
+SECTION_REGISTRY: List[Tuple[int, str, str]] = [
+    (1,  "TARGET PROFILE",           "_render_01_target_profile"),
+    (2,  "EXECUTIVE SUMMARY",        "_render_02_executive_summary"),
+    (3,  "DATA QUALITY",             "_render_03_data_quality"),
+    (4,  "NETWORK INTELLIGENCE",     "_render_04_network"),
+    (5,  "DNS INTELLIGENCE",         "_render_05_dns"),
+    (6,  "CERTIFICATE INTELLIGENCE", "_render_06_certificate"),
+    (7,  "PASSIVE DNS",              "_render_07_passive_dns"),
+    (8,  "HISTORICAL INTELLIGENCE",  "_render_08_history"),
+    (9,  "THREAT INTELLIGENCE",      "_render_09_threat"),
+    (10, "INFRASTRUCTURE CORRELATION", "_render_10_correlation"),
+    (11, "ATTACK SURFACE",           "_render_11_attack_surface"),
+    (12, "TECHNOLOGY",               "_render_12_technology"),
+    (13, "VULNERABILITY CANDIDATES", "_render_13_vulnerability"),
+    (14, "ANOMALIES",                "_render_14_anomalies"),
+    (15, "EVIDENCE",                 "_render_15_evidence"),
+    (16, "CONFIDENCE",               "_render_16_confidence"),
+    (17, "LIMITATIONS",              "_render_17_limitations"),
+    (18, "NEXT INVESTIGATION",       "_render_18_next_investigation"),
+]
+
+
+def _render_placeholder(number: int, title: str,
+                        config: Dict[str, Any]) -> Optional["Panel"]:
+    """
+    A placeholder section renderer for stages B3–B5 to replace (Stage B1).
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        body = Text(
+            f"[section {number:02d}] {title} — renderer not yet implemented",
+            style=palette.get("muted") or "",
+        )
+        return section(number, title, body, config)
+    except Exception as e:
+        logging.debug(f"placeholder render failed: {e}")
+        return None
+
+
+# ---- Placeholder section renderers (replaced in B3–B5) ----
+
+def _render_01_target_profile(report, config):
+    return _render_placeholder(1, "TARGET PROFILE", config)
+
+
+def _render_02_executive_summary(report, config):
+    return _render_placeholder(2, "EXECUTIVE SUMMARY", config)
+
+
+def _render_03_data_quality(report, config):
+    return _render_placeholder(3, "DATA QUALITY", config)
+
+
+def _render_04_network(report, config):
+    return _render_placeholder(4, "NETWORK INTELLIGENCE", config)
+
+
+def _render_05_dns(report, config):
+    return _render_placeholder(5, "DNS INTELLIGENCE", config)
+
+
+def _render_06_certificate(report, config):
+    return _render_placeholder(6, "CERTIFICATE INTELLIGENCE", config)
+
+
+def _render_07_passive_dns(report, config):
+    return _render_placeholder(7, "PASSIVE DNS", config)
+
+
+def _render_08_history(report, config):
+    return _render_placeholder(8, "HISTORICAL INTELLIGENCE", config)
+
+
+def _render_09_threat(report, config):
+    return _render_placeholder(9, "THREAT INTELLIGENCE", config)
+
+
+def _render_10_correlation(report, config):
+    return _render_placeholder(10, "INFRASTRUCTURE CORRELATION", config)
+
+
+def _render_11_attack_surface(report, config):
+    return _render_placeholder(11, "ATTACK SURFACE", config)
+
+
+def _render_12_technology(report, config):
+    return _render_placeholder(12, "TECHNOLOGY", config)
+
+
+def _render_13_vulnerability(report, config):
+    return _render_placeholder(13, "VULNERABILITY CANDIDATES", config)
+
+
+def _render_14_anomalies(report, config):
+    return _render_placeholder(14, "ANOMALIES", config)
+
+
+def _render_15_evidence(report, config):
+    return _render_placeholder(15, "EVIDENCE", config)
+
+
+def _render_16_confidence(report, config):
+    return _render_placeholder(16, "CONFIDENCE", config)
+
+
+def _render_17_limitations(report, config):
+    return _render_placeholder(17, "LIMITATIONS", config)
+
+
+def _render_18_next_investigation(report, config):
+    return _render_placeholder(18, "NEXT INVESTIGATION", config)
+
+
+def _render_banner(config: Dict[str, Any]):
+    """Stage B2 will implement. Returns None in B1."""
+    return None
+
+
+def _render_target_header(report: Dict[str, Any],
+                          config: Dict[str, Any]):
+    """Stage B2 will implement. Returns None in B1."""
+    return None
+
+
+def _render_footer(config: Dict[str, Any]):
+    """Stage B2 will implement. Returns None in B1."""
+    return None
+
+
+def _render_reports_summary(paths: Dict[str, str],
+                            config: Dict[str, Any]):
+    """Stage B5 will implement. Returns None in B1."""
+    return None
+
+
+def render_all(report: Dict[str, Any],
+               config: Dict[str, Any],
+               export_paths: Optional[Dict[str, str]] = None) -> None:
+    """
+    Render the full report to the terminal (Stage B1 dispatcher).
+
+    Behavior:
+      - Skipped entirely if display is disabled.
+      - Falls back silently if rich is unavailable.
+      - Never raises. Any exception is caught and logged.
+      - Never writes to disk.
+    """
+    try:
+        display_cfg = (config.get("display", {}) or {}) if isinstance(config, dict) else {}
+    except Exception:
+        display_cfg = {}
+    if not isinstance(display_cfg, dict):
+        display_cfg = {}
+    if not display_cfg.get("enabled", True):
+        return
+
+    if not _RICH_AVAILABLE:
+        # Silent fallback: print a single line, do not break the pipeline
+        print("[display] rich not available; skipping rich rendering.")
+        return
+
+    try:
+        console = _console(config)
+        if console is None:
+            return
+
+        # ---- Banner (Stage B2 will implement) ----
+        try:
+            if display_cfg.get("show_banner", True):
+                banner = _render_banner(config)
+                if banner is not None:
+                    console.print(banner)
+        except Exception as e:
+            logging.debug(f"banner render failed: {e}")
+
+        # ---- Target header (Stage B2 will implement) ----
+        try:
+            header = _render_target_header(report, config)
+            if header is not None:
+                console.print(header)
+        except Exception as e:
+            logging.debug(f"header render failed: {e}")
+
+        # ---- Sections ----
+        if display_cfg.get("show_all_sections", True):
+            for number, title, fn_name in SECTION_REGISTRY:
+                try:
+                    fn = globals().get(fn_name)
+                    if not callable(fn):
+                        continue
+                    panel_obj = fn(report, config)
+                    if panel_obj is not None:
+                        console.print(panel_obj)
+                        console.print()  # spacing between sections
+                except Exception as e:
+                    logging.exception(f"Render failed for section {number}: {e}")
+                    try:
+                        console.print(f"[red]Section {number:02d} failed to render.[/red]")
+                    except Exception:
+                        pass
+
+        # ---- Reports summary (Stage B5 will implement) ----
+        try:
+            if display_cfg.get("show_reports_summary", True) and export_paths:
+                summary = _render_reports_summary(export_paths, config)
+                if summary is not None:
+                    console.print(summary)
+        except Exception as e:
+            logging.debug(f"reports summary render failed: {e}")
+
+        # ---- Footer (Stage B2 will implement) ----
+        try:
+            footer = _render_footer(config)
+            if footer is not None:
+                console.print(footer)
+        except Exception as e:
+            logging.debug(f"footer render failed: {e}")
+
+    except Exception as e:
+        # Display must NEVER break the pipeline
+        logging.exception(f"Display failed: {e}")
+
+
 def test_providers(target: str, config: Dict[str, Any]) -> int:
     """
     Test every enabled provider against a single target.
@@ -16128,6 +16552,22 @@ def main() -> int:
                 # Text summary + export paths (recon already exported files)
                 if not getattr(args, "quiet", False):
                     paths = result.get("export_paths", {})
+                    # Terminal display (Stage B1: placeholders only).
+                    # Reports are already on disk; display never blocks them.
+                    try:
+                        _display_cfg = config.get("display", {}) if isinstance(config, dict) else {}
+                    except Exception:
+                        _display_cfg = {}
+                    if not isinstance(_display_cfg, dict):
+                        _display_cfg = {}
+                    _no_display = bool(getattr(args, "no_display", False)) or not _display_cfg.get("enabled", True)
+                    if not _no_display:
+                        try:
+                            _final = result.get("final_report", {}) if isinstance(result, dict) else {}
+                            if isinstance(_final, dict) and _final:
+                                render_all(_final, config, paths if isinstance(paths, dict) else None)
+                        except Exception as e:
+                            logging.debug(f"terminal display skipped: {e}")
                     if isinstance(paths, dict) and paths:
                         for fmt, p in paths.items():
                             print(f"[{fmt}] {p}")

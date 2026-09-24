@@ -661,6 +661,41 @@ logging:
     - "per_provider: one WARNING line per missing provider (legacy behavior)"
     - "off: no warnings for missing keys (silent mode)"
 
+# Terminal display configuration (Stage B1: infrastructure only)
+display:
+  enabled: true
+  mode: "terminal"                # terminal | minimal | quiet
+  show_banner: true
+  show_all_sections: true
+  show_reports_summary: true
+  show_progress: true
+  width: null                     # null = auto-detect terminal width
+  box_style: "rounded"            # rounded | heavy | double | simple | minimal | square | ascii
+  colors:
+    primary: "cyan"
+    accent: "magenta"
+    success: "green"
+    warning: "yellow"
+    danger: "red"
+    muted: "dim"
+    highlight: "bold white"
+    border: "cyan"
+    label: "bold"
+    value: ""
+  labels:
+    very_low: "dim"
+    low: "yellow"
+    moderate: "yellow"
+    high: "red"
+    very_high: "bold red"
+  notes:
+    - "Set enabled: false to disable terminal rendering entirely."
+    - "Set mode: minimal to show only banner and reports summary."
+    - "Set mode: quiet to show only the reports summary."
+    - "width: null means auto-detect. Set an integer to force a fixed width."
+    - "box_style controls the border style of every section."
+    - "colors control the palette used across all sections."
+
 phase_n: {allow_private_targets: false, max_batch: 100, subprocess_timeout: 6.0}
 phase_p2:
   subdomain_enum:
