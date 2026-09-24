@@ -672,6 +672,7 @@ display:
   show_reports_summary: true
   show_progress: true
   banner_style: "block"          # block | compact | none
+  section_spacing: 1              # blank lines between sections (default 1)
   width: null                     # null = auto-detect terminal width
   box_style: "rounded"            # rounded | heavy | double | simple | minimal | square | ascii
   colors:
@@ -698,6 +699,7 @@ display:
     - "width: null means auto-detect. Set an integer to force a fixed width."
     - "box_style controls the border style of every section."
     - "colors control the palette used across all sections."
+    - "section_spacing: number of blank lines between sections (default 1)."
     - "banner_style: block (default) | compact (one-line) | none"
     - "Set show_header: false to hide the target/profile header."
     - "Set show_footer: false to hide the closing footer."

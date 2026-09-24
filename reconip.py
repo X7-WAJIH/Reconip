@@ -15835,6 +15835,85 @@ class Palette:
         return " ".join(parts) if parts else ""
 
 
+_MISSING = "—"  # em-dash for missing values (Stage B3)
+
+
+def _safe(d: Any, *keys: str, default: Any = _MISSING) -> Any:
+    """
+    Safely walk a nested dict and return the value at the path (Stage B3).
+
+    Returns `default` when any key is missing or an intermediate
+    value is not a dict.
+
+    Example:
+      _safe(report, "01_target_profile", "asn") → 15169
+    """
+    if not isinstance(d, dict):
+        return default
+    cur: Any = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return default
+        try:
+            cur = cur.get(k, default)
+        except Exception:
+            return default
+        if cur is _MISSING:
+            return default
+    return cur if cur is not None else default
+
+
+def _present(value: Any) -> str:
+    """
+    Normalize a value for display (Stage B3).
+    - None → "—"; empty list/dict/str → "—"
+    - True/False → "yes"/"no"; otherwise str(value).
+    """
+    if value is None:
+        return _MISSING
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    if isinstance(value, (list, dict)) and not value:
+        return _MISSING
+    if isinstance(value, str) and not value.strip():
+        return _MISSING
+    try:
+        return str(value)
+    except Exception:
+        return _MISSING
+
+
+def _kv_grid(pairs: List[Tuple[str, Any]],
+             config: Dict[str, Any],
+             columns: int = 2) -> "Table":
+    """
+    Build a rich.Table.grid with N label/value column groups (Stage B3).
+    """
+    palette = Palette(config)
+    grid = Table.grid(padding=(0, 2))
+    for _ in range(max(1, columns)):
+        grid.add_column(style=palette.get("muted"), no_wrap=True)
+        grid.add_column(style=palette.get("value") or palette.get("highlight"),
+                        no_wrap=False, overflow="fold")
+
+    # Fill row by row
+    row: List[str] = []
+    for label, value in pairs:
+        row.append(str(label))
+        row.append(_present(value))
+        if len(row) == max(1, columns) * 2:
+            grid.add_row(*row)
+            row = []
+    if row:
+        # Pad the last row
+        while len(row) < max(1, columns) * 2:
+            row.append("")
+        grid.add_row(*row)
+    return grid
+
+
 def _resolve_box(config: Dict[str, Any]):
     """
     Return the rich box constant matching display.box_style (Stage B1).
@@ -15963,27 +16042,613 @@ def _render_placeholder(number: int, title: str,
 # ---- Placeholder section renderers (replaced in B3–B5) ----
 
 def _render_01_target_profile(report, config):
-    return _render_placeholder(1, "TARGET PROFILE", config)
+    """
+    Render Section 01 — TARGET PROFILE (Stage B3).
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        tp = (report.get("01_target_profile", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(tp, dict):
+            tp = {}
+
+        rows: List[Tuple[str, Any]] = [
+            ("Target",       tp.get("target")),
+            ("IP",           tp.get("ip")),
+            ("ASN",          tp.get("asn")),
+            ("ASN Name",     tp.get("asn_name")),
+            ("Country",      tp.get("country")),
+            ("Organization", tp.get("organization")),
+            ("Prefix",       tp.get("prefix")),
+            ("RIR",          tp.get("rir")),
+            ("Anycast",      tp.get("anycast")),
+        ]
+
+        body = _kv_grid(rows, config, columns=2)
+        return section(1, "TARGET PROFILE", body, config)
+    except Exception as e:
+        logging.debug(f"section 01 render failed: {e}")
+        return _render_placeholder(1, "TARGET PROFILE", config)
+
+
+def _score_bar(value: float, config: Dict[str, Any],
+                width: int = 10) -> "Text":
+    """Build a mini bar for a 0–100 score (Stage B3)."""
+    palette = Palette(config)
+    try:
+        v = max(0.0, min(100.0, float(value)))
+    except (TypeError, ValueError):
+        v = 0.0
+    filled = int(round(v / 100.0 * width))
+    filled = max(0, min(width, filled))
+    bar_color = _score_style(v, config)
+    return Text.assemble(
+        ("█" * filled, bar_color),
+        ("░" * (width - filled), palette.get("muted")),
+    )
+
+
+def _score_style(value: float, config: Dict[str, Any]) -> str:
+    """Severity color for a 0–100 score (Stage B3)."""
+    palette = Palette(config)
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return palette.get("muted")
+    if v >= 80:
+        return palette.get("danger")
+    if v >= 60:
+        return palette.get("warning")
+    if v >= 40:
+        return palette.get("primary")
+    return palette.get("muted")
+
+
+def _score_label_from_value(value: float, config: Dict[str, Any]) -> "Text":
+    """Severity label for a 0–100 score (Stage B3)."""
+    palette = Palette(config)
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return Text(_MISSING, style=palette.get("muted"))
+    if v >= 80:
+        label, color = "VERY_HIGH", palette.get("danger")
+    elif v >= 60:
+        label, color = "HIGH", palette.get("warning")
+    elif v >= 40:
+        label, color = "MODERATE", palette.get("primary")
+    elif v >= 20:
+        label, color = "LOW", palette.get("muted")
+    else:
+        label, color = "VERY_LOW", palette.get("muted")
+    return Text(label, style=color)
+
+
+def _assessment_style(label: Any, config: Dict[str, Any]) -> str:
+    """Style for an assessment confidence label (Stage B3)."""
+    palette = Palette(config)
+    if not isinstance(label, str):
+        return palette.get("muted")
+    ll = label.upper()
+    if ll == "HIGH":
+        return palette.get("success")
+    if ll == "MODERATE":
+        return palette.get("warning")
+    if ll == "LOW":
+        return palette.get("muted")
+    if ll == "VERY_LOW":
+        return palette.get("danger")
+    return palette.get("muted")
 
 
 def _render_02_executive_summary(report, config):
-    return _render_placeholder(2, "EXECUTIVE SUMMARY", config)
+    """
+    Render Section 02 — EXECUTIVE SUMMARY (Stage B3).
+
+    Shows assessment confidence + score, six scores with mini bars,
+    and the one-line headline. Read-only: no values are computed.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        ex = (report.get("02_executive_summary", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(ex, dict):
+            ex = {}
+        scores = ex.get("scores", {}) or {}
+        if not isinstance(scores, dict):
+            scores = {}
+        assessment = ex.get("assessment_confidence", _MISSING)
+        assessment_score = ex.get("assessment_score", _MISSING)
+        headline = ex.get("headline", _MISSING)
+
+        # ---- Assessment line ----
+        assessment_line = Text.assemble(
+            ("Assessment Confidence  ", palette.get("muted")),
+            (f"{assessment}", _assessment_style(assessment, config)),
+            ("  ", ""),
+            (f"({assessment_score})" if assessment_score != _MISSING and assessment_score is not None else "",
+             palette.get("muted")),
+        )
+
+        # ---- Scores table with bar ----
+        score_table = Table(
+            show_header=True,
+            header_style=palette.get("muted"),
+            box=None,
+            padding=(0, 1),
+            expand=False,
+        )
+        score_table.add_column("Score", style=palette.get("muted"), no_wrap=True)
+        score_table.add_column("Value", justify="right", no_wrap=True)
+        score_table.add_column("Bar", no_wrap=True)
+        score_table.add_column("Label", no_wrap=True)
+
+        for key, label in (
+            ("threat",         "Threat"),
+            ("infrastructure", "Infrastructure"),
+            ("data_quality",   "Data Quality"),
+            ("exposure",       "Exposure"),
+            ("anomaly",        "Anomaly"),
+            ("coverage",       "Coverage"),
+        ):
+            value = scores.get(key)
+            if value is None:
+                score_table.add_row(label, _MISSING, _MISSING, _MISSING)
+                continue
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                score_table.add_row(label, str(value), _MISSING, _MISSING)
+                continue
+            bar = _score_bar(v, config)
+            lbl = _score_label_from_value(v, config)
+            score_table.add_row(label, f"{v:.1f}", bar, lbl)
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(assessment_line)
+        body.add_row(Text(""))
+        body.add_row(score_table)
+        body.add_row(Text(""))
+        body.add_row(Text.assemble(
+            ("▸ ", palette.get("accent")),
+            (str(headline), palette.get("highlight")),
+        ))
+
+        return section(2, "EXECUTIVE SUMMARY", body, config)
+    except Exception as e:
+        logging.debug(f"section 02 render failed: {e}")
+        return _render_placeholder(2, "EXECUTIVE SUMMARY", config)
+
+
+def _to_float(v: Any) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _component_badges(components: Dict[str, Any],
+                      config: Dict[str, Any]) -> List[str]:
+    """Compact badges for the Data Quality header line (Stage B3)."""
+    badges: List[str] = []
+    try:
+        if "ok_count" in components and "total_evidence" in components:
+            badges.append(f"{components['ok_count']}/{components['total_evidence']} OK")
+        if "freshness_avg" in components:
+            badges.append(f"fresh {_to_float(components['freshness_avg']):.2f}")
+        if "coverage" in components:
+            badges.append(f"cov {_to_float(components['coverage']):.2f}")
+    except Exception:
+        pass
+    return badges
 
 
 def _render_03_data_quality(report, config):
-    return _render_placeholder(3, "DATA QUALITY", config)
+    """
+    Render Section 03 — DATA QUALITY (Stage B3).
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        dq = (report.get("03_data_quality", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(dq, dict):
+            dq = {}
+        score = dq.get("score", _MISSING)
+        components = dq.get("components", {}) or {}
+        if not isinstance(components, dict):
+            components = {}
+        explanation = dq.get("explanation", _MISSING)
+
+        # Score header line
+        score_text = Text.assemble(
+            ("Score  ", palette.get("muted")),
+            (f"{score}", _score_style(_to_float(score), config)),
+            ("  ", ""),
+            ("  ".join(_component_badges(components, config)), ""),
+        )
+
+        # Components breakdown
+        comp_table = Table.grid(padding=(0, 2))
+        comp_table.add_column(style=palette.get("muted"), no_wrap=True)
+        comp_table.add_column(style=palette.get("value") or palette.get("highlight"))
+        for key, label in (
+            ("total_evidence",   "Evidence items"),
+            ("ok_count",         "OK evidence"),
+            ("freshness_avg",    "Freshness avg"),
+            ("status_avg",       "Status avg"),
+            ("coverage",         "Coverage"),
+        ):
+            comp_table.add_row(label, _present(components.get(key)))
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(score_text)
+        body.add_row(Text(""))
+        body.add_row(comp_table)
+        body.add_row(Text(""))
+        body.add_row(Text.assemble(
+            ("▸ ", palette.get("accent")),
+            (str(explanation), palette.get("muted")),
+        ))
+
+        return section(3, "DATA QUALITY", body, config)
+    except Exception as e:
+        logging.debug(f"section 03 render failed: {e}")
+        return _render_placeholder(3, "DATA QUALITY", config)
 
 
 def _render_04_network(report, config):
-    return _render_placeholder(4, "NETWORK INTELLIGENCE", config)
+    """
+    Render Section 04 — NETWORK INTELLIGENCE (Stage B3).
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        net = (report.get("04_network_intelligence", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(net, dict):
+            net = {}
+        asn = net.get("asn", {}) or {}
+        prefix = net.get("prefix", {}) or {}
+        org = net.get("organization", {}) or {}
+        origin = net.get("origin", {}) or {}
+        related = net.get("related_infrastructure", {}) or {}
+        if not isinstance(asn, dict):
+            asn = {}
+        if not isinstance(prefix, dict):
+            prefix = {}
+        if not isinstance(org, dict):
+            org = {}
+        if not isinstance(origin, dict):
+            origin = {}
+        if not isinstance(related, dict):
+            related = {}
+
+        rows: List[Tuple[str, Any]] = [
+            ("ASN",          asn.get("asn")),
+            ("ASN Name",     asn.get("asn_name")),
+            ("ASN Type",     asn.get("type")),
+            ("Country",      asn.get("country")),
+            ("Prefix",       prefix.get("cidr")),
+            ("Prefix Len",   prefix.get("prefix_length")),
+            ("RIR",          prefix.get("rir")),
+            ("Allocated",    prefix.get("allocated")),
+            ("Organization", org.get("name")),
+            ("Abuse Email",  org.get("abuse_email")),
+            ("Origin ASN",   origin.get("origin_asn")),
+            ("Routing",      origin.get("routing_status")),
+        ]
+
+        grid = _kv_grid(rows, config, columns=2)
+
+        # Related infrastructure (optional line)
+        try:
+            siblings = related.get("sibling_prefixes") or []
+        except Exception:
+            siblings = []
+        if siblings:
+            sibs = ", ".join(str(s) for s in siblings[:3])
+            if len(siblings) > 3:
+                sibs += f"  (+{len(siblings) - 3} more)"
+            outer = Table.grid(padding=(0, 0))
+            outer.add_column()
+            outer.add_row(grid)
+            outer.add_row(Text.assemble(
+                ("Related: ", palette.get("muted")),
+                (sibs, palette.get("value") or palette.get("highlight")),
+            ))
+            body = outer
+        else:
+            body = grid
+
+        return section(4, "NETWORK INTELLIGENCE", body, config)
+    except Exception as e:
+        logging.debug(f"section 04 render failed: {e}")
+        return _render_placeholder(4, "NETWORK INTELLIGENCE", config)
+
+
+def _security_flags_line(flags: List[Tuple[str, str, str]],
+                         config: Dict[str, Any]) -> "Text":
+    """Compact SPF/DMARC/CAA flag line (Stage B3)."""
+    palette = Palette(config)
+    parts: List[Tuple[str, str]] = [("Security  ", palette.get("muted"))]
+    first = True
+    for label, value, style in flags:
+        if not first:
+            parts.append(("  ", ""))
+        first = False
+        parts.append((f"{label}:", palette.get("muted")))
+        parts.append((" ", ""))
+        parts.append((str(value), style))
+    return Text.assemble(*parts)
+
+
+def _anomaly_count_style(n: int, config: Dict[str, Any]) -> str:
+    """Severity color for an anomaly count (Stage B3)."""
+    palette = Palette(config)
+    try:
+        count = int(n)
+    except (TypeError, ValueError):
+        return palette.get("muted")
+    if count == 0:
+        return palette.get("success")
+    if count <= 2:
+        return palette.get("warning")
+    return palette.get("danger")
 
 
 def _render_05_dns(report, config):
-    return _render_placeholder(5, "DNS INTELLIGENCE", config)
+    """
+    Render Section 05 — DNS INTELLIGENCE (Stage B3).
+
+    Shows record-type counts, SPF/DMARC/CAA flags, first values per
+    type, and the anomaly count. Read-only.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        dns = (report.get("05_dns_intelligence", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(dns, dict):
+            dns = {}
+        analysis = dns.get("analysis", {}) or {}
+        if not isinstance(analysis, dict):
+            analysis = {}
+        evidence = dns.get("evidence", []) or []
+        if not isinstance(evidence, list):
+            evidence = []
+
+        # ---- Records summary by type ----
+        counts = analysis.get("record_counts", {}) or {}
+        if not isinstance(counts, dict) or not counts:
+            # Fallback: count from evidence
+            counts = {}
+            for ev in evidence:
+                if not isinstance(ev, dict) or ev.get("status") != "OK":
+                    continue
+                try:
+                    rt = (ev.get("metadata", {}) or {}).get("record_type", "UNKNOWN")
+                except Exception:
+                    rt = "UNKNOWN"
+                counts[rt] = counts.get(rt, 0) + 1
+
+        records_line = "  ".join(
+            f"{rt}={counts[rt]}" for rt in sorted(counts)
+        ) or _MISSING
+
+        # ---- Security flags ----
+        security = analysis.get("security", {}) or {}
+        if not isinstance(security, dict):
+            security = {}
+        flags: List[Tuple[str, str, str]] = []  # (label, value, style)
+        for key, label in (
+            ("spf_present",   "SPF"),
+            ("dmarc_present", "DMARC"),
+            ("caa_present",   "CAA"),
+        ):
+            val = security.get(key)
+            if val is True:
+                flags.append((label, "present", palette.get("success")))
+            elif val is False:
+                flags.append((label, "missing", palette.get("warning")))
+            else:
+                flags.append((label, _MISSING, palette.get("muted")))
+
+        # ---- Records of interest ----
+        def _first_value(rtype: str) -> str:
+            for ev in evidence:
+                if not isinstance(ev, dict) or ev.get("status") != "OK":
+                    continue
+                try:
+                    if (ev.get("metadata", {}) or {}).get("record_type") == rtype:
+                        return _present(ev.get("normalized_value"))
+                except Exception:
+                    continue
+            return _MISSING
+
+        rows: List[Tuple[str, Any]] = [
+            ("A",     _first_value("A")),
+            ("AAAA",  _first_value("AAAA")),
+            ("PTR",   _first_value("PTR")),
+            ("NS",    _first_value("NS")),
+            ("MX",    _first_value("MX")),
+            ("CNAME", _first_value("CNAME")),
+            ("TXT",   _first_value("TXT")),
+            ("CAA",   _first_value("CAA")),
+            ("SOA",   _first_value("SOA")),
+        ]
+
+        records_grid = _kv_grid(rows, config, columns=2)
+
+        # ---- Anomaly line ----
+        anomalies = analysis.get("anomalies", []) or []
+        if not isinstance(anomalies, list):
+            anomalies = []
+        anomalies_line = Text.assemble(
+            ("Anomalies  ", palette.get("muted")),
+            (str(len(anomalies)), _anomaly_count_style(len(anomalies), config)),
+        )
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(Text(f"Records  {records_line}", style=palette.get("muted")))
+        body.add_row(_security_flags_line(flags, config))
+        body.add_row(Text(""))
+        body.add_row(records_grid)
+        body.add_row(anomalies_line)
+
+        return section(5, "DNS INTELLIGENCE", body, config)
+    except Exception as e:
+        logging.debug(f"section 05 render failed: {e}")
+        return _render_placeholder(5, "DNS INTELLIGENCE", config)
+
+
+def _short_date(iso: Optional[str]) -> str:
+    """Trim an ISO8601 timestamp to YYYY-MM-DD (Stage B3)."""
+    if not iso:
+        return _MISSING
+    try:
+        s = str(iso).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return str(iso)
+
+
+def _short_fp(fp: Optional[str]) -> str:
+    """Truncate a fingerprint to first8…last8 (Stage B3)."""
+    if not fp:
+        return _MISSING
+    s = str(fp)
+    if len(s) <= 16:
+        return s
+    return s[:8] + "…" + s[-8:]
+
+
+def _key_summary(live: Dict[str, Any]) -> str:
+    """Summarize key type + size (Stage B3)."""
+    try:
+        kt = live.get("key_type")
+        ks = live.get("key_size")
+    except Exception:
+        return _MISSING
+    if kt and ks:
+        return f"{kt} {ks}"
+    if kt:
+        return str(kt)
+    return _MISSING
+
+
+def _count_style(n: int, config: Dict[str, Any]) -> str:
+    """Severity color for a counter (Stage B3)."""
+    palette = Palette(config)
+    try:
+        count = int(n)
+    except (TypeError, ValueError):
+        return palette.get("muted")
+    if count == 0:
+        return palette.get("success")
+    if count <= 1:
+        return palette.get("warning")
+    return palette.get("danger")
 
 
 def _render_06_certificate(report, config):
-    return _render_placeholder(6, "CERTIFICATE INTELLIGENCE", config)
+    """
+    Render Section 06 — CERTIFICATE INTELLIGENCE (Stage B3).
+
+    Shows live certificate summary, SAN preview, and CT counters.
+    Read-only.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        ci = (report.get("06_certificate_intelligence", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(ci, dict):
+            ci = {}
+        live = ci.get("live_certificate") or {}
+        if not isinstance(live, dict):
+            live = {}
+        ct_certs = ci.get("ct_certificates", []) or []
+        if not isinstance(ct_certs, list):
+            ct_certs = []
+        summary = ci.get("summary", {}) or {}
+        if not isinstance(summary, dict):
+            summary = {}
+
+        if not live and not ct_certs:
+            empty = Text("No certificate data available.", style=palette.get("muted"))
+            return section(6, "CERTIFICATE INTELLIGENCE", empty, config)
+
+        # ---- Live certificate rows ----
+        rows: List[Tuple[str, Any]] = []
+        if live:
+            rows.extend([
+                ("Subject CN",  live.get("subject_cn")),
+                ("Issuer CN",   live.get("issuer_cn")),
+                ("Issuer O",    live.get("issuer_o")),
+                ("Valid From",  _short_date(live.get("not_before"))),
+                ("Valid To",    _short_date(live.get("not_after"))),
+                ("Key",         _key_summary(live)),
+                ("Sig Algo",    live.get("signature_algorithm")),
+                ("Wildcard",    live.get("wildcard")),
+                ("Fingerprint", _short_fp(live.get("fingerprint_sha256"))),
+            ])
+        else:
+            rows.append(("Live cert", _MISSING))
+
+        live_grid = _kv_grid(rows, config, columns=2)
+
+        # ---- SAN preview ----
+        try:
+            sans = (live.get("san_domains") or []) if live else []
+        except Exception:
+            sans = []
+        if sans:
+            preview = ", ".join(str(s) for s in sans[:4])
+            if len(sans) > 4:
+                preview += f"  (+{len(sans) - 4} more)"
+            san_line = Text.assemble(
+                ("SANs  ", palette.get("muted")),
+                (preview, palette.get("value") or palette.get("highlight")),
+            )
+        else:
+            san_line = Text.assemble(
+                ("SANs  ", palette.get("muted")),
+                (_MISSING, palette.get("muted")),
+            )
+
+        # ---- Counters ----
+        total_ct = summary.get("total_certificates", len(ct_certs))
+        expired = summary.get("expired_count", 0)
+        weak = summary.get("weak_algo_count", 0)
+        wildcard = summary.get("wildcard_count", 0)
+
+        counters = Text.assemble(
+            ("CT certs  ", palette.get("muted")),
+            (str(total_ct), palette.get("highlight")),
+            ("   Expired  ", palette.get("muted")),
+            (str(expired), _count_style(expired, config)),
+            ("   Weak algo  ", palette.get("muted")),
+            (str(weak), _count_style(weak, config)),
+            ("   Wildcard  ", palette.get("muted")),
+            (str(wildcard), palette.get("highlight")),
+        )
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(live_grid)
+        body.add_row(san_line)
+        body.add_row(counters)
+
+        return section(6, "CERTIFICATE INTELLIGENCE", body, config)
+    except Exception as e:
+        logging.debug(f"section 06 render failed: {e}")
+        return _render_placeholder(6, "CERTIFICATE INTELLIGENCE", config)
 
 
 def _render_07_passive_dns(report, config):
@@ -16329,6 +16994,12 @@ def render_all(report: Dict[str, Any],
             logging.debug(f"header render failed: {e}")
 
         # ---- Sections ----
+        try:
+            spacing = int(display_cfg.get("section_spacing", 1))
+        except Exception:
+            spacing = 1
+        if spacing < 0:
+            spacing = 0
         if display_cfg.get("show_all_sections", True):
             for number, title, fn_name in SECTION_REGISTRY:
                 try:
@@ -16338,7 +17009,8 @@ def render_all(report: Dict[str, Any],
                     panel_obj = fn(report, config)
                     if panel_obj is not None:
                         console.print(panel_obj)
-                        console.print()  # spacing between sections
+                        if spacing > 0:
+                            console.print("\n" * (spacing - 1))
                 except Exception as e:
                     logging.exception(f"Render failed for section {number}: {e}")
                     try:
