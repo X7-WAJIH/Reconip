@@ -8,6 +8,7 @@ import threading, uuid, random, shutil, signal, pathlib
 import hmac, urllib.request, urllib.error, urllib.parse
 import html as _html
 import concurrent.futures
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from urllib.parse import urlparse
 from typing import Dict, List, Optional, Any, Set, Tuple
@@ -33,9 +34,15 @@ try:
         ROUNDED, HEAVY, DOUBLE, SIMPLE, MINIMAL,
         SQUARE, ASCII, ASCII2, ASCII_DOUBLE_HEAD,
     )
+    from rich.progress import (
+        Progress, SpinnerColumn, TextColumn, BarColumn,
+        TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn,
+    )
     _RICH_AVAILABLE = True
+    _RICH_PROGRESS_AVAILABLE = True
 except ImportError:
     _RICH_AVAILABLE = False
+    _RICH_PROGRESS_AVAILABLE = False
 
 # ---- Identity constants (Stage B2, config-overridable) ----
 
@@ -13359,6 +13366,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Generate reports without rendering to the terminal."
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the progress indicator."
+    )
 
     # Legacy single-target / system flags (preserved for backward compat)
     parser.add_argument("-o", "--output", choices=["text", "json"], default="text")
@@ -13429,7 +13441,8 @@ def _apply_cli_overrides(config: Dict[str, Any],
 
 def _process_single_target(target: str,
                            config: Dict[str, Any],
-                           args: argparse.Namespace) -> Dict[str, Any]:
+                           args: argparse.Namespace,
+                           progress=None) -> Dict[str, Any]:
     """
     Process a single target end-to-end.
 
@@ -13439,8 +13452,15 @@ def _process_single_target(target: str,
       - Returns a full report dict, or an error dict.
     Delegates to the existing single-target pipeline (recon) to avoid
     duplication and guarantee parity with single-target workflow.
+
+    progress: optional _NoopProgress/_RichProgress handle (Stage C1).
+      Defaults to a silent no-op; never affects results.
     """
     try:
+        try:
+            progress = progress or _NoopProgress()
+        except Exception:
+            progress = _NoopProgress()
         # Per-target config copy (avoid cross-target leakage)
         try:
             local_config = _deep_copy_config(config)
@@ -13456,7 +13476,8 @@ def _process_single_target(target: str,
         # attack surface, technology, vuln, correlation, history,
         # anomaly, confidence, scoring, final report + export.
         # Use local output_dir/formats if overridden by re-exporting.
-        report = recon(target, enable_db=not bool(getattr(args, "no_db", False)))
+        report = recon(target, enable_db=not bool(getattr(args, "no_db", False)),
+                       progress=progress)
 
         if not isinstance(report, dict):
             return {"target": target, "error": "empty report", "status": "FAILED"}
@@ -13513,9 +13534,13 @@ def _log_batch_progress(current: int, total: int,
 def batch_process(targets: List[str],
                   config: Dict[str, Any],
                   args: argparse.Namespace,
-                  workers: int = 1) -> Dict[str, Any]:
+                  workers: int = 1,
+                  progress=None) -> Dict[str, Any]:
     """
     Process multiple targets.
+
+    progress: optional progress handle forwarded to each target (Stage C1).
+      Defaults to a silent no-op; never affects results.
 
     Returns:
     {
@@ -13524,6 +13549,10 @@ def batch_process(targets: List[str],
         "stats": {...}
     }
     """
+    try:
+        progress = progress or _NoopProgress()
+    except Exception:
+        progress = _NoopProgress()
     results: Dict[str, Any] = {}
     started = datetime.now(timezone.utc)
 
@@ -13549,7 +13578,12 @@ def batch_process(targets: List[str],
             except Exception:
                 pass
             try:
-                results[target] = _process_single_target(target, config, args)
+                progress.update(f"[{i}/{len(targets)}] {target}")
+            except Exception:
+                pass
+            try:
+                results[target] = _process_single_target(target, config, args,
+                                                         progress=progress)
             except Exception as e:
                 logging.exception(f"Target {target} raised: {e}")
                 results[target] = {"target": target, "error": str(e), "status": "FAILED"}
@@ -13557,7 +13591,7 @@ def batch_process(targets: List[str],
         # Parallel
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_target = {
-                executor.submit(_process_single_target, t, config, args): t
+                executor.submit(_process_single_target, t, config, args, progress): t
                 for t in targets
             }
             completed = 0
@@ -13772,7 +13806,7 @@ def export_batch_summary(summary: Dict[str, Any],
 # ============================================================
 #  RECON (MAIN FLOW) — v21.3 with Phase 2
 # ============================================================
-def recon(target, enable_db=True, parallel=None):
+def recon(target, enable_db=True, parallel=None, progress=None):
     try:
         normalized, _k = validate_target(target, allow_private=PN["allow_private_targets"])
     except SecurityError as e:
@@ -13798,6 +13832,13 @@ def recon(target, enable_db=True, parallel=None):
             return out
     out["ip"] = ip
     evs = []; cert_ci = None; threat_obs = []
+
+    # Live progress (Stage C1): additive markers only, never logic.
+    try:
+        progress = progress or _NoopProgress()
+    except Exception:
+        progress = _NoopProgress()
+    progress.start("01/13 DNS Intelligence")
 
     if parallel:
         res = collect_parallel(ip, domain)
@@ -13876,6 +13917,7 @@ def recon(target, enable_db=True, parallel=None):
 
     threat_obs, threat_st = threat_res if len(threat_res) == 2 \
         else ([], MS.SKIPPED.value)
+    progress.next("02/13 Threat Intelligence")
     threat_agg = agg_threat(threat_obs)
     evs += threat_evs(ip, threat_obs)
     out["module_statuses"]["threat"] = threat_st
@@ -14007,6 +14049,7 @@ def recon(target, enable_db=True, parallel=None):
     ni = network_intel(ip, domain, evs, trusted, cert_ci)
 
     # Stage 7: Certificate Intelligence 2.0 — v34 (single source of truth)
+    progress.next("03/13 Certificate")
     try:
         cert_intel = certificate_intelligence(target, CFG)
     except Exception as e:
@@ -14030,6 +14073,7 @@ def recon(target, enable_db=True, parallel=None):
     _merged_cert_intel.update(cert_intel)
 
     # Stage 8: Passive DNS Intelligence — v34.1 (single source of truth)
+    progress.next("04/13 Passive DNS")
     try:
         pdns_intel = passive_dns_intelligence(target, CFG)
     except Exception as e:
@@ -14051,6 +14095,7 @@ def recon(target, enable_db=True, parallel=None):
                       "related_domains": [], "anomalies": [], "summary": {}}
 
     # Stage 6: Infrastructure Intelligence — v33.1
+    progress.next("05/13 Infrastructure")
     try:
         infra = infra_profile(target, CFG)
         out["infrastructure_intelligence"] = infra
@@ -14241,6 +14286,7 @@ def recon(target, enable_db=True, parallel=None):
     })
 
     # Stage 9: Historical Intelligence — v35 (single source of truth)
+    progress.next("06/13 History")
     # Snapshot must be taken after all sections are built.
     try:
         history_intel = historical_intelligence(target, out, CFG)
@@ -14254,6 +14300,7 @@ def recon(target, enable_db=True, parallel=None):
     out["historical_intelligence"] = history_intel
 
     # Stage 10: Correlation Engine — v36 (single source of truth)
+    progress.next("07/13 Correlation")
     # Called after all other sections; reads only, modifies none.
     try:
         correlation = correlate([out], [target], CFG)
@@ -14267,6 +14314,7 @@ def recon(target, enable_db=True, parallel=None):
     out["correlation_intelligence"] = correlation
 
     # Stage 11: Attack Surface Intelligence — v37 (passive by default)
+    progress.next("08/13 Attack Surface")
     # Reads infrastructure/certificate sections; OPEN != VULNERABLE.
     try:
         as_intel = attack_surface(target, out, CFG)
@@ -14288,6 +14336,7 @@ def recon(target, enable_db=True, parallel=None):
     out["attack_surface_intelligence"] = as_intel
 
     # Stage 12: Technology Fingerprinting — v38 (passive by default)
+    progress.next("09/13 Technology")
     # Reads attack surface services; never guesses a version.
     try:
         tech_intel = technology_intelligence(out, CFG)
@@ -14305,6 +14354,7 @@ def recon(target, enable_db=True, parallel=None):
     out["technology_intelligence"] = tech_intel
 
     # Stage 13: Vulnerability Intelligence — v39 (candidates only)
+    progress.next("10/13 Vulnerability")
     # Reads technology fingerprints; candidate != confirmed.
     try:
         vuln_intel = vulnerability_candidates(out, CFG)
@@ -14330,6 +14380,7 @@ def recon(target, enable_db=True, parallel=None):
     out["vulnerability_intelligence"] = vuln_intel
 
     # Stage 14: Anomaly Detection Engine — v40 (deviation, not verdict)
+    progress.next("11/13 Anomaly")
     # Reads all prior sections; must run last before persistence.
     try:
         anomaly_intel = anomaly_report(out, CFG)
@@ -14347,6 +14398,7 @@ def recon(target, enable_db=True, parallel=None):
     out["anomaly_intelligence"] = anomaly_intel
 
     # Stage 15: Confidence Engine — v41 (four separate metrics)
+    progress.next("12/13 Confidence")
     # Must be computed last, after all other sections are populated.
     try:
         confidence = confidence_engine(out, CFG)
@@ -14365,6 +14417,7 @@ def recon(target, enable_db=True, parallel=None):
         pass
 
     # Stage 16: Intelligence Scoring — v41.1 (six explainable scores)
+    progress.next("13/13 Scoring")
     # Must be computed last, after all other sections and confidence are populated.
     try:
         scoring = compute_scores(out, CFG)
@@ -14383,6 +14436,7 @@ def recon(target, enable_db=True, parallel=None):
         out["cache_intelligence"] = {"enabled": False, "error": str(e)}
 
     # Stage 17: Final Intelligence Report — v42 (18 sections + exports)
+    progress.done()
     # Must be computed last, after all intelligence and scoring.
     try:
         final_report = generate_report(target, out, CFG)
@@ -15833,6 +15887,161 @@ class Palette:
         except Exception:
             return ""
         return " ".join(parts) if parts else ""
+
+
+class _NoopProgress:
+    """
+    A silent no-op progress handle (Stage C1).
+
+    Used when progress is disabled, when stdout is not a TTY,
+    or when rich is unavailable. Pipeline code calls it uniformly.
+    """
+    def start(self, name: str) -> None:
+        pass
+
+    def next(self, name: str) -> None:
+        pass
+
+    def update(self, name: str) -> None:
+        pass
+
+    def done(self) -> None:
+        pass
+
+    def note(self, message: str) -> None:
+        pass
+
+
+class _RichProgress:
+    """
+    A real progress handle wrapping a rich Progress instance (Stage C1).
+    """
+    def __init__(self, progress: "Progress", task_id: Any, total: int = 0):
+        self._progress = progress
+        self._task_id = task_id
+        try:
+            self._total = int(total)
+        except Exception:
+            self._total = 0
+
+    def start(self, name: str) -> None:
+        self._progress.update(self._task_id, description=name)
+
+    def next(self, name: str) -> None:
+        self._progress.update(self._task_id, advance=1, description=name)
+
+    def update(self, name: str) -> None:
+        self._progress.update(self._task_id, description=name)
+
+    def done(self) -> None:
+        try:
+            if self._total > 0:
+                self._progress.update(self._task_id, completed=self._total,
+                                      description="Done")
+            else:
+                self._progress.update(self._task_id, description="Done")
+        except Exception:
+            pass
+
+    def note(self, message: str) -> None:
+        try:
+            self._progress.console.log(message)
+        except Exception:
+            pass
+
+
+def _progress_wanted(config: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    True when a live progress bar should be shown (Stage C1).
+
+    Suppressed by: display.enabled=false, display.show_progress=false,
+    display.mode=quiet, batch quiet mode. Requires a TTY unless
+    display.force_progress is true. Never raises.
+    """
+    try:
+        dcfg = (config.get("display", {}) or {}) if isinstance(config, dict) else {}
+        if not isinstance(dcfg, dict):
+            return False
+        if not dcfg.get("enabled", True):
+            return False
+        if not dcfg.get("show_progress", True):
+            return False
+        if str(dcfg.get("mode", "terminal")) == "quiet":
+            return False
+        try:
+            if isinstance(config, dict) and bool((config.get("batch", {}) or {}).get("quiet", False)):
+                return False
+        except Exception:
+            pass
+        if bool(dcfg.get("force_progress", False)):
+            return True
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+@contextmanager
+def _progress_context(config: Dict[str, Any],
+                      total_stages: int,
+                      stage_name: str = "Scan"):
+    """
+    Yield a progress handle suitable for the current environment (Stage C1).
+
+    Yields _RichProgress on an interactive TTY, else _NoopProgress.
+    The rich bar is transient: it clears itself when the context exits.
+    Never raises; never writes reports; never touches the pipeline.
+    """
+    if not _progress_wanted(config):
+        yield _NoopProgress()
+        return
+    if not _RICH_AVAILABLE or not _RICH_PROGRESS_AVAILABLE:
+        yield _NoopProgress()
+        return
+
+    try:
+        palette = Palette(config)
+    except Exception:
+        yield _NoopProgress()
+        return
+    try:
+        dcfg = (config.get("display", {}) or {}) if isinstance(config, dict) else {}
+        refresh = int(dcfg.get("progress_refresh_per_second", 10))
+    except Exception:
+        refresh = 10
+    if refresh < 1:
+        refresh = 1
+    if refresh > 60:
+        refresh = 60
+
+    try:
+        progress = Progress(
+            SpinnerColumn(style=palette.get("accent")),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(
+                bar_width=None,
+                style=palette.get("muted"),
+                complete_style=palette.get("success"),
+            ),
+            MofNCompleteColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            transient=True,
+            refresh_per_second=refresh,
+            console=_console(config),
+        )
+        task_id = progress.add_task(stage_name, total=total_stages)
+        handle = _RichProgress(progress, task_id, total=total_stages)
+    except Exception:
+        yield _NoopProgress()
+        return
+
+    try:
+        with progress:
+            yield handle
+    finally:
+        # progress.__exit__ clears the transient display
+        pass
 
 
 _MISSING = "—"  # em-dash for missing values (Stage B3)
@@ -18641,6 +18850,15 @@ def main() -> int:
     except Exception as e:
         log.debug(f"profile sync: {e}")
 
+    # ---- Progress CLI overrides (Stage C1; config holds the defaults) ----
+    try:
+        if getattr(args, "no_progress", False):
+            config.setdefault("display", {})["show_progress"] = False
+        if getattr(args, "no_display", False):
+            config.setdefault("display", {})["show_progress"] = False
+    except Exception:
+        pass
+
     # ---- List-providers mode (Stage A3: instant, read-only discovery) ----
     if getattr(args, "list_providers", False):
         try:
@@ -18818,7 +19036,10 @@ def main() -> int:
     if len(targets) == 1 and not getattr(args, "batch", False):
         # Single-target mode (v42 behavior preserved via _process_single_target)
         _scan_start = time.time()
-        result = _process_single_target(targets[0], config, args)
+        with _progress_context(config, total_stages=13,
+                               stage_name=f"Scanning {targets[0]}") as _progress:
+            result = _process_single_target(targets[0], config, args,
+                                            progress=_progress)
         try:
             _scan_duration = time.time() - _scan_start
         except Exception:
@@ -18903,7 +19124,17 @@ def main() -> int:
         workers = int(batch_cfg.get("max_workers", 4))
     workers = max(1, min(workers, hard))
 
-    batch_result = batch_process(targets, config, args, workers=workers)
+    # Progress forces sequential execution to avoid interleaved output (C1).
+    if _progress_wanted(config) and workers > 1:
+        if not getattr(args, "quiet", False):
+            print("[progress] forcing workers=1 to avoid interleaved output",
+                  file=sys.stderr)
+        workers = 1
+
+    with _progress_context(config, total_stages=13,
+                           stage_name=f"Batch ({len(targets)} targets)") as _bprogress:
+        batch_result = batch_process(targets, config, args, workers=workers,
+                                     progress=_bprogress)
 
     # Cross-target correlation
     batch_corr = {"enabled": False}

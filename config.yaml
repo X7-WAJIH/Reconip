@@ -671,6 +671,8 @@ display:
   show_all_sections: true
   show_reports_summary: true
   show_progress: true
+  force_progress: false           # show progress even when stdout is not a TTY
+  progress_refresh_per_second: 10 # progress redraw rate (rich default)
   banner_style: "block"          # block | compact | none
   section_spacing: 1              # blank lines between sections (default 1)
   width: null                     # null = auto-detect terminal width
@@ -700,6 +702,9 @@ display:
     - "box_style controls the border style of every section."
     - "colors control the palette used across all sections."
     - "section_spacing: number of blank lines between sections (default 1)."
+    - "show_progress: show a transient spinner and progress bar during the pipeline."
+    - "force_progress: show progress even when stdout is not a TTY."
+    - "In batch mode with parallel workers, progress forces workers=1."
     - "banner_style: block (default) | compact (one-line) | none"
     - "Set show_header: false to hide the target/profile header."
     - "Set show_footer: false to hide the closing footer."
