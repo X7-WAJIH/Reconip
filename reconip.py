@@ -16038,7 +16038,10 @@ SECTION_REGISTRY: List[Tuple[int, str, str]] = [
 def _render_placeholder(number: int, title: str,
                         config: Dict[str, Any]) -> Optional["Panel"]:
     """
-    A placeholder section renderer for stages B3–B5 to replace (Stage B1).
+    Fallback renderer for sections that are not yet implemented (Stage B1).
+
+    Should not be reached after Stage B5, but is kept as a safety net
+    so render_all() never crashes on a missing renderer.
     """
     if not _RICH_AVAILABLE:
         return None
@@ -17432,28 +17435,598 @@ def _render_12_technology(report, config):
         return _render_placeholder(12, "TECHNOLOGY", config)
 
 
+def _section_summary_line(pairs: List[Tuple[str, Any]],
+                          config: Dict[str, Any]) -> "Text":
+    """
+    Build a one-line summary from (label, value) pairs (Stage B5).
+    """
+    palette = Palette(config)
+    parts: List[Tuple[str, str]] = []
+    for i, (label, value) in enumerate(pairs):
+        if i > 0:
+            parts.append(("   ", ""))
+        parts.append((f"{label} ", palette.get("muted")))
+        parts.append((_present(value), palette.get("highlight")))
+    return Text.assemble(*parts)
+
+
+def _cve_severity_label(sev: Any) -> str:
+    """CVSS float → severity label (Stage B5)."""
+    try:
+        v = float(sev)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if v >= 9.0:
+        return "CRITICAL"
+    if v >= 7.0:
+        return "HIGH"
+    if v >= 4.0:
+        return "MEDIUM"
+    if v > 0:
+        return "LOW"
+    return "UNKNOWN"
+
+
+def _cve_severity_key(sev: Any) -> str:
+    """CVSS float → severity key for styling (Stage B5)."""
+    try:
+        v = float(sev)
+    except (TypeError, ValueError):
+        return "informational"
+    if v >= 9.0:
+        return "critical"
+    if v >= 7.0:
+        return "high"
+    if v >= 4.0:
+        return "moderate"
+    if v > 0:
+        return "low"
+    return "informational"
+
+
+def _candidate_status_style(status: Any, config: Dict[str, Any]) -> str:
+    """Status color for a vulnerability candidate row (Stage B5)."""
+    palette = Palette(config)
+    s = str(status).upper()
+    if s == "CANDIDATE":
+        return palette.get("warning")
+    if s == "NEEDS_VALIDATION":
+        return palette.get("accent")
+    if s == "CONFIRMED":
+        return palette.get("danger")
+    return palette.get("muted")
+
+
 def _render_13_vulnerability(report, config):
-    return _render_placeholder(13, "VULNERABILITY CANDIDATES", config)
+    """
+    Render Section 13 — VULNERABILITY CANDIDATES (Stage B5). Read-only.
+
+    A candidate is not a confirmed vulnerability: the warning note is
+    always shown.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        vuln = (report.get("13_vulnerability_candidates", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(vuln, dict):
+            vuln = {}
+        candidates = vuln.get("candidates", []) or []
+        summary = vuln.get("summary", {}) or {}
+        if not isinstance(candidates, list):
+            candidates = []
+        if not isinstance(summary, dict):
+            summary = {}
+
+        if not candidates:
+            body = Text.assemble(
+                ("No vulnerability candidates identified.", palette.get("muted")),
+                "\n",
+                ("Reason: no technology with a confident version was identified.",
+                 palette.get("muted")),
+            )
+            return section(13, "VULNERABILITY CANDIDATES", body, config)
+
+        # ---- Summary line ----
+        by_sev = summary.get("by_severity", {}) or {}
+        if not isinstance(by_sev, dict):
+            by_sev = {}
+        try:
+            total_c = int(summary.get("candidates", len(candidates)))
+        except (TypeError, ValueError):
+            total_c = len(candidates)
+        summary_line = Text.assemble(
+            ("Candidates  ", palette.get("muted")),
+            (str(total_c), palette.get("highlight")),
+            ("   ", ""),
+            ("critical=", palette.get("muted")),
+            (str(by_sev.get("critical", 0)), _sev_style("critical", config)),
+            ("  ", ""),
+            ("high=", palette.get("muted")),
+            (str(by_sev.get("high", 0)), _sev_style("high", config)),
+            ("  ", ""),
+            ("medium=", palette.get("muted")),
+            (str(by_sev.get("medium", 0)), _sev_style("moderate", config)),
+            ("  ", ""),
+            ("low=", palette.get("muted")),
+            (str(by_sev.get("low", 0)), _sev_style("low", config)),
+        )
+
+        # ---- Candidate table (top 8) ----
+        table = Table(
+            show_header=True,
+            header_style=palette.get("muted"),
+            box=None,
+            padding=(0, 1),
+            expand=False,
+        )
+        table.add_column("Severity", no_wrap=True)
+        table.add_column("CVE", style=palette.get("highlight"), no_wrap=True)
+        table.add_column("Product", style=palette.get("value") or "")
+        table.add_column("Version", no_wrap=True)
+        table.add_column("Status", no_wrap=True)
+
+        for c in candidates[:8]:
+            if not isinstance(c, dict):
+                continue
+            sev = c.get("severity")
+            sev_label = _cve_severity_label(sev)
+            sev_style = _sev_style(_cve_severity_key(sev), config)
+            try:
+                tech = c.get("technology", {}) or {}
+            except Exception:
+                tech = {}
+            if not isinstance(tech, dict):
+                tech = {}
+            table.add_row(
+                Text(sev_label, style=sev_style),
+                str(c.get("cve", _MISSING)),
+                str(tech.get("product", _MISSING)),
+                str(tech.get("version") or _MISSING),
+                Text(str(c.get("status", "CANDIDATE")),
+                     style=_candidate_status_style(c.get("status"), config)),
+            )
+
+        if len(candidates) > 8:
+            table.add_row(f"[dim]+{len(candidates) - 8} more[/dim]",
+                          "", "", "", "")
+
+        # ---- Candidate vs confirmed note ----
+        note = Text(
+            "A candidate is not a confirmed vulnerability. Validation required.",
+            style=palette.get("warning"),
+        )
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(summary_line)
+        body.add_row(Text(""))
+        body.add_row(table)
+        body.add_row(note)
+
+        return section(13, "VULNERABILITY CANDIDATES", body, config)
+    except Exception as e:
+        logging.debug(f"section 13 render failed: {e}")
+        return _render_placeholder(13, "VULNERABILITY CANDIDATES", config)
 
 
 def _render_14_anomalies(report, config):
-    return _render_placeholder(14, "ANOMALIES", config)
+    """
+    Render Section 14 — ANOMALIES (Stage B5). Read-only.
+
+    An anomaly is a deviation, not a verdict.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        an = (report.get("14_anomalies", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(an, dict):
+            an = {}
+        checks = an.get("checks_executed", []) or []
+        by_sev = an.get("by_severity", {}) or {}
+        by_cat = an.get("by_category", {}) or {}
+        anomalies = an.get("anomalies", []) or []
+        if not isinstance(checks, list):
+            checks = []
+        if not isinstance(by_sev, dict):
+            by_sev = {}
+        if not isinstance(by_cat, dict):
+            by_cat = {}
+        if not isinstance(anomalies, list):
+            anomalies = []
+
+        # ---- Checks + severity line ----
+        checks_line = Text.assemble(
+            ("Checks executed  ", palette.get("muted")),
+            (str(len(checks)), palette.get("highlight")),
+            ("   ", ""),
+            ("HIGH=", palette.get("muted")),
+            (str(by_sev.get("HIGH", 0)), _sev_style("high", config)),
+            ("  ", ""),
+            ("MODERATE=", palette.get("muted")),
+            (str(by_sev.get("MODERATE", 0)), _sev_style("moderate", config)),
+            ("  ", ""),
+            ("LOW=", palette.get("muted")),
+            (str(by_sev.get("LOW", 0)), _sev_style("low", config)),
+            ("  ", ""),
+            ("INFO=", palette.get("muted")),
+            (str(by_sev.get("INFORMATIONAL", 0)), palette.get("muted")),
+        )
+
+        # ---- Empty state ----
+        if not anomalies:
+            body = Table.grid(padding=(0, 0))
+            body.add_column()
+            body.add_row(checks_line)
+            body.add_row(Text("No anomalies detected. All checks passed.",
+                              style=palette.get("success")))
+            return section(14, "ANOMALIES", body, config)
+
+        # ---- Category line ----
+        if by_cat:
+            cat_line = Text.assemble(
+                ("Categories  ", palette.get("muted")),
+                (_truncate_list(
+                    [f"{k}={v}" for k, v in sorted(by_cat.items())],
+                    limit=6,
+                ), palette.get("value") or palette.get("highlight")),
+            )
+        else:
+            cat_line = Text("")
+
+        # ---- Anomaly table (top 10) ----
+        table = Table(
+            show_header=True,
+            header_style=palette.get("muted"),
+            box=None,
+            padding=(0, 1),
+            expand=False,
+        )
+        table.add_column("Severity", no_wrap=True)
+        table.add_column("Category", style=palette.get("muted"), no_wrap=True)
+        table.add_column("Message", style=palette.get("value") or "")
+        table.add_column("Conf", justify="right", no_wrap=True)
+
+        for a in anomalies[:10]:
+            if not isinstance(a, dict):
+                continue
+            sev = a.get("severity", "INFORMATIONAL")
+            try:
+                conf = float(a.get("confidence", 0.0))
+                conf_s = f"{conf:.2f}"
+            except (TypeError, ValueError):
+                conf_s = _MISSING
+            table.add_row(
+                Text(str(sev), style=_sev_style(str(sev).lower(), config)),
+                str(a.get("category", _MISSING)),
+                str(a.get("message", ""))[:80],
+                conf_s,
+            )
+
+        if len(anomalies) > 10:
+            table.add_row(f"[dim]+{len(anomalies) - 10} more[/dim]",
+                          "", "", "")
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(checks_line)
+        body.add_row(cat_line)
+        body.add_row(Text(""))
+        body.add_row(table)
+
+        return section(14, "ANOMALIES", body, config)
+    except Exception as e:
+        logging.debug(f"section 14 render failed: {e}")
+        return _render_placeholder(14, "ANOMALIES", config)
 
 
 def _render_15_evidence(report, config):
-    return _render_placeholder(15, "EVIDENCE", config)
+    """
+    Render Section 15 — EVIDENCE (Stage B5). Read-only.
+
+    Summarizes the evidence index; never dumps raw items.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        ev = (report.get("15_evidence", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(ev, dict):
+            ev = {}
+        try:
+            total = int(ev.get("total", 0))
+        except (TypeError, ValueError):
+            total = 0
+        by_status = ev.get("by_status", {}) or {}
+        by_source = ev.get("by_source", {}) or {}
+        if not isinstance(by_status, dict):
+            by_status = {}
+        if not isinstance(by_source, dict):
+            by_source = {}
+
+        if total == 0:
+            body = Text("No evidence collected.", style=palette.get("muted"))
+            return section(15, "EVIDENCE", body, config)
+
+        # ---- Total line ----
+        total_line = Text.assemble(
+            ("Total items  ", palette.get("muted")),
+            (str(total), palette.get("highlight")),
+        )
+
+        # ---- Status breakdown ----
+        status_parts: List[Tuple[str, str]] = []
+        for status in ("OK", "FAILED", "NOT_CONFIGURED", "PARTIAL", "DISABLED"):
+            try:
+                count = int(by_status.get(status, 0))
+            except (TypeError, ValueError):
+                count = 0
+            if count == 0:
+                continue
+            style = _provider_status_style(status, config)
+            status_parts.append(("   ", ""))
+            status_parts.append((f"{status}=", palette.get("muted")))
+            status_parts.append((str(count), style))
+        status_line = Text.assemble(*status_parts) if status_parts else Text("")
+
+        # ---- Source breakdown ----
+        if by_source:
+            source_line = Text.assemble(
+                ("By source  ", palette.get("muted")),
+                (_truncate_list(
+                    [f"{k}={v}" for k, v in sorted(by_source.items())],
+                    limit=8,
+                ), palette.get("value") or palette.get("highlight")),
+            )
+        else:
+            source_line = Text("")
+
+        # ---- Note ----
+        note = Text(
+            "Evidence is the foundation of every claim in this report.",
+            style=palette.get("muted"),
+        )
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(total_line)
+        body.add_row(status_line)
+        body.add_row(source_line)
+        body.add_row(note)
+
+        return section(15, "EVIDENCE", body, config)
+    except Exception as e:
+        logging.debug(f"section 15 render failed: {e}")
+        return _render_placeholder(15, "EVIDENCE", config)
+
+
+def _style_label(label: Any, config: Dict[str, Any]) -> "Text":
+    """
+    Style a score label (VERY_LOW / LOW / MODERATE / HIGH / VERY_HIGH).
+    Accepts a plain label or an existing Text (Stage B5).
+    """
+    palette = Palette(config)
+    try:
+        s = str(label).upper()
+    except Exception:
+        s = "UNKNOWN"
+    if s == "VERY_HIGH":
+        return Text(s, style=palette.get("danger"))
+    if s == "HIGH":
+        return Text(s, style=palette.get("warning"))
+    if s == "MODERATE":
+        return Text(s, style=palette.get("primary"))
+    if s == "LOW":
+        return Text(s, style=palette.get("muted"))
+    return Text(s, style=palette.get("muted"))
 
 
 def _render_16_confidence(report, config):
-    return _render_placeholder(16, "CONFIDENCE", config)
+    """
+    Render Section 16 — CONFIDENCE (Stage B5). Read-only.
+
+    Confidence is a self-assessment, not accuracy.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        conf = (report.get("16_confidence", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(conf, dict):
+            conf = {}
+        data = conf.get("data_confidence", {}) or {}
+        threat = conf.get("threat_confidence", {}) or {}
+        geo = conf.get("geo_confidence", {}) or {}
+        assessment = conf.get("assessment_confidence", {}) or {}
+        for _d in (data, threat, geo, assessment):
+            if not isinstance(_d, dict):
+                _d = {}
+
+        # ---- Confidence table ----
+        table = Table(
+            show_header=True,
+            header_style=palette.get("muted"),
+            box=None,
+            padding=(0, 1),
+            expand=False,
+        )
+        table.add_column("Metric", style=palette.get("muted"))
+        table.add_column("Score", justify="right")
+        table.add_column("Bar", no_wrap=True)
+        table.add_column("Label", no_wrap=True)
+
+        for label, entry in (
+            ("Data Confidence",       data),
+            ("Threat Confidence",     threat),
+            ("Geo Confidence",        geo),
+            ("Assessment Confidence", assessment),
+        ):
+            score = entry.get("score")
+            if score is None:
+                table.add_row(label, _MISSING, _MISSING, _MISSING)
+                continue
+            s = _to_float(score)
+            value_0_100 = s * 100.0
+            bar = _score_bar(value_0_100, config)
+            lbl = entry.get("label") or _score_label_from_value(value_0_100, config)
+            table.add_row(label, f"{s:.2f}", bar, _style_label(lbl, config))
+
+        # ---- Assessment headline ----
+        assessment_label = assessment.get("label", _MISSING)
+        assessment_score = assessment.get("score")
+        headline = Text.assemble(
+            ("Assessment  ", palette.get("muted")),
+            (str(assessment_label), _assessment_style(assessment_label, config)),
+            ("  ", ""),
+            (f"({assessment_score})" if assessment_score is not None else "",
+             palette.get("muted")),
+        )
+
+        # ---- Note ----
+        note = Text(
+            "Confidence is not accuracy. A low-confidence report is an honest one.",
+            style=palette.get("muted"),
+        )
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(table)
+        body.add_row(headline)
+        body.add_row(note)
+
+        return section(16, "CONFIDENCE", body, config)
+    except Exception as e:
+        logging.debug(f"section 16 render failed: {e}")
+        return _render_placeholder(16, "CONFIDENCE", config)
+
+
+def _interleave_newlines(items: List["Text"]) -> List[Any]:
+    """
+    Interleave a list of Text with newline separators (Stage B5).
+    """
+    out: List[Any] = []
+    for i, t in enumerate(items):
+        if i > 0:
+            out.append("\n")
+        out.append(t)
+    return out
 
 
 def _render_17_limitations(report, config):
-    return _render_placeholder(17, "LIMITATIONS", config)
+    """
+    Render Section 17 — LIMITATIONS (Stage B5). Read-only.
+
+    Never truncated: every limitation is a boundary of what the tool
+    claims, so all lines are shown.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        lim = (report.get("17_limitations", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(lim, dict):
+            lim = {}
+        limitations = lim.get("limitations", []) or []
+        if not isinstance(limitations, list):
+            limitations = []
+
+        if not limitations:
+            body = Text("No limitations recorded.",
+                        style=palette.get("muted"))
+            return section(17, "LIMITATIONS", body, config)
+
+        # ---- Bullet list (complete, never truncated) ----
+        lines: List[Text] = []
+        for item in limitations:
+            lines.append(Text.assemble(
+                ("• ", palette.get("accent")),
+                (str(item), palette.get("value") or ""),
+            ))
+
+        if len(lines) == 1:
+            body = lines[0]
+        else:
+            body = Text.assemble(*_interleave_newlines(lines))
+
+        return section(17, "LIMITATIONS", body, config)
+    except Exception as e:
+        logging.debug(f"section 17 render failed: {e}")
+        return _render_placeholder(17, "LIMITATIONS", config)
+
+
+def _priority_style(priority: Any, config: Dict[str, Any]) -> str:
+    """Severity color for a next-step priority (Stage B5)."""
+    palette = Palette(config)
+    p = str(priority).lower()
+    if p == "high":
+        return palette.get("danger")
+    if p == "moderate":
+        return palette.get("warning")
+    if p == "low":
+        return palette.get("primary")
+    return palette.get("muted")
 
 
 def _render_18_next_investigation(report, config):
-    return _render_placeholder(18, "NEXT INVESTIGATION", config)
+    """
+    Render Section 18 — NEXT INVESTIGATION (Stage B5). Read-only.
+
+    Preserves the report's priority order; never re-sorts here.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        ni = (report.get("18_next_investigation", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(ni, dict):
+            ni = {}
+        steps = ni.get("next_investigation", []) or []
+        if not isinstance(steps, list):
+            steps = []
+
+        if not steps:
+            body = Text("No next steps suggested.",
+                        style=palette.get("muted"))
+            return section(18, "NEXT INVESTIGATION", body, config)
+
+        # ---- Table ----
+        table = Table(
+            show_header=True,
+            header_style=palette.get("muted"),
+            box=None,
+            padding=(0, 1),
+            expand=True,
+        )
+        table.add_column("Priority", no_wrap=True)
+        table.add_column("Action", style=palette.get("value") or "", overflow="fold")
+        table.add_column("Reason", style=palette.get("muted"), overflow="fold")
+
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            priority = step.get("priority", "informational")
+            table.add_row(
+                Text(str(priority).upper(), style=_priority_style(priority, config)),
+                str(step.get("action", _MISSING)),
+                str(step.get("reason", _MISSING)),
+            )
+
+        # ---- Note ----
+        note = Text(
+            "These are suggested steps. The analyst decides the scope.",
+            style=palette.get("muted"),
+        )
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(table)
+        body.add_row(note)
+
+        return section(18, "NEXT INVESTIGATION", body, config)
+    except Exception as e:
+        logging.debug(f"section 18 render failed: {e}")
+        return _render_placeholder(18, "NEXT INVESTIGATION", config)
 
 
 def _render_banner(config: Dict[str, Any]) -> Optional["Panel"]:
@@ -17694,8 +18267,55 @@ def _render_footer(config: Dict[str, Any]) -> Optional["Text"]:
 
 def _render_reports_summary(paths: Dict[str, str],
                             config: Dict[str, Any]):
-    """Stage B5 will implement. Returns None in B1."""
-    return None
+    """
+    Render the reports summary panel, numbered 00 (Stage B5). Read-only.
+
+    Args:
+      paths: mapping of {format: filepath}.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        if not paths or not isinstance(paths, dict):
+            return None
+        palette = Palette(config)
+
+        table = Table(
+            show_header=True,
+            header_style=palette.get("muted"),
+            box=None,
+            padding=(0, 1),
+            expand=False,
+        )
+        table.add_column("Format", style=palette.get("accent"), no_wrap=True)
+        table.add_column("Path", style=palette.get("value") or "")
+
+        # Stable order
+        order = ["json", "html", "markdown", "csv", "stix", "misp"]
+        seen = set()
+        for fmt in order:
+            if fmt in paths:
+                table.add_row(fmt.upper(), str(paths[fmt]))
+                seen.add(fmt)
+        # Any remaining formats not in the canonical order
+        for fmt, path in paths.items():
+            if fmt in seen:
+                continue
+            table.add_row(str(fmt).upper(), str(path))
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(Text.assemble(
+            ("Reports generated  ", palette.get("muted")),
+            (str(len(paths)), palette.get("highlight")),
+        ))
+        body.add_row(Text(""))
+        body.add_row(table)
+
+        return section(0, "REPORTS", body, config)
+    except Exception as e:
+        logging.debug(f"reports summary render failed: {e}")
+        return None
 
 
 def render_all(report: Dict[str, Any],
