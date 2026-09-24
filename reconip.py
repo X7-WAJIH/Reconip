@@ -37,6 +37,22 @@ try:
 except ImportError:
     _RICH_AVAILABLE = False
 
+# ---- Identity constants (Stage B2, config-overridable) ----
+
+DEFAULT_TOOL_NAME = "RECONIP"
+
+DEFAULT_TAGLINE = "EVIDENCE-DRIVEN OSINT PLATFORM"
+
+# ASCII art for the tool name (block letters for the default name).
+DEFAULT_BANNER_ART = r"""
+██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗██╗██████╗
+██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║██║██╔══██╗
+██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║██║██████╔╝
+██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║██║██╔═══╝
+██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║██║██║
+╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝╚═╝
+""".strip("\n")
+
 import yaml, requests, dns.resolver, dns.reversename, dns.exception, dns.rdatatype
 try: import geoip2.database; GEOIP2 = True
 except ImportError: geoip2 = None; GEOIP2 = False
@@ -16018,20 +16034,240 @@ def _render_18_next_investigation(report, config):
     return _render_placeholder(18, "NEXT INVESTIGATION", config)
 
 
-def _render_banner(config: Dict[str, Any]):
-    """Stage B2 will implement. Returns None in B1."""
-    return None
+def _render_banner(config: Dict[str, Any]) -> Optional["Panel"]:
+    """
+    Render the ReconIP ASCII banner (Stage B2).
+
+    Config keys used:
+      display.show_banner, display.banner_style ("block"|"compact"|"none"),
+      identity.tool_name, identity.tagline, identity.version,
+      display.colors.*, display border.
+
+    Returns a Panel, or None when disabled or rich is unavailable.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        display_cfg = (config.get("display", {}) or {}) if isinstance(config, dict) else {}
+    except Exception:
+        display_cfg = {}
+    if not isinstance(display_cfg, dict):
+        display_cfg = {}
+    if not display_cfg.get("show_banner", True):
+        return None
+    try:
+        style = (display_cfg.get("banner_style") or "block").lower()
+    except Exception:
+        style = "block"
+    if style == "none":
+        return None
+
+    try:
+        identity = (config.get("identity", {}) or {}) if isinstance(config, dict) else {}
+    except Exception:
+        identity = {}
+    if not isinstance(identity, dict):
+        identity = {}
+    tool_name = identity.get("tool_name") or DEFAULT_TOOL_NAME
+    tagline = identity.get("tagline") or DEFAULT_TAGLINE
+    try:
+        version = identity.get("version") or (config.get("version", "v?") if isinstance(config, dict) else "v?")
+    except Exception:
+        version = "v?"
+
+    try:
+        palette = Palette(config)
+        box = _resolve_box(config)
+
+        if style == "compact":
+            # Single-line banner for narrow terminals / minimal contexts.
+            line = Text.assemble(
+                ("▰▰▰  ", palette.get("primary")),
+                (str(tool_name).upper(), palette.get("highlight")),
+                ("  ", ""),
+                (f"•  {version}", palette.get("accent")),
+                ("  ▰▰▰", palette.get("primary")),
+            )
+            return Panel(
+                Align.center(line),
+                border_style=palette.get("border"),
+                box=box,
+                padding=(0, 2),
+            )
+
+        # ---- Block banner (default) ----
+        if str(tool_name).upper() != DEFAULT_TOOL_NAME:
+            # Custom names fall back to plain text (no font renderer shipped).
+            art = Text(str(tool_name).upper(), style=palette.get("primary"))
+        else:
+            art = Text(DEFAULT_BANNER_ART, style=palette.get("primary"))
+
+        tagline_text = Text.assemble(
+            (str(tagline), palette.get("accent")),
+            ("  •  ", palette.get("muted")),
+            (str(version), palette.get("highlight")),
+        )
+        content = Text.assemble(art, "\n\n", tagline_text)
+        return Panel(
+            Align.center(content),
+            border_style=palette.get("border"),
+            box=box,
+            padding=(1, 3),
+            expand=False,
+        )
+    except Exception as e:
+        logging.debug(f"banner render failed: {e}")
+        return None
+
+
+def _short_time(iso: str) -> str:
+    """
+    Extract HH:MM:SS from an ISO8601 UTC timestamp (Stage B2).
+    Returns the input unchanged when parsing fails.
+    """
+    if not iso or iso == "unknown":
+        return iso
+    try:
+        s = str(iso).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt.strftime("%H:%M:%S")
+    except Exception:
+        return iso
 
 
 def _render_target_header(report: Dict[str, Any],
-                          config: Dict[str, Any]):
-    """Stage B2 will implement. Returns None in B1."""
-    return None
+                          config: Dict[str, Any],
+                          scan_duration: Optional[float] = None) -> Optional["Panel"]:
+    """
+    Render the target + run context header (Stage B2).
+
+    Returns a Panel, or None when disabled or rich is unavailable.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        display_cfg = (config.get("display", {}) or {}) if isinstance(config, dict) else {}
+    except Exception:
+        display_cfg = {}
+    if not isinstance(display_cfg, dict):
+        display_cfg = {}
+    if not display_cfg.get("show_header", True):
+        return None
+
+    try:
+        palette = Palette(config)
+        box = _resolve_box(config)
+
+        metadata = (report.get("metadata", {}) or {}) if isinstance(report, dict) else {}
+        profile_info = metadata.get("profile", {}) or {}
+        target_profile = (report.get("01_target_profile", {}) or {}) if isinstance(report, dict) else {}
+
+        target = metadata.get("target") or target_profile.get("target") or "unknown"
+        try:
+            applied = (config.get("_applied_profile", {}) or {}) if isinstance(config, dict) else {}
+        except Exception:
+            applied = {}
+        profile_name = profile_info.get("name") or applied.get("name") or "base"
+        generated_at = metadata.get("generated_at") or "unknown"
+
+        ip = target_profile.get("ip")
+        asn = target_profile.get("asn")
+        asn_name = target_profile.get("asn_name") or target_profile.get("organization")
+
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style=palette.get("muted"), no_wrap=True)
+        table.add_column(style=palette.get("highlight"), overflow="fold")
+        table.add_column(style=palette.get("muted"), no_wrap=True)
+        table.add_column(style=palette.get("highlight"), overflow="fold")
+
+        table.add_row(
+            "Target", str(target),
+            "Time", _short_time(generated_at),
+        )
+        table.add_row(
+            "Profile", str(profile_name),
+            "Scan", (f"{scan_duration:.2f}s" if scan_duration is not None else "—"),
+        )
+
+        # Optional third row: IP / ASN summary.
+        if ip or asn:
+            sub = Text.assemble(
+                ("IP: ", palette.get("muted")),
+                (str(ip or "—"), palette.get("value") or ""),
+                ("   ", ""),
+                ("ASN: ", palette.get("muted")),
+                (str(asn or "—"), palette.get("value") or ""),
+                ("   ", ""),
+                ("Org: ", palette.get("muted")),
+                (str(asn_name or "—"), palette.get("value") or ""),
+            )
+            table.add_row(sub, "", "", "")
+
+        return Panel(
+            table,
+            border_style=palette.get("border"),
+            box=box,
+            padding=(0, 1),
+            expand=True,
+        )
+    except Exception as e:
+        logging.debug(f"header render failed: {e}")
+        return None
 
 
-def _render_footer(config: Dict[str, Any]):
-    """Stage B2 will implement. Returns None in B1."""
-    return None
+def _render_footer(config: Dict[str, Any]) -> Optional["Text"]:
+    """
+    Render the closing footer as a centered Rule (Stage B2).
+
+    Operator fields are optional (Phase D). Never fails on missing
+    identity — every value has a default.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        display_cfg = (config.get("display", {}) or {}) if isinstance(config, dict) else {}
+    except Exception:
+        display_cfg = {}
+    if not isinstance(display_cfg, dict):
+        display_cfg = {}
+    if not display_cfg.get("show_footer", True):
+        return None
+
+    try:
+        palette = Palette(config)
+        identity = (config.get("identity", {}) or {}) if isinstance(config, dict) else {}
+        if not isinstance(identity, dict):
+            identity = {}
+
+        tool_name = identity.get("tool_name") or DEFAULT_TOOL_NAME
+        try:
+            version = identity.get("version") or (config.get("version", "v?") if isinstance(config, dict) else "v?")
+        except Exception:
+            version = "v?"
+        tagline = identity.get("tagline") or DEFAULT_TAGLINE
+        operator_name = identity.get("operator_name")
+        operator_signature = identity.get("operator_signature")
+
+        parts: List[Tuple[str, str]] = []
+        parts.append((f"  {tool_name}", palette.get("accent")))
+        parts.append(("  •  ", palette.get("muted")))
+        parts.append((str(version), palette.get("highlight")))
+        parts.append(("  •  ", palette.get("muted")))
+        parts.append((str(tagline), palette.get("muted")))
+
+        # Phase D will fill these in.
+        if operator_signature:
+            parts.append(("  •  ", palette.get("muted")))
+            parts.append((str(operator_signature), palette.get("primary")))
+        if operator_name:
+            parts.append(("  —  ", palette.get("muted")))
+            parts.append((str(operator_name), palette.get("value") or ""))
+
+        line = Text.assemble(*parts)
+        return Rule(line, style=palette.get("border"), align="center")
+    except Exception as e:
+        logging.debug(f"footer render failed: {e}")
+        return None
 
 
 def _render_reports_summary(paths: Dict[str, str],
@@ -16042,15 +16278,18 @@ def _render_reports_summary(paths: Dict[str, str],
 
 def render_all(report: Dict[str, Any],
                config: Dict[str, Any],
-               export_paths: Optional[Dict[str, str]] = None) -> None:
+               export_paths: Optional[Dict[str, str]] = None,
+               scan_duration: Optional[float] = None) -> None:
     """
-    Render the full report to the terminal (Stage B1 dispatcher).
+    Render the full report to the terminal (Stage B1 dispatcher, B2 duration).
 
     Behavior:
       - Skipped entirely if display is disabled.
       - Falls back silently if rich is unavailable.
       - Never raises. Any exception is caught and logged.
       - Never writes to disk.
+
+    New in B2: scan_duration is passed to _render_target_header().
     """
     try:
         display_cfg = (config.get("display", {}) or {}) if isinstance(config, dict) else {}
@@ -16080,11 +16319,12 @@ def render_all(report: Dict[str, Any],
         except Exception as e:
             logging.debug(f"banner render failed: {e}")
 
-        # ---- Target header (Stage B2 will implement) ----
+        # ---- Target header ----
         try:
-            header = _render_target_header(report, config)
+            header = _render_target_header(report, config, scan_duration=scan_duration)
             if header is not None:
                 console.print(header)
+                console.print()
         except Exception as e:
             logging.debug(f"header render failed: {e}")
 
@@ -16528,7 +16768,12 @@ def main() -> int:
 
     if len(targets) == 1 and not getattr(args, "batch", False):
         # Single-target mode (v42 behavior preserved via _process_single_target)
+        _scan_start = time.time()
         result = _process_single_target(targets[0], config, args)
+        try:
+            _scan_duration = time.time() - _scan_start
+        except Exception:
+            _scan_duration = None
         if not isinstance(result, dict) or result.get("status") == "FAILED":
             try:
                 print(f"Target {targets[0]} failed: {(result or {}).get('error', 'unknown')}")
@@ -16565,7 +16810,12 @@ def main() -> int:
                         try:
                             _final = result.get("final_report", {}) if isinstance(result, dict) else {}
                             if isinstance(_final, dict) and _final:
-                                render_all(_final, config, paths if isinstance(paths, dict) else None)
+                                try:
+                                    _sd = _scan_duration
+                                except NameError:
+                                    _sd = None
+                                render_all(_final, config, paths if isinstance(paths, dict) else None,
+                                           scan_duration=_sd)
                         except Exception as e:
                             logging.debug(f"terminal display skipped: {e}")
                     if isinstance(paths, dict) and paths:

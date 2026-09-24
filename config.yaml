@@ -666,9 +666,12 @@ display:
   enabled: true
   mode: "terminal"                # terminal | minimal | quiet
   show_banner: true
+  show_header: true              # B2: target/profile run-context header
+  show_footer: true              # B2: closing footer rule
   show_all_sections: true
   show_reports_summary: true
   show_progress: true
+  banner_style: "block"          # block | compact | none
   width: null                     # null = auto-detect terminal width
   box_style: "rounded"            # rounded | heavy | double | simple | minimal | square | ascii
   colors:
@@ -695,6 +698,21 @@ display:
     - "width: null means auto-detect. Set an integer to force a fixed width."
     - "box_style controls the border style of every section."
     - "colors control the palette used across all sections."
+    - "banner_style: block (default) | compact (one-line) | none"
+    - "Set show_header: false to hide the target/profile header."
+    - "Set show_footer: false to hide the closing footer."
+    - "Phase D will populate identity.operator_name and identity.operator_signature."
+
+identity:
+  tool_name: "RECONIP"                            # Displayed in banner and footer
+  tagline: "EVIDENCE-DRIVEN OSINT PLATFORM"       # Displayed in banner and footer
+  version: null                                   # null → uses top-level version
+  operator_name: null                             # Phase D
+  operator_signature: null                        # Phase D
+  affiliation: null                               # Phase D
+  notes:
+    - "Phase D will populate operator_name and operator_signature."
+    - "Leave version null to inherit from the top-level version key."
 
 phase_n: {allow_private_targets: false, max_batch: 100, subprocess_timeout: 6.0}
 phase_p2:
