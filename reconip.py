@@ -15914,6 +15914,21 @@ def _kv_grid(pairs: List[Tuple[str, Any]],
     return grid
 
 
+def _truncate_list(items: List[Any], limit: int,
+                   joiner: str = ", ") -> str:
+    """
+    Join a list into a string, truncating with a (+N more) suffix (Stage B4).
+    """
+    if not items:
+        return _MISSING
+    try:
+        shown = [str(x) for x in items[:limit]]
+        tail = f"  (+{len(items) - limit} more)" if len(items) > limit else ""
+        return joiner.join(shown) + tail
+    except Exception:
+        return _MISSING
+
+
 def _resolve_box(config: Dict[str, Any]):
     """
     Return the rich box constant matching display.box_style (Stage B1).
@@ -16651,28 +16666,770 @@ def _render_06_certificate(report, config):
         return _render_placeholder(6, "CERTIFICATE INTELLIGENCE", config)
 
 
+def _lifecycle_style(lifecycle: Any, config: Dict[str, Any]) -> str:
+    """Severity color for a passive-DNS lifecycle state (Stage B4)."""
+    palette = Palette(config)
+    if not isinstance(lifecycle, str):
+        return palette.get("muted")
+    ll = lifecycle.upper()
+    if ll == "ACTIVE":
+        return palette.get("success")
+    if ll == "HISTORICAL":
+        return palette.get("muted")
+    return palette.get("warning")
+
+
 def _render_07_passive_dns(report, config):
-    return _render_placeholder(7, "PASSIVE DNS", config)
+    """
+    Render Section 07 — PASSIVE DNS (Stage B4). Read-only.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        pdns = (report.get("07_passive_dns", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(pdns, dict):
+            pdns = {}
+        timeline = pdns.get("timeline", []) or []
+        stats = pdns.get("stats", {}) or {}
+        related = pdns.get("related_domains", []) or []
+        anomalies = pdns.get("anomalies", []) or []
+        if not isinstance(timeline, list):
+            timeline = []
+        if not isinstance(stats, dict):
+            stats = {}
+        if not isinstance(related, list):
+            related = []
+        if not isinstance(anomalies, list):
+            anomalies = []
+
+        if not timeline and not stats:
+            body = Text("No passive DNS data available.",
+                        style=palette.get("muted"))
+            return section(7, "PASSIVE DNS", body, config)
+
+        # ---- Stat line ----
+        stat_line = Text.assemble(
+            ("Domains  ", palette.get("muted")),
+            (str(stats.get("total_domains", len(timeline))), palette.get("highlight")),
+            ("   Active  ", palette.get("muted")),
+            (str(stats.get("active_count", 0)), palette.get("success")),
+            ("   Historical  ", palette.get("muted")),
+            (str(stats.get("historical_count", 0)), palette.get("muted")),
+            ("   Churn  ", palette.get("muted")),
+            (str(stats.get("churn_count", 0)),
+             _count_style(stats.get("churn_count", 0), config)),
+        )
+
+        # ---- Timeline table (top 8 entries) ----
+        timeline_table = Table(
+            show_header=True,
+            header_style=palette.get("muted"),
+            box=None,
+            padding=(0, 1),
+            expand=False,
+        )
+        timeline_table.add_column("Domain", style=palette.get("value") or palette.get("highlight"))
+        timeline_table.add_column("First Seen", style=palette.get("muted"), no_wrap=True)
+        timeline_table.add_column("Last Seen", style=palette.get("muted"), no_wrap=True)
+        timeline_table.add_column("Lifecycle", no_wrap=True)
+
+        for entry in timeline[:8]:
+            if not isinstance(entry, dict):
+                continue
+            domain = entry.get("domain", _MISSING)
+            first = _short_date(entry.get("first_seen"))
+            last = _short_date(entry.get("last_seen"))
+            lifecycle = entry.get("lifecycle", _MISSING)
+            style = _lifecycle_style(lifecycle, config)
+            timeline_table.add_row(
+                str(domain), first, last,
+                Text(str(lifecycle), style=style),
+            )
+
+        if len(timeline) > 8:
+            timeline_table.add_row(
+                f"[dim]+{len(timeline) - 8} more[/dim]", "", "", ""
+            )
+
+        # ---- Anomalies line ----
+        anomalies_line = Text.assemble(
+            ("Anomalies  ", palette.get("muted")),
+            (str(len(anomalies)), _count_style(len(anomalies), config)),
+        )
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(stat_line)
+        body.add_row(Text(""))
+        body.add_row(timeline_table)
+        body.add_row(anomalies_line)
+
+        # Related domains (optional)
+        if related:
+            try:
+                preview = _truncate_list(
+                    [f"{r.get('domain_a')} ↔ {r.get('domain_b')}" for r in related
+                     if isinstance(r, dict)],
+                    limit=3,
+                )
+            except Exception:
+                preview = _MISSING
+            body.add_row(Text.assemble(
+                ("Related  ", palette.get("muted")),
+                (preview, palette.get("value") or palette.get("highlight")),
+            ))
+
+        return section(7, "PASSIVE DNS", body, config)
+    except Exception as e:
+        logging.debug(f"section 07 render failed: {e}")
+        return _render_placeholder(7, "PASSIVE DNS", config)
+
+
+def _sev_style(sev: Any, config: Dict[str, Any]) -> str:
+    """Severity color for a change severity (Stage B4)."""
+    palette = Palette(config)
+    s = str(sev).lower()
+    if s == "critical":
+        return palette.get("danger")
+    if s == "high":
+        return palette.get("danger")
+    if s == "moderate":
+        return palette.get("warning")
+    if s == "low":
+        return palette.get("muted")
+    return palette.get("muted")
+
+
+def _short_val(v: Any, max_len: int = 24) -> str:
+    """Truncate a value for table cells (Stage B4)."""
+    s = _present(v)
+    if len(s) > max_len:
+        return s[:max_len - 1] + "…"
+    return s
 
 
 def _render_08_history(report, config):
-    return _render_placeholder(8, "HISTORICAL INTELLIGENCE", config)
+    """
+    Render Section 08 — HISTORICAL INTELLIGENCE (Stage B4). Read-only.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        hist = (report.get("08_historical_intelligence", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(hist, dict):
+            hist = {}
+        status = hist.get("status", "UNKNOWN")
+        prev_ts = hist.get("previous_timestamp")
+        curr_ts = hist.get("current_timestamp")
+        detection = hist.get("detection", {}) or {}
+        if not isinstance(detection, dict):
+            detection = {}
+
+        if status == "FIRST_OBSERVATION":
+            body = Text.assemble(
+                ("No previous snapshot found. Baseline established.", palette.get("muted")),
+                "\n",
+                ("Current timestamp: ", palette.get("muted")),
+                (str(curr_ts or _MISSING), palette.get("highlight")),
+            )
+            return section(8, "HISTORICAL INTELLIGENCE", body, config)
+
+        if status != "COMPARED":
+            body = Text(f"Historical status: {status}",
+                        style=palette.get("muted"))
+            return section(8, "HISTORICAL INTELLIGENCE", body, config)
+
+        # ---- Comparison window ----
+        window_line = Text.assemble(
+            ("Previous  ", palette.get("muted")),
+            (str(prev_ts or _MISSING), palette.get("value") or palette.get("highlight")),
+            ("   Current  ", palette.get("muted")),
+            (str(curr_ts or _MISSING), palette.get("value") or palette.get("highlight")),
+        )
+
+        # ---- Severity summary ----
+        by_sev = detection.get("by_severity", {}) or {}
+        if not isinstance(by_sev, dict):
+            by_sev = {}
+        severity_line = Text.assemble(
+            ("Changes  ", palette.get("muted")),
+            (str(detection.get("total_changes", 0)), palette.get("highlight")),
+            ("   ", ""),
+            ("critical=", palette.get("muted")),
+            (str(by_sev.get("critical", 0)), _sev_style("critical", config)),
+            ("  ", ""),
+            ("high=", palette.get("muted")),
+            (str(by_sev.get("high", 0)), _sev_style("high", config)),
+            ("  ", ""),
+            ("moderate=", palette.get("muted")),
+            (str(by_sev.get("moderate", 0)), _sev_style("moderate", config)),
+            ("  ", ""),
+            ("low=", palette.get("muted")),
+            (str(by_sev.get("low", 0)), _sev_style("low", config)),
+        )
+
+        # ---- Changes table (top 8) ----
+        changes = detection.get("changes", []) or []
+        if not isinstance(changes, list):
+            changes = []
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(window_line)
+        body.add_row(severity_line)
+        body.add_row(Text(""))
+        if changes:
+            change_table = Table(
+                show_header=True,
+                header_style=palette.get("muted"),
+                box=None,
+                padding=(0, 1),
+                expand=False,
+            )
+            change_table.add_column("Severity", no_wrap=True)
+            change_table.add_column("Key", style=palette.get("value") or palette.get("highlight"))
+            change_table.add_column("Old → New", style=palette.get("muted"))
+
+            for ch in changes[:8]:
+                if not isinstance(ch, dict):
+                    continue
+                sev = ch.get("severity", "informational")
+                key = ch.get("key", _MISSING)
+                old = _short_val(ch.get("old"))
+                new = _short_val(ch.get("new"))
+                change_table.add_row(
+                    Text(str(sev).upper(), style=_sev_style(sev, config)),
+                    str(key),
+                    f"{old} → {new}",
+                )
+
+            if len(changes) > 8:
+                change_table.add_row(
+                    f"[dim]+{len(changes) - 8} more[/dim]", "", ""
+                )
+            body.add_row(change_table)
+        else:
+            body.add_row(Text("No changes detected since previous snapshot.",
+                              style=palette.get("success")))
+
+        return section(8, "HISTORICAL INTELLIGENCE", body, config)
+    except Exception as e:
+        logging.debug(f"section 08 render failed: {e}")
+        return _render_placeholder(8, "HISTORICAL INTELLIGENCE", config)
+
+
+def _provider_status_style(status: Any, config: Dict[str, Any]) -> str:
+    """Status color for a threat provider row (Stage B4)."""
+    palette = Palette(config)
+    s = str(status).upper()
+    if s == "OK":
+        return palette.get("success")
+    if s == "FAILED":
+        return palette.get("danger")
+    if s == "NOT_CONFIGURED":
+        return palette.get("warning")
+    if s == "DISABLED":
+        return palette.get("muted")
+    return palette.get("muted")
 
 
 def _render_09_threat(report, config):
-    return _render_placeholder(9, "THREAT INTELLIGENCE", config)
+    """
+    Render Section 09 — THREAT INTELLIGENCE (Stage B4). Read-only.
+
+    Never hides provider failures: FAILED and NOT_CONFIGURED rows
+    are always shown, and the failure line is always present.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        ti = (report.get("09_threat_intelligence", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(ti, dict):
+            ti = {}
+        normalized = ti.get("normalized", []) or []
+        failures = ti.get("failures", {}) or {}
+        if not isinstance(normalized, list):
+            normalized = []
+        if not isinstance(failures, dict):
+            failures = {}
+
+        # ---- Metric line ----
+        try:
+            observed = float(ti.get("observed_threat_score", 0.0))
+        except (TypeError, ValueError):
+            observed = 0.0
+        try:
+            coverage = float(ti.get("evidence_coverage", 0.0))
+            agreement = float(ti.get("provider_agreement", 0.0))
+            freshness = float(ti.get("data_freshness", 0.0))
+            threat_conf = float(ti.get("threat_confidence", 0.0))
+        except (TypeError, ValueError):
+            coverage = agreement = freshness = threat_conf = 0.0
+
+        metrics_line = Text.assemble(
+            ("Observed  ", palette.get("muted")),
+            (f"{observed:.1f}", _score_style(observed, config)),
+            ("   Coverage  ", palette.get("muted")),
+            (f"{coverage * 100:.1f}%", palette.get("highlight")),
+            ("   Agreement  ", palette.get("muted")),
+            (f"{agreement * 100:.1f}%", palette.get("highlight")),
+            ("   Freshness  ", palette.get("muted")),
+            (f"{freshness * 100:.1f}%", palette.get("highlight")),
+            ("   Confidence  ", palette.get("muted")),
+            (f"{threat_conf * 100:.1f}%",
+             _score_style(threat_conf * 100, config)),
+        )
+
+        # ---- Provider table ----
+        provider_table = Table(
+            show_header=True,
+            header_style=palette.get("muted"),
+            box=None,
+            padding=(0, 1),
+            expand=False,
+        )
+        provider_table.add_column("Provider", style=palette.get("value") or palette.get("highlight"))
+        provider_table.add_column("Status", no_wrap=True)
+        provider_table.add_column("Score", justify="right")
+        provider_table.add_column("Conf", justify="right")
+        provider_table.add_column("Cache", justify="center")
+
+        for entry in normalized:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("source", _MISSING)
+            status = entry.get("status", "UNKNOWN")
+            score = entry.get("threat_score")
+            conf = entry.get("confidence", 0.0)
+            try:
+                meta = entry.get("metadata", {}) or {}
+            except Exception:
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            cache_status = meta.get("cache_status", "-")
+
+            status_style = _provider_status_style(status, config)
+            provider_table.add_row(
+                str(name),
+                Text(str(status), style=status_style),
+                f"{score:.2f}" if isinstance(score, (int, float)) else _MISSING,
+                f"{conf:.2f}" if isinstance(conf, (int, float)) else _MISSING,
+                str(cache_status),
+            )
+
+        # ---- Failure line (always shown) ----
+        failed = failures.get("failed", []) or []
+        not_config = failures.get("not_configured", []) or []
+        if not isinstance(failed, list):
+            failed = []
+        if not isinstance(not_config, list):
+            not_config = []
+
+        if failed or not_config:
+            failure_line = Text.assemble(
+                ("Failures  ", palette.get("muted")),
+                (f"{len(failed)} failed", palette.get("danger") if failed else palette.get("muted")),
+                ("   ", ""),
+                (f"{len(not_config)} not configured",
+                 palette.get("warning") if not_config else palette.get("muted")),
+                ("   ", ""),
+                ("(absence of data ≠ absence of threat)",
+                 palette.get("muted")),
+            )
+        else:
+            failure_line = Text.assemble(
+                ("Failures  ", palette.get("muted")),
+                ("none", palette.get("success")),
+            )
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(metrics_line)
+        body.add_row(Text(""))
+        body.add_row(provider_table)
+        body.add_row(failure_line)
+
+        return section(9, "THREAT INTELLIGENCE", body, config)
+    except Exception as e:
+        logging.debug(f"section 09 render failed: {e}")
+        return _render_placeholder(9, "THREAT INTELLIGENCE", config)
 
 
 def _render_10_correlation(report, config):
-    return _render_placeholder(10, "INFRASTRUCTURE CORRELATION", config)
+    """
+    Render Section 10 — INFRASTRUCTURE CORRELATION (Stage B4). Read-only.
+
+    Correlation is evidence, not a verdict: the closing note is always
+    shown.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        corr = (report.get("10_infrastructure_correlation", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(corr, dict):
+            corr = {}
+        graph_stats = corr.get("graph_stats", {}) or {}
+        shared = corr.get("shared", {}) or {}
+        related_targets = corr.get("related_targets", []) or []
+        if not isinstance(graph_stats, dict):
+            graph_stats = {}
+        if not isinstance(shared, dict):
+            shared = {}
+        if not isinstance(related_targets, list):
+            related_targets = []
+
+        # ---- Graph summary ----
+        try:
+            node_count = int(graph_stats.get("node_count", 0))
+        except (TypeError, ValueError):
+            node_count = 0
+        try:
+            edge_count = int(graph_stats.get("edge_count", 0))
+        except (TypeError, ValueError):
+            edge_count = 0
+        graph_line = Text.assemble(
+            ("Nodes  ", palette.get("muted")),
+            (str(node_count), palette.get("highlight")),
+            ("   Edges  ", palette.get("muted")),
+            (str(edge_count), palette.get("highlight")),
+        )
+
+        node_types = graph_stats.get("node_types", {}) or {}
+        if isinstance(node_types, dict) and node_types:
+            types_line = Text.assemble(
+                ("Node types  ", palette.get("muted")),
+                (_truncate_list(
+                    [f"{k}={v}" for k, v in sorted(node_types.items())],
+                    limit=6
+                ), palette.get("value") or palette.get("highlight")),
+            )
+        else:
+            types_line = Text("")
+
+        # ---- Shared entities table ----
+        def _shared_len(key: str) -> int:
+            try:
+                val = shared.get(key, []) or []
+                return len(val) if isinstance(val, list) else 0
+            except Exception:
+                return 0
+
+        shared_rows: List[Tuple[str, int]] = [
+            ("ASNs",          _shared_len("shared_asns")),
+            ("Prefixes",      _shared_len("shared_prefixes")),
+            ("Certificates",  _shared_len("shared_certificates")),
+            ("Nameservers",   _shared_len("shared_nameservers")),
+            ("Mailservers",   _shared_len("shared_mailservers")),
+            ("Organizations", _shared_len("shared_organizations")),
+        ]
+
+        shared_table = Table(
+            show_header=True,
+            header_style=palette.get("muted"),
+            box=None,
+            padding=(0, 1),
+            expand=False,
+        )
+        shared_table.add_column("Shared Entity", style=palette.get("muted"))
+        shared_table.add_column("Count", justify="right")
+
+        for label, count in shared_rows:
+            style = palette.get("warning") if count > 0 else palette.get("muted")
+            shared_table.add_row(label, Text(str(count), style=style))
+
+        # ---- Related targets ----
+        if related_targets:
+            try:
+                pairs_preview = ", ".join(
+                    f"{r.get('target_a')} ↔ {r.get('target_b')} ({r.get('shared_count')})"
+                    for r in related_targets[:3] if isinstance(r, dict)
+                ) or _MISSING
+            except Exception:
+                pairs_preview = _MISSING
+            related_line = Text.assemble(
+                ("Related targets  ", palette.get("muted")),
+                (pairs_preview, palette.get("value") or palette.get("highlight")),
+            )
+        else:
+            related_line = Text.assemble(
+                ("Related targets  ", palette.get("muted")),
+                ("none", palette.get("muted")),
+            )
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(graph_line)
+        body.add_row(types_line)
+        body.add_row(Text(""))
+        body.add_row(shared_table)
+        body.add_row(related_line)
+        body.add_row(Text(""))
+        body.add_row(Text("Relationship ≠ Maliciousness.", style=palette.get("muted")))
+
+        return section(10, "INFRASTRUCTURE CORRELATION", body, config)
+    except Exception as e:
+        logging.debug(f"section 10 render failed: {e}")
+        return _render_placeholder(10, "INFRASTRUCTURE CORRELATION", config)
+
+
+def _risk_style(risk: Any, config: Dict[str, Any]) -> str:
+    """Severity color for a service risk class (Stage B4)."""
+    palette = Palette(config)
+    r = str(risk).lower()
+    if r in ("critical", "high"):
+        return palette.get("danger")
+    if r == "moderate":
+        return palette.get("warning")
+    if r == "low":
+        return palette.get("muted")
+    return palette.get("muted")
 
 
 def _render_11_attack_surface(report, config):
-    return _render_placeholder(11, "ATTACK SURFACE", config)
+    """
+    Render Section 11 — ATTACK SURFACE (Stage B4). Read-only.
+
+    OPEN ≠ VULNERABLE: the closing note is always shown.
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        asx = (report.get("11_attack_surface", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(asx, dict):
+            asx = {}
+        services = asx.get("services", []) or []
+        exposure = asx.get("exposure", {}) or {}
+        if not isinstance(services, list):
+            services = []
+        if not isinstance(exposure, dict):
+            exposure = {}
+
+        if not services:
+            body = Text("No exposed services identified.",
+                        style=palette.get("muted"))
+            return section(11, "ATTACK SURFACE", body, config)
+
+        # ---- Exposure summary ----
+        try:
+            service_count = int(asx.get("service_count", len(services)))
+        except (TypeError, ValueError):
+            service_count = len(services)
+        try:
+            sensitive_count = int(asx.get("sensitive_count", 0))
+        except (TypeError, ValueError):
+            sensitive_count = 0
+        try:
+            external_count = int(exposure.get("external_count", 0))
+        except (TypeError, ValueError):
+            external_count = 0
+        try:
+            internal_count = int(exposure.get("internal_count", 0))
+        except (TypeError, ValueError):
+            internal_count = 0
+        exposure_line = Text.assemble(
+            ("Services  ", palette.get("muted")),
+            (str(service_count), palette.get("highlight")),
+            ("   Sensitive  ", palette.get("muted")),
+            (str(sensitive_count),
+             _count_style(sensitive_count, config)),
+            ("   External  ", palette.get("muted")),
+            (str(external_count), palette.get("highlight")),
+            ("   Internal  ", palette.get("muted")),
+            (str(internal_count), palette.get("muted")),
+        )
+
+        # ---- Services table ----
+        svc_table = Table(
+            show_header=True,
+            header_style=palette.get("muted"),
+            box=None,
+            padding=(0, 1),
+            expand=False,
+        )
+        svc_table.add_column("Port", no_wrap=True, justify="right")
+        svc_table.add_column("Proto", no_wrap=True)
+        svc_table.add_column("Service", style=palette.get("value") or palette.get("highlight"))
+        svc_table.add_column("Risk", no_wrap=True)
+        svc_table.add_column("Sensitive", justify="center")
+
+        for svc in services[:12]:
+            if not isinstance(svc, dict):
+                continue
+            port = svc.get("port", _MISSING)
+            proto = svc.get("protocol", _MISSING)
+            service = svc.get("service", _MISSING)
+            risk = svc.get("risk_class", "unknown")
+            sensitive = svc.get("sensitive", False)
+
+            risk_style = _risk_style(risk, config)
+            sens_text = Text("yes", style=palette.get("danger")) if sensitive \
+                else Text("no", style=palette.get("muted"))
+
+            svc_table.add_row(
+                str(port), str(proto), str(service),
+                Text(str(risk).upper(), style=risk_style),
+                sens_text,
+            )
+
+        if len(services) > 12:
+            svc_table.add_row(
+                f"[dim]+{len(services) - 12} more[/dim]",
+                "", "", "", ""
+            )
+
+        # ---- Note ----
+        note = Text("OPEN ≠ VULNERABLE.", style=palette.get("muted"))
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(exposure_line)
+        body.add_row(Text(""))
+        body.add_row(svc_table)
+        body.add_row(note)
+
+        return section(11, "ATTACK SURFACE", body, config)
+    except Exception as e:
+        logging.debug(f"section 11 render failed: {e}")
+        return _render_placeholder(11, "ATTACK SURFACE", config)
+
+
+def _tech_status_style(status: Any, config: Dict[str, Any]) -> str:
+    """Status color for a technology fingerprint row (Stage B4)."""
+    palette = Palette(config)
+    s = str(status).upper()
+    if s == "OK":
+        return palette.get("success")
+    if s == "INSUFFICIENT_EVIDENCE":
+        return palette.get("warning")
+    if s == "UNKNOWN":
+        return palette.get("muted")
+    return palette.get("muted")
 
 
 def _render_12_technology(report, config):
-    return _render_placeholder(12, "TECHNOLOGY", config)
+    """
+    Render Section 12 — TECHNOLOGY (Stage B4). Read-only.
+
+    Never claims technology without evidence: rows without a matched
+    signature show the provider status (often INSUFFICIENT_EVIDENCE).
+    """
+    if not _RICH_AVAILABLE:
+        return None
+    try:
+        palette = Palette(config)
+        tech = (report.get("12_technology", {}) or {}) if isinstance(report, dict) else {}
+        if not isinstance(tech, dict):
+            tech = {}
+        results = tech.get("results", []) or []
+        summary = tech.get("summary", {}) or {}
+        if not isinstance(results, list):
+            results = []
+        if not isinstance(summary, dict):
+            summary = {}
+
+        if not results:
+            body = Text("No technology fingerprinting data available.",
+                        style=palette.get("muted"))
+            return section(12, "TECHNOLOGY", body, config)
+
+        # ---- Summary line ----
+        def _int(key: str, default: int = 0) -> int:
+            try:
+                return int(summary.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        summary_line = Text.assemble(
+            ("Analyzed  ", palette.get("muted")),
+            (str(_int("services_analyzed", len(results))), palette.get("highlight")),
+            ("   Identified  ", palette.get("muted")),
+            (str(_int("technologies_identified")), palette.get("success")),
+            ("   Insufficient  ", palette.get("muted")),
+            (str(_int("insufficient_evidence")), palette.get("warning")),
+            ("   Unknown  ", palette.get("muted")),
+            (str(_int("unknown")), palette.get("muted")),
+        )
+
+        # ---- Technology table ----
+        tech_table = Table(
+            show_header=True,
+            header_style=palette.get("muted"),
+            box=None,
+            padding=(0, 1),
+            expand=False,
+        )
+        tech_table.add_column("Port", no_wrap=True, justify="right")
+        tech_table.add_column("Service", style=palette.get("muted"), no_wrap=True)
+        tech_table.add_column("Product", style=palette.get("value") or palette.get("highlight"))
+        tech_table.add_column("Version", no_wrap=True)
+        tech_table.add_column("Conf", justify="right", no_wrap=True)
+        tech_table.add_column("Status", no_wrap=True)
+
+        rows_added = 0
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            port = result.get("port", _MISSING)
+            service = result.get("service", _MISSING)
+            status = result.get("status", "UNKNOWN")
+            techs = result.get("technology", []) or []
+            if not isinstance(techs, list):
+                techs = []
+
+            if not techs:
+                tech_table.add_row(
+                    str(port), str(service), _MISSING, _MISSING, _MISSING,
+                    Text(str(status), style=_tech_status_style(status, config)),
+                )
+                rows_added += 1
+            else:
+                for t in techs:
+                    if not isinstance(t, dict):
+                        continue
+                    try:
+                        conf = float(t.get("confidence", 0))
+                        conf_s = f"{conf:.2f}"
+                    except (TypeError, ValueError):
+                        conf_s = _MISSING
+                    tech_table.add_row(
+                        str(port),
+                        str(service),
+                        str(t.get("product", _MISSING)),
+                        str(t.get("version") or _MISSING),
+                        conf_s,
+                        Text(str(status), style=_tech_status_style(status, config)),
+                    )
+                    rows_added += 1
+
+            if rows_added >= 12:
+                break
+
+        if rows_added < len(results):
+            tech_table.add_row(
+                f"[dim]+{len(results) - rows_added} more[/dim]",
+                "", "", "", "", ""
+            )
+
+        # ---- Notes ----
+        note = Text("A banner is a hint, not a fact. UNKNOWN is honest.",
+                    style=palette.get("muted"))
+
+        body = Table.grid(padding=(0, 0))
+        body.add_column()
+        body.add_row(summary_line)
+        body.add_row(Text(""))
+        body.add_row(tech_table)
+        body.add_row(note)
+
+        return section(12, "TECHNOLOGY", body, config)
+    except Exception as e:
+        logging.debug(f"section 12 render failed: {e}")
+        return _render_placeholder(12, "TECHNOLOGY", config)
 
 
 def _render_13_vulnerability(report, config):
