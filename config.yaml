@@ -685,6 +685,15 @@ display:
   progress_refresh_per_second: 10 # progress redraw rate (rich default)
   banner_style: "block"          # block | compact | none
   section_spacing: 1              # blank lines between sections (default 1)
+  truncation:                     # operator-tunable display limits (C3.7)
+    asn_name: 30
+    organization_name: 30
+    subject_cn: 30
+    issuer_cn: 20
+    issuer_o: 30
+    ns_preview: 40
+    passive_dns_timeline: 5
+    node_types_preview: 4
   width: null                     # null = auto-detect terminal width
   box_style: "rounded"            # rounded | heavy | double | simple | minimal | square | ascii
   colors:

@@ -16485,6 +16485,53 @@ def _present(value: Any) -> str:
         return _MISSING
 
 
+def _shorten(value: Any, max_len: int = 30) -> str:
+    """
+    Shorten a value for display (Stage C3.7).
+
+    Behavior:
+      - None or empty → "—"
+      - Length ≤ max_len → unchanged
+      - Length > max_len → first (max_len - 1) chars + "…"
+
+    Note: display-only transformation. The full value remains
+    in the JSON report.
+    """
+    if value is None:
+        return _MISSING
+    try:
+        s = str(value).strip()
+    except Exception:
+        return _MISSING
+    if not s:
+        return _MISSING
+    try:
+        limit = int(max_len)
+    except Exception:
+        limit = 30
+    if len(s) <= limit:
+        return s
+    if limit <= 1:
+        return "…"
+    return s[: limit - 1] + "…"
+
+
+def _trunc_limit(config: Dict[str, Any], key: str, default: int) -> int:
+    """
+    Read an operator-tunable truncation limit (Stage C3.7).
+
+    display.truncation.<key> overrides the hardcoded default.
+    Missing/invalid config falls back to the default.
+    """
+    try:
+        trunc = ((config.get("display", {}) or {}).get("truncation", {}) or {})
+        if isinstance(trunc, dict) and key in trunc:
+            return max(1, int(trunc[key]))
+    except Exception:
+        pass
+    return default
+
+
 def _kv_grid(pairs: List[Tuple[str, Any]],
              config: Dict[str, Any],
              columns: int = 2) -> "Table":
@@ -16947,14 +16994,14 @@ def _render_04_network(report, config):
 
         rows: List[Tuple[str, Any]] = [
             ("ASN",          asn.get("asn")),
-            ("ASN Name",     asn.get("asn_name")),
+            ("ASN Name",     _shorten(asn.get("asn_name"), _trunc_limit(config, "asn_name", 30))),
             ("ASN Type",     asn.get("type")),
             ("Country",      asn.get("country")),
             ("Prefix",       prefix.get("cidr")),
             ("Prefix Len",   prefix.get("prefix_length")),
             ("RIR",          prefix.get("rir")),
             ("Allocated",    prefix.get("allocated")),
-            ("Organization", org.get("name")),
+            ("Organization", _shorten(org.get("name"), _trunc_limit(config, "organization_name", 30))),
             ("Abuse Email",  org.get("abuse_email")),
             ("Origin ASN",   origin.get("origin_asn")),
             ("Routing",      origin.get("routing_status")),
@@ -17091,7 +17138,7 @@ def _render_05_dns(report, config):
             ("A",     _first_value("A")),
             ("AAAA",  _first_value("AAAA")),
             ("PTR",   _first_value("PTR")),
-            ("NS",    _first_value("NS")),
+            ("NS",    _shorten(_first_value("NS"), _trunc_limit(config, "ns_preview", 40))),
             ("MX",    _first_value("MX")),
             ("CNAME", _first_value("CNAME")),
             ("TXT",   _first_value("TXT")),
@@ -17206,9 +17253,9 @@ def _render_06_certificate(report, config):
         rows: List[Tuple[str, Any]] = []
         if live:
             rows.extend([
-                ("Subject CN",  live.get("subject_cn")),
-                ("Issuer CN",   live.get("issuer_cn")),
-                ("Issuer O",    live.get("issuer_o")),
+                ("Subject CN",  _shorten(live.get("subject_cn"), _trunc_limit(config, "subject_cn", 30))),
+                ("Issuer CN",   _shorten(live.get("issuer_cn"), _trunc_limit(config, "issuer_cn", 20))),
+                ("Issuer O",    _shorten(live.get("issuer_o"), _trunc_limit(config, "issuer_o", 30))),
                 ("Valid From",  _short_date(live.get("not_before"))),
                 ("Valid To",    _short_date(live.get("not_after"))),
                 ("Key",         _key_summary(live)),
@@ -17337,7 +17384,8 @@ def _render_07_passive_dns(report, config):
         timeline_table.add_column("Last Seen", style=palette.get("muted"), no_wrap=True)
         timeline_table.add_column("Lifecycle", no_wrap=True)
 
-        for entry in timeline[:8]:
+        _tl_limit = _trunc_limit(config, "passive_dns_timeline", 5)
+        for entry in timeline[:_tl_limit]:
             if not isinstance(entry, dict):
                 continue
             domain = entry.get("domain", _MISSING)
@@ -17350,9 +17398,9 @@ def _render_07_passive_dns(report, config):
                 Text(str(lifecycle), style=style),
             )
 
-        if len(timeline) > 8:
+        if len(timeline) > _tl_limit:
             timeline_table.add_row(
-                f"[dim]+{len(timeline) - 8} more[/dim]", "", "", ""
+                f"[dim]+{len(timeline) - _tl_limit} more[/dim]", "", "", ""
             )
 
         # ---- Anomalies line ----
@@ -17707,7 +17755,7 @@ def _render_10_correlation(report, config):
                 ("Node types  ", palette.get("muted")),
                 (_truncate_list(
                     [f"{k}={v}" for k, v in sorted(node_types.items())],
-                    limit=6
+                    limit=_trunc_limit(config, "node_types_preview", 4)
                 ), palette.get("value") or palette.get("highlight")),
             )
         else:
@@ -18515,10 +18563,12 @@ def _interleave_newlines(items: List["Text"]) -> List[Any]:
 
 def _render_17_limitations(report, config):
     """
-    Render Section 17 — LIMITATIONS (Stage B5). Read-only.
+    Render Section 17 — LIMITATIONS (Stage B5, compacted in C3.7).
 
-    Never truncated: every limitation is a boundary of what the tool
-    claims, so all lines are shown.
+    Every limitation is shown in full — none are truncated. Density is
+    reduced with a lighter bullet, stripped trailing punctuation, and
+    a natural-width (non-expanded) panel. Display-only: the JSON report
+    keeps the original text.
     """
     if not _RICH_AVAILABLE:
         return None
@@ -18536,20 +18586,37 @@ def _render_17_limitations(report, config):
                         style=palette.get("muted"))
             return section(17, "LIMITATIONS", body, config)
 
-        # ---- Bullet list (complete, never truncated) ----
+        # ---- Compact bulleted list (complete, never truncated) ----
         lines: List[Text] = []
         for item in limitations:
+            try:
+                text = str(item).rstrip(" .;")
+            except Exception:
+                text = _MISSING
             lines.append(Text.assemble(
-                ("• ", palette.get("accent")),
-                (str(item), palette.get("value") or ""),
+                ("· ", palette.get("accent")),
+                (text, palette.get("value") or ""),
             ))
 
-        if len(lines) == 1:
-            body = lines[0]
-        else:
-            body = Text.assemble(*_interleave_newlines(lines))
+        # Join with single newlines — no blank line between items.
+        parts: List[Any] = []
+        for i, t in enumerate(lines):
+            if i > 0:
+                parts.append("\n")
+            parts.append(t)
+        body = Text.assemble(*parts)
 
-        return section(17, "LIMITATIONS", body, config)
+        panel = section(17, "LIMITATIONS", body, config)
+
+        # Cap width to keep the section from dominating wide terminals.
+        try:
+            if panel is not None:
+                panel.width = None  # let rich compute
+                panel.expand = False  # do not stretch to terminal width
+        except Exception:
+            pass
+
+        return panel
     except Exception as e:
         logging.debug(f"section 17 render failed: {e}")
         return _render_placeholder(17, "LIMITATIONS", config)
