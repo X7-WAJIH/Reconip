@@ -51,7 +51,20 @@ DEFAULT_TOOL_NAME = "RECONIP"
 DEFAULT_TAGLINE = "EVIDENCE-DRIVEN OSINT PLATFORM"
 
 # ASCII art for the tool name (block letters for the default name).
-DEFAULT_BANNER_ART = r"""
+# ─────────────────────────────────────────────────────────────
+# Banner arts — one per width tier (Stage C3.2).
+#
+# Widths are chosen so that:
+#   WIDE    fits in terminals >= 62 columns
+#   MEDIUM  fits in terminals >= 50 columns
+#   COMPACT fits in terminals >= 32 columns
+#
+# The selector picks the largest art that fits, or returns None
+# if the terminal is too narrow even for the compact art.
+# ─────────────────────────────────────────────────────────────
+
+# WIDE — ANSI Shadow style (largest)
+BANNER_WIDE = r"""
 ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗██╗██████╗
 ██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║██║██╔══██╗
 ██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║██║██████╔╝
@@ -59,6 +72,56 @@ DEFAULT_BANNER_ART = r"""
 ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║██║██║
 ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝╚═╝
 """.strip("\n")
+
+# MEDIUM — compressed ANSI Shadow style
+BANNER_MEDIUM = r"""
+████╗ ██████╗ ██████╗ ██████╗ ███╗ ██╗██╗██████╗
+██╔═██╗██╔═══╝██╔═══╝██╔══██╗████╗██║██║██╔══██╗
+█████╔╝█████╗ ██║    ██║  ██║██╔███║██║██████╔╝
+██╔═██╗██╔══╝ ██║    ██║  ██║██║╚██║██║██╔═══╝
+██║ ██║██████╗╚█████╗╚█████╔╝██║ ╚█║██║██║
+╚═╝ ╚═╝╚═════╝ ╚════╝ ╚════╝ ╚═╝  ╚╝╚═╝╚═╝
+""".strip("\n")
+
+# COMPACT — small block font
+BANNER_COMPACT = r"""
+█▀█ █▀▀ █▀▀ █▀█ █▄░█ █ █▀█
+█▀▄ ██▄ █▄▄ █▄█ █░▀█ █ █▀▀
+""".strip("\n")
+
+# Back-compat alias (Stage B2 name). Prefer the tiered arts above.
+DEFAULT_BANNER_ART = BANNER_WIDE
+
+
+def _banner_art_width(art: str) -> int:
+    """Return the width of the widest line in the art (Stage C3.2)."""
+    try:
+        return max(len(line) for line in str(art).split("\n"))
+    except Exception:
+        return 0
+
+
+def _select_banner_art(term_width: int) -> Optional[str]:
+    """
+    Return the widest art that fits the terminal (Stage C3.2).
+
+    Fitting rule: art_width + PADDING + BORDER <= term_width,
+    where PADDING = 2 (1 char each side) and BORDER = 2.
+
+    Returns None when no art fits.
+    """
+    try:
+        width = int(term_width)
+    except Exception:
+        return None
+    PADDING_AND_BORDER = 4
+    for art in (BANNER_WIDE, BANNER_MEDIUM, BANNER_COMPACT):
+        try:
+            if _banner_art_width(art) + PADDING_AND_BORDER <= width:
+                return art
+        except Exception:
+            continue
+    return None
 
 import yaml, requests, dns.resolver, dns.reversename, dns.exception, dns.rdatatype
 try: import geoip2.database; GEOIP2 = True
@@ -8957,64 +9020,124 @@ def _score_threat(report: Dict[str, Any],
                   config: Dict[str, Any]) -> Dict[str, Any]:
     """
     THREAT SCORE: how likely is this target to be malicious?
+
+    Model:
+      base      = observed threat from providers  (0.0 – 1.0)
+      modifier  = 0.5 + 0.5 × (agreement × coverage)  (0.5 – 1.0)
+      score     = base × modifier × 100  (0.0 – 100.0)
+
+    Rationale:
+      - "Observed" is the only true threat signal.
+      - "Agreement" and "Coverage" are confidence modifiers.
+      - They scale the signal but must never create it.
+      - A clean target with perfect coverage still scores 0.
+      - A malicious target with poor coverage is discounted, not eliminated.
     """
-    ti = report.get("threat_intelligence", {}) if isinstance(report, dict) else {}
+    ti = report.get("threat_intelligence", {}) or {}
     if not isinstance(ti, dict):
         ti = {}
     normalized = ti.get("normalized", []) or []
-    ok = [r for r in normalized if _sget(r, "status") == "OK"]
+    if not isinstance(normalized, list):
+        normalized = []
+    ok = [r for r in normalized if isinstance(r, dict) and r.get("status") == "OK"]
 
-    components: List[Dict[str, Any]] = []
-
-    # Component 1: observed threat score from providers
+    # ---- Base: weighted observed threat score ----
     if ok:
         try:
-            weighted_sum = sum(_sfloat(_sget(r, "threat_score", 0), 0) * _sfloat(_sget(r, "weight", 1.0), 1.0) * _sfloat(_sget(r, "confidence", 0.5), 0.5) for r in ok)
-            weight_sum = sum(_sfloat(_sget(r, "weight", 1.0), 1.0) * _sfloat(_sget(r, "confidence", 0.5), 0.5) for r in ok)
+            weighted_sum = sum(
+                _sfloat(r.get("threat_score", 0.0), 0.0)
+                * _sfloat(r.get("weight", 1.0), 1.0)
+                * _sfloat(r.get("confidence", 0.0), 0.0)
+                for r in ok
+            )
+            weight_sum = sum(
+                _sfloat(r.get("weight", 1.0), 1.0)
+                * _sfloat(r.get("confidence", 0.0), 0.0)
+                for r in ok
+            )
             observed = (weighted_sum / weight_sum) if weight_sum > 0 else 0.0
         except Exception:
             observed = 0.0
     else:
         observed = 0.0
-    components.append({
-        "name": "observed_provider_score",
-        "value": max(0.0, min(1.0, observed)),
-        "weight": 0.5,
-        "evidence": f"{len(ok)} provider(s) responded",
-        "source_section": "threat_intelligence"
-    })
 
-    # Component 2: provider agreement
+    # ---- Modifier 1: provider agreement ----
     if len(ok) > 1:
         try:
-            scores = [_sfloat(_sget(r, "threat_score", 0), 0) for r in ok]
+            scores = [_sfloat(r.get("threat_score", 0.0), 0.0) for r in ok]
             mean = sum(scores) / len(scores)
             variance = sum((s - mean) ** 2 for s in scores) / len(scores)
             agreement = 1.0 - min(variance / 0.25, 1.0)
         except Exception:
             agreement = 0.0
+    elif len(ok) == 1:
+        agreement = 0.5
     else:
-        agreement = 0.5 if ok else 0.0
-    components.append({
-        "name": "provider_agreement",
-        "value": max(0.0, min(1.0, agreement)),
-        "weight": 0.2,
-        "evidence": f"agreement among {len(ok)} provider(s)",
-        "source_section": "threat_intelligence"
-    })
+        agreement = 0.0
 
-    # Component 3: coverage
+    # ---- Modifier 2: provider coverage ----
     total = len(normalized)
-    coverage = len(ok) / total if total > 0 else 0.0
-    components.append({
-        "name": "provider_coverage",
-        "value": max(0.0, min(1.0, coverage)),
-        "weight": 0.3,
-        "evidence": f"{len(ok)}/{total} providers responded",
-        "source_section": "threat_intelligence"
-    })
+    coverage = (len(ok) / total) if total > 0 else 0.0
 
-    return explain_score("THREAT SCORE", components, config)
+    # ---- Final score ----
+    modifier = 0.5 + 0.5 * (agreement * coverage)
+    score = observed * modifier * 100.0
+
+    # ---- Component breakdown for explainability ----
+    components: List[Dict[str, Any]] = [
+        {
+            "name": "observed_provider_score",
+            "value": observed,
+            "weight": 1.0,          # signal weight
+            "contribution": round(observed, 4),
+            "evidence": f"{len(ok)} provider(s) responded",
+            "source_section": "threat_intelligence",
+        },
+        {
+            "name": "provider_agreement",
+            "value": agreement,
+            "weight": 0.0,          # modifier, not additive
+            "contribution": 0.0,
+            "evidence": f"agreement among {len(ok)} provider(s)",
+            "source_section": "threat_intelligence",
+        },
+        {
+            "name": "provider_coverage",
+            "value": coverage,
+            "weight": 0.0,          # modifier, not additive
+            "contribution": 0.0,
+            "evidence": f"{len(ok)}/{total} providers responded",
+            "source_section": "threat_intelligence",
+        },
+        {
+            "name": "modifier",
+            "value": modifier,
+            "weight": 0.0,          # modifier applied to base
+            "contribution": round(modifier, 4),
+            "evidence": f"modifier = 0.5 + 0.5 × ({agreement:.2f} × {coverage:.2f})",
+            "source_section": "threat_intelligence",
+        },
+    ]
+
+    result = explain_score("THREAT SCORE", components, config)
+
+    # ---- Override the score with the modifier-based value ----
+    # explain_score() computes a weighted average, which is not what we want.
+    # We set the value directly.
+    result["value"] = round(score, 2)
+    result["label"] = _score_label(score)
+    result["explanation"] = (
+        f"THREAT SCORE = observed({observed:.2f}) "
+        f"× modifier({modifier:.2f}) × 100 = {score:.1f}"
+    )
+    result["formula"] = "observed × modifier × 100"
+    result["modifier_breakdown"] = {
+        "agreement": round(agreement, 4),
+        "coverage": round(coverage, 4),
+        "modifier": round(modifier, 4),
+    }
+
+    return result
 
 
 def _score_infrastructure(report: Dict[str, Any],
@@ -15914,36 +16037,70 @@ class _NoopProgress:
 
 class _RichProgress:
     """
-    A real progress handle wrapping a rich Progress instance (Stage C1).
+    A progress handle that owns its own completed counter (Stage C3.4).
+
+    Design:
+      - `completed` is tracked locally, not by rich.
+      - Every `next()` passes an absolute `completed` value to rich.
+      - `total` is passed on every update so the bar never loses it.
+      - `done()` forces the counter to `total` and marks the description.
+      - `start()` resets the counter so handle reuse across batch
+        targets restarts the bar instead of resuming a stale count.
+
+    This removes the dependency on rich's internal `advance` behavior,
+    which was responsible for the stalled counter in v47.5.
     """
-    def __init__(self, progress: "Progress", task_id: Any, total: int = 0):
+
+    def __init__(self, progress: "Progress", task_id: Any, total: int = 13):
         self._progress = progress
         self._task_id = task_id
         try:
-            self._total = int(total)
+            self._total = max(1, int(total))
         except Exception:
-            self._total = 0
+            self._total = 13
+        self._completed = 0
 
     def start(self, name: str) -> None:
-        self._progress.update(self._task_id, description=name)
+        """Reset to 0 and set the first stage description."""
+        self._completed = 0
+        self._progress.update(
+            self._task_id,
+            description=name,
+            completed=0,
+            total=self._total,
+        )
 
     def next(self, name: str) -> None:
-        self._progress.update(self._task_id, advance=1, description=name)
+        """Advance by 1 and set the next stage description."""
+        self._completed = min(self._completed + 1, self._total)
+        self._progress.update(
+            self._task_id,
+            description=name,
+            completed=self._completed,
+            total=self._total,
+        )
 
     def update(self, name: str) -> None:
-        self._progress.update(self._task_id, description=name)
+        """Update only the description, preserving the counter."""
+        self._progress.update(
+            self._task_id,
+            description=name,
+            completed=self._completed,
+            total=self._total,
+        )
 
     def done(self) -> None:
-        try:
-            if self._total > 0:
-                self._progress.update(self._task_id, completed=self._total,
-                                      description="Done")
-            else:
-                self._progress.update(self._task_id, description="Done")
-        except Exception:
-            pass
+        """Force the counter to total and mark as done."""
+        self._completed = self._total
+        self._progress.update(
+            self._task_id,
+            description="Done",
+            completed=self._completed,
+            total=self._total,
+        )
 
     def note(self, message: str) -> None:
+        """Emit a log line through rich's console."""
         try:
             self._progress.console.log(message)
         except Exception:
@@ -18282,6 +18439,11 @@ def _render_banner(config: Dict[str, Any]) -> Optional["Panel"]:
     try:
         palette = Palette(config)
         box = _resolve_box(config)
+        try:
+            _console_obj = _console(config)
+            term_width = int(_console_obj.width) if _console_obj is not None else 80
+        except Exception:
+            term_width = 80
 
         if style == "compact":
             # Single-line banner for narrow terminals / minimal contexts.
@@ -18296,29 +18458,78 @@ def _render_banner(config: Dict[str, Any]) -> Optional["Panel"]:
                 Align.center(line),
                 border_style=palette.get("border"),
                 box=box,
-                padding=(0, 2),
+                padding=(0, 1),
+                expand=False,
             )
 
-        # ---- Block banner (default) ----
+        # ---- Block banner (default): widest art that fits ----
+        # Custom tool names cannot reuse the pre-rendered art,
+        # so fall back to plain text (never wrapped, never truncated).
         if str(tool_name).upper() != DEFAULT_TOOL_NAME:
-            # Custom names fall back to plain text (no font renderer shipped).
-            art = Text(str(tool_name).upper(), style=palette.get("primary"))
+            art_text = Text(str(tool_name).upper(), style=palette.get("primary"))
+            art_text.no_wrap = True
+            art_width = len(str(tool_name).upper())
         else:
-            art = Text(DEFAULT_BANNER_ART, style=palette.get("primary"))
+            art = _select_banner_art(term_width)
+            art_width = _banner_art_width(art) if art is not None else 0
+            if art is None:
+                art_text = None
+            else:
+                art_text = Text(art, style=palette.get("primary"))
+                art_text.no_wrap = True
 
-        tagline_text = Text.assemble(
-            (str(tagline), palette.get("accent")),
+        tagline_plain = f"{tagline}  •  {version}"
+        short_plain = f"{tool_name}  •  {version}"
+
+        # Total content width decides the layout. The tagline counts:
+        # a fitting art with a cropping tagline is still truncation.
+        content_width = max(art_width, len(tagline_plain))
+        if art_text is not None and content_width + 4 <= term_width:
+            tagline_text = Text.assemble(
+                (str(tagline), palette.get("accent")),
+                ("  •  ", palette.get("muted")),
+                (str(version), palette.get("highlight")),
+            )
+            tagline_text.no_wrap = True
+
+            content = Text.assemble(
+                art_text, "\n\n",
+                tagline_text,
+            )
+            content.no_wrap = True
+
+            return Panel(
+                Align.center(content),
+                border_style=palette.get("border"),
+                box=box,
+                padding=(0, 1),
+                expand=False,
+            )
+
+        # Narrow terminal — fall back to a compact line.
+        line = Text.assemble(
+            (str(tool_name).upper(), palette.get("highlight")),
             ("  •  ", palette.get("muted")),
-            (str(version), palette.get("highlight")),
+            (str(version), palette.get("accent")),
         )
-        content = Text.assemble(art, "\n\n", tagline_text)
-        return Panel(
-            Align.center(content),
-            border_style=palette.get("border"),
-            box=box,
-            padding=(1, 3),
-            expand=False,
-        )
+        if len(short_plain) + 4 <= term_width:
+            return Panel(
+                Align.center(line),
+                border_style=palette.get("border"),
+                box=box,
+                padding=(0, 1),
+                expand=False,
+            )
+        if len(short_plain) + 2 <= term_width:
+            return Panel(
+                Align.center(line),
+                border_style=palette.get("border"),
+                box=box,
+                padding=(0, 0),
+                expand=False,
+            )
+        # Extremely narrow: bare text, no panel. Never crashes.
+        return line
     except Exception as e:
         logging.debug(f"banner render failed: {e}")
         return None
@@ -18468,6 +18679,31 @@ def _render_footer(config: Dict[str, Any]) -> Optional["Text"]:
             parts.append((str(operator_name), palette.get("value") or ""))
 
         line = Text.assemble(*parts)
+        # Narrow-terminal fallback (Stage C3.2): a Rule crops content
+        # wider than the console, so shorten the line instead of
+        # letting rich silently truncate it.
+        try:
+            _fconsole = _console(config)
+            _fwidth = int(_fconsole.width) if _fconsole is not None else 80
+        except Exception:
+            _fwidth = 80
+        try:
+            _plain_len = len(line.plain)
+        except Exception:
+            _plain_len = 0
+        if _plain_len > _fwidth:
+            short_parts: List[Tuple[str, str]] = [
+                (f"  {tool_name}", palette.get("accent")),
+                ("  •  ", palette.get("muted")),
+                (str(version), palette.get("highlight")),
+            ]
+            if operator_signature:
+                short_parts.append(("  •  ", palette.get("muted")))
+                short_parts.append((str(operator_signature), palette.get("primary")))
+            if operator_name:
+                short_parts.append(("  —  ", palette.get("muted")))
+                short_parts.append((str(operator_name), palette.get("value") or ""))
+            line = Text.assemble(*short_parts)
         return Rule(line, style=palette.get("border"), align="center")
     except Exception as e:
         logging.debug(f"footer render failed: {e}")
