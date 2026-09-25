@@ -14104,6 +14104,19 @@ def recon(target, enable_db=True, parallel=None, progress=None):
             if key not in existing_keys:
                 combined_dns_evs.append(ev)
                 existing_keys.add(key)
+        # Deterministic ordering (v48.1): upstream DNS answers may arrive
+        # in varying order (round-robin). Sort so consecutive runs are
+        # structurally identical. Score-neutral: analysis uses multisets.
+        try:
+            combined_dns_evs.sort(key=lambda e: (
+                str((getattr(e, "metadata", {}) or {}).get("record_type", "")),
+                str(getattr(e, "normalized_value", "") or ""),
+                str(getattr(e, "source", "") or ""),
+                str(getattr(e, "provider", "") or ""),
+                str(getattr(e, "value", "") or ""),
+            ))
+        except Exception:
+            pass
         dns_intel = dns_analyze(combined_dns_evs, CFG)
         out["dns_intelligence"] = {
             "evidence": [ev.to_dict() for ev in combined_dns_evs],
@@ -18558,8 +18571,9 @@ def _render_17_limitations(report, config):
     Render Section 17 — LIMITATIONS (Stage B5, compacted in C3.7).
 
     Every limitation is shown in full — none are truncated. Density is
-    reduced with a lighter bullet, stripped trailing punctuation, and
-    a natural-width (non-expanded) panel. Display-only: the JSON report
+    reduced with a lighter bullet and stripped trailing punctuation.
+    The panel uses the uniform expand=True rule. Display-only: the
+    JSON report
     keeps the original text.
     """
     if not _RICH_AVAILABLE:
@@ -18598,17 +18612,7 @@ def _render_17_limitations(report, config):
             parts.append(t)
         body = Text.assemble(*parts)
 
-        panel = section(17, "LIMITATIONS", body, config)
-
-        # Cap width to keep the section from dominating wide terminals.
-        try:
-            if panel is not None:
-                panel.width = None  # let rich compute
-                panel.expand = False  # do not stretch to terminal width
-        except Exception:
-            pass
-
-        return panel
+        return section(17, "LIMITATIONS", body, config)
     except Exception as e:
         logging.debug(f"section 17 render failed: {e}")
         return _render_placeholder(17, "LIMITATIONS", config)
