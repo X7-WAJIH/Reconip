@@ -19303,16 +19303,21 @@ def main() -> int:
                 # Text summary + export paths (recon already exported files)
                 if not getattr(args, "quiet", False):
                     paths = result.get("export_paths", {})
-                    # Terminal display (Stage B1: placeholders only).
+                    # Single source of truth for output (Stage C3.5):
+                    #   display enabled  -> render_all() (includes Section 00)
+                    #   display disabled -> plain-text list ("off" mode)
                     # Reports are already on disk; display never blocks them.
+                    # NOTE: no C2-style mode resolver exists in this codebase,
+                    # so --no-display is honored here alongside display.enabled.
                     try:
                         _display_cfg = config.get("display", {}) if isinstance(config, dict) else {}
                     except Exception:
                         _display_cfg = {}
                     if not isinstance(_display_cfg, dict):
                         _display_cfg = {}
-                    _no_display = bool(getattr(args, "no_display", False)) or not _display_cfg.get("enabled", True)
-                    if not _no_display:
+                    _display_enabled = bool(_display_cfg.get("enabled", True)) \
+                        and not bool(getattr(args, "no_display", False))
+                    if _display_enabled:
                         try:
                             _final = result.get("final_report", {}) if isinstance(result, dict) else {}
                             if isinstance(_final, dict) and _final:
@@ -19324,11 +19329,15 @@ def main() -> int:
                                            scan_duration=_sd)
                         except Exception as e:
                             logging.debug(f"terminal display skipped: {e}")
-                    if isinstance(paths, dict) and paths:
-                        for fmt, p in paths.items():
-                            print(f"[{fmt}] {p}")
+                        if not isinstance(paths, dict) or not paths:
+                            print(render_text(result))
                     else:
-                        print(render_text(result))
+                        # "off" mode: plain-text output only, no rich rendering.
+                        if isinstance(paths, dict) and paths:
+                            for fmt, p in paths.items():
+                                print(f"[{fmt}] {p}")
+                        else:
+                            print(render_text(result))
         except Exception as e:
             logging.error(f"Display failed: {e}")
         # Legacy --export print
