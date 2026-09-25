@@ -18855,9 +18855,24 @@ def _render_target_header(report: Dict[str, Any],
                           config: Dict[str, Any],
                           scan_duration: Optional[float] = None) -> Optional["Panel"]:
     """
-    Render the target + run context header (Stage B2).
+    Render the target + run context header (Stage C3.9.1).
 
-    Returns a Panel, or None when disabled or rich is unavailable.
+    Layout:
+      Row 1:  Target:   <value>           Profile:  <value>
+      Row 2:  Time:     <value>           Scan:     <value>
+      Row 3:  (blank spacer)
+      Row 4:  IP: <value>   ASN: <value>   Org: <value>
+
+    Design rationale:
+      - No rich Table.grid. Grid columns negotiate widths and elide
+        with "…" on narrow terminals.
+      - Each row is a single Text.assemble. If a row is too wide,
+        rich wraps it instead of truncating.
+      - Labels use fixed-width padding so columns align visually.
+      - Values are shortened only if they exceed their column width.
+
+    Returns:
+      A rich Panel, or None if disabled or rich is unavailable.
     """
     if not _RICH_AVAILABLE:
         return None
@@ -18874,53 +18889,134 @@ def _render_target_header(report: Dict[str, Any],
         palette = Palette(config)
         box = _resolve_box(config)
 
-        metadata = (report.get("metadata", {}) or {}) if isinstance(report, dict) else {}
-        profile_info = metadata.get("profile", {}) or {}
-        target_profile = (report.get("01_target_profile", {}) or {}) if isinstance(report, dict) else {}
+        # ---- Extract fields safely ----
+        try:
+            metadata = (report.get("metadata", {}) or {}) if isinstance(report, dict) else {}
+        except Exception:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        try:
+            profile_info = metadata.get("profile", {}) or {}
+        except Exception:
+            profile_info = {}
+        if not isinstance(profile_info, dict):
+            profile_info = {}
+        try:
+            target_profile = (report.get("01_target_profile", {}) or {}) if isinstance(report, dict) else {}
+        except Exception:
+            target_profile = {}
+        if not isinstance(target_profile, dict):
+            target_profile = {}
 
-        target = metadata.get("target") or target_profile.get("target") or "unknown"
+        target = (
+            metadata.get("target")
+            or target_profile.get("target")
+            or "unknown"
+        )
         try:
             applied = (config.get("_applied_profile", {}) or {}) if isinstance(config, dict) else {}
         except Exception:
             applied = {}
-        profile_name = profile_info.get("name") or applied.get("name") or "base"
+        if not isinstance(applied, dict):
+            applied = {}
+        profile_name = (
+            profile_info.get("name")
+            or applied.get("name")
+            or "base"
+        )
         generated_at = metadata.get("generated_at") or "unknown"
 
         ip = target_profile.get("ip")
         asn = target_profile.get("asn")
-        asn_name = target_profile.get("asn_name") or target_profile.get("organization")
-
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style=palette.get("muted"), no_wrap=True)
-        table.add_column(style=palette.get("highlight"), overflow="fold")
-        table.add_column(style=palette.get("muted"), no_wrap=True)
-        table.add_column(style=palette.get("highlight"), overflow="fold")
-
-        table.add_row(
-            "Target", str(target),
-            "Time", _short_time(generated_at),
-        )
-        table.add_row(
-            "Profile", str(profile_name),
-            "Scan", (f"{scan_duration:.2f}s" if scan_duration is not None else "—"),
+        org = (
+            target_profile.get("asn_name")
+            or target_profile.get("organization")
         )
 
-        # Optional third row: IP / ASN summary.
-        if ip or asn:
-            sub = Text.assemble(
-                ("IP: ", palette.get("muted")),
-                (str(ip or "—"), palette.get("value") or ""),
-                ("   ", ""),
-                ("ASN: ", palette.get("muted")),
-                (str(asn or "—"), palette.get("value") or ""),
-                ("   ", ""),
-                ("Org: ", palette.get("muted")),
-                (str(asn_name or "—"), palette.get("value") or ""),
+        # ---- Prepare display values ----
+        target_v = _shorten(target, 30)
+        profile_v = _shorten(profile_name, 20)
+        time_v = _short_time(generated_at)
+        scan_v = f"{scan_duration:.2f}s" if scan_duration is not None else "—"
+
+        ip_v = _shorten(ip, 30) if ip else "—"
+        asn_v = _shorten(asn, 10) if asn else "—"
+        org_v = _shorten(org, 40) if org else "—"
+
+        # ---- Fixed column widths for alignment ----
+        # Row layout:
+        #   [label1 (10)] [value1 (24)] [sep (2)] [label2 (11)] [value2 (rest)]
+        LABEL1_W = 10
+        VALUE1_W = 24
+        SEP_W = 2
+        LABEL2_W = 11
+
+        def _pad(s: str, width: int) -> str:
+            try:
+                s = str(s)
+            except Exception:
+                s = ""
+            try:
+                width = int(width)
+            except Exception:
+                return s
+            if len(s) >= width:
+                return s[: width - 1] + "…" if width > 1 else s[:width]
+            return s + " " * (width - len(s))
+
+        label1_style = palette.get("muted")
+        value_style = palette.get("highlight")
+        label2_style = palette.get("muted")
+
+        # ---- Row 1: Target + Profile ----
+        row1 = Text.assemble(
+            (_pad("Target:", LABEL1_W), label1_style),
+            (_pad(target_v, VALUE1_W), value_style),
+            (" " * SEP_W, ""),
+            (_pad("Profile:", LABEL2_W), label2_style),
+            (profile_v, value_style),
+        )
+        row1.no_wrap = False
+
+        # ---- Row 2: Time + Scan ----
+        row2 = Text.assemble(
+            (_pad("Time:", LABEL1_W), label1_style),
+            (_pad(time_v, VALUE1_W), value_style),
+            (" " * SEP_W, ""),
+            (_pad("Scan:", LABEL2_W), label2_style),
+            (scan_v, value_style),
+        )
+        row2.no_wrap = False
+
+        # ---- Row 4: IP + ASN + Org ----
+        row4 = Text.assemble(
+            ("IP: ", label1_style),
+            (ip_v, value_style),
+            ("   ", ""),
+            ("ASN: ", label2_style),
+            (asn_v, value_style),
+            ("   ", ""),
+            ("Org: ", label2_style),
+            (org_v, value_style),
+        )
+        row4.no_wrap = False
+
+        # ---- Compose body ----
+        has_sub = bool(ip or asn or org)
+
+        if has_sub:
+            body = Text.assemble(
+                row1, "\n",
+                row2, "\n",
+                "\n",
+                row4,
             )
-            table.add_row(sub, "", "", "")
+        else:
+            body = Text.assemble(row1, "\n", row2)
 
         return Panel(
-            table,
+            body,
             border_style=palette.get("border"),
             box=box,
             padding=(0, 1),
