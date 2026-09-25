@@ -18818,7 +18818,7 @@ def _render_banner(config: Dict[str, Any]) -> Optional["Panel"]:
                 Align.center(line),
                 border_style=palette.get("border"),
                 box=box,
-                padding=(0, 0),
+                padding=(0, 1),
                 expand=False,
             )
         # Extremely narrow: bare text, no panel. Never crashes.
