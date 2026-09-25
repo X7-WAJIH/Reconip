@@ -44,6 +44,15 @@ except ImportError:
     _RICH_AVAILABLE = False
     _RICH_PROGRESS_AVAILABLE = False
 
+
+# RichHandler is a separate import path. It may be missing even when
+# the base rich package is present (unlikely, but possible).
+try:
+    from rich.logging import RichHandler
+    _RICH_LOG_AVAILABLE = True
+except ImportError:
+    _RICH_LOG_AVAILABLE = False
+
 # ---- Identity constants (Stage B2, config-overridable) ----
 
 DEFAULT_TOOL_NAME = "RECONIP"
@@ -1483,8 +1492,100 @@ def _auth_warning_mode(config: Optional[Dict[str, Any]] = None) -> str:
     return "summary"
 
 
+def _format_auth_summary(auth_info: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Build the single-line auth summary as (level, message) (Stage C3.6).
+
+    level is "warning" when any enabled provider is missing or
+    misconfigured, otherwise "info". Text matches the summary-mode
+    output of _log_auth_summary() exactly.
+    """
+    try:
+        present = list(auth_info.get("present", []) or [])
+        missing = list(auth_info.get("missing", []) or [])
+        misconfigured = list(auth_info.get("misconfigured", []) or [])
+        disabled = list(auth_info.get("disabled", []) or [])
+        no_auth = list(auth_info.get("no_auth", []) or auth_info.get("not_required", []) or [])
+        missing_env = auth_info.get("missing_env", {}) or {}
+    except Exception:
+        return "info", "Auth: status unknown."
+    offenders: List[str] = []
+    for n in list(missing) + list(misconfigured):
+        if n not in offenders:
+            offenders.append(n)
+    if offenders:
+        detail_parts: List[str] = []
+        for name in offenders:
+            if name in misconfigured:
+                detail_parts.append(f"{name} (no api_key_env)")
+                continue
+            env = None
+            try:
+                env = missing_env.get(name) or _lookup_env_for(name)
+            except Exception:
+                env = None
+            detail_parts.append(f"{name} ({env})" if env else name)
+        detail = ", ".join(detail_parts)
+        return ("warning",
+                f"{len(offenders)} enabled provider(s) "
+                f"missing API keys: {detail}. "
+                f"These will report NOT_CONFIGURED.")
+    return ("info",
+            f"Auth: {len(present)} configured, 0 missing, "
+            f"{len(disabled)} disabled, {len(no_auth)} no-auth.")
+
+
+def _progress_is_live(progress: Optional[Any] = None) -> bool:
+    """
+    True when progress is a live rich handle whose note() draws on the
+    terminal (Stage C3.6). A _NoopProgress note() draws nothing, so the
+    flagged-record path must not be used for it.
+    """
+    try:
+        return isinstance(progress, _RichProgress)
+    except Exception:
+        return False
+
+
+def _emit_auth(level: str, msg: str, progress: Optional[Any] = None) -> None:
+    """
+    Emit one auth line, terminal occurrence exactly once (Stage C3.6).
+
+    With a live progress handle: note() draws above the bar, and the
+    With a live progress handle: note() draws above the bar, and the
+    flagged logging record is dropped by console handlers
+    (_NoteDedupFilter) while the file handler still records it.
+    Without (None or no-op): plain logging call.
+    """
+    if _progress_is_live(progress):
+        try:
+            progress.note(f"[{level.upper()}] {msg}")
+            noted = True
+        except Exception:
+            noted = False
+        try:
+            if noted:
+                if level == "warning":
+                    logging.warning(msg, extra={"via_note": True})
+                else:
+                    logging.info(msg, extra={"via_note": True})
+            else:
+                if level == "warning":
+                    logging.warning(msg)
+                else:
+                    logging.info(msg)
+        except Exception:
+            pass
+        return
+    if level == "warning":
+        logging.warning(msg)
+    else:
+        logging.info(msg)
+
+
 def _log_auth_summary(auth_info: Dict[str, Any],
-                      config: Optional[Dict[str, Any]] = None) -> None:
+                      config: Optional[Dict[str, Any]] = None,
+                      progress: Optional[Any] = None) -> None:
     """
     Emit exactly one line per run summarizing auth state (Stage A2).
 
@@ -1517,9 +1618,11 @@ def _log_auth_summary(auth_info: Dict[str, Any],
 
     if offenders:
         if mode == "off":
-            logging.info(
+            _emit_auth(
+                "info",
                 f"Auth: {len(present)} configured, {len(offenders)} missing, "
-                f"{len(disabled)} disabled, {len(no_auth)} no-auth."
+                f"{len(disabled)} disabled, {len(no_auth)} no-auth.",
+                progress,
             )
             return
         if mode == "per_provider":
@@ -1560,30 +1663,13 @@ def _log_auth_summary(auth_info: Dict[str, Any],
             )
             return
         # ---- Default: one summary WARNING line ----
-        detail_parts: List[str] = []
-        for name in offenders:
-            if name in misconfigured:
-                detail_parts.append(f"{name} (no api_key_env)")
-                continue
-            env = None
-            try:
-                env = missing_env.get(name) or _lookup_env_for(name)
-            except Exception:
-                env = None
-            detail_parts.append(f"{name} ({env})" if env else name)
-        detail = ", ".join(detail_parts)
-        logging.warning(
-            f"{len(offenders)} enabled provider(s) "
-            f"missing API keys: {detail}. "
-            f"These will report NOT_CONFIGURED."
-        )
+        _level, _msg = _format_auth_summary(auth_info)
+        _emit_auth(_level, _msg, progress)
         return
 
     # ---- All good: one INFO line ----
-    logging.info(
-        f"Auth: {len(present)} configured, 0 missing, "
-        f"{len(disabled)} disabled, {len(no_auth)} no-auth."
-    )
+    _level, _msg = _format_auth_summary(auth_info)
+    _emit_auth(_level, _msg, progress)
 
 # ============================================================
 #  PERFORMANCE ENGINE — v43 (Stage 19)
@@ -14055,7 +14141,8 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         except Exception:
             pass
         auth_info = load_api_keys(cfg_providers, CFG)
-        _log_auth_summary(auth_info, CFG)
+        # NOTE (C3.6): no _log_auth_summary() here. main() emits it once,
+        # inside the progress context (or via plain logging when inactive).
         stage3_threat_evs = run_providers(ip, cfg_providers)
         # Keep for evidence_engine; also optionally extend evs for legacy scoring (as Ev)
         # Convert to Ev for downstream if needed, but keep separate to avoid double count
@@ -15958,6 +16045,153 @@ def _console(config: Optional[Dict[str, Any]] = None) -> Optional["Console"]:
             width = None
         _CONSOLE = Console(width=width, force_terminal=None, soft_wrap=False)
     return _CONSOLE
+
+
+class _NoteDedupFilter(logging.Filter):
+    """
+    Drop records already shown via progress.note() (Stage C3.6).
+
+    _log_auth_summary() emits through progress.note() for live display
+    AND through logging so the file handler captures it. This filter,
+    attached to console handlers only, suppresses the duplicate on the
+    terminal while the file handler (no filter) still records it.
+    """
+
+    def filter(self, record: Any) -> bool:
+        try:
+            return not bool(getattr(record, "via_note", False))
+        except Exception:
+            return True
+
+
+def _setup_logging(config: Dict[str, Any]) -> None:
+    """
+    Configure the root logger (Stage C3.6).
+
+    Behavior:
+      - Display enabled AND rich.logging available: RichHandler on the
+        SHARED _console() so log lines coordinate with the live progress
+        region (drawn above the bar) instead of jamming into it.
+      - Otherwise: plain stderr StreamHandler (scripts, off mode, pipes).
+      - logging.file (when set): plain-text FileHandler, best-effort.
+      - logging.level (default INFO); unknown levels fall back to INFO.
+      - Existing root handlers are removed to prevent double-logging.
+      - Never raises.
+    """
+    try:
+        log_cfg = (config.get("logging", {}) or {}) if isinstance(config, dict) else {}
+        if not isinstance(log_cfg, dict):
+            log_cfg = {}
+        level_name = str(log_cfg.get("level", "INFO")).upper()
+        level = getattr(logging, level_name, logging.INFO)
+        try:
+            level = int(level)
+        except Exception:
+            level = logging.INFO
+
+        log_file = log_cfg.get("file")
+        log_format = log_cfg.get(
+            "format",
+            "%(asctime)s [%(levelname)s] %(message)s",
+        )
+
+        # ---- Reset existing handlers (avoid double-logging) ----
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            try:
+                root.removeHandler(h)
+            except Exception:
+                pass
+
+        handlers: List[logging.Handler] = []
+
+        # ---- Console handler ----
+        try:
+            dcfg = (config.get("display", {}) or {}) if isinstance(config, dict) else {}
+        except Exception:
+            dcfg = {}
+        if not isinstance(dcfg, dict):
+            dcfg = {}
+        display_enabled = bool(dcfg.get("enabled", True))
+
+        # RF redacts secrets (API keys, tokens) from every record.
+        try:
+            _redacting_formatter = RF(log_format)
+        except Exception:
+            _redacting_formatter = logging.Formatter(log_format)
+
+        if _RICH_AVAILABLE and _RICH_LOG_AVAILABLE and display_enabled:
+            # Shared console: rich coordinates log lines with the live
+            # progress region instead of interleaving raw streams.
+            try:
+                _shared = _console(config)
+            except Exception:
+                _shared = None
+            if _shared is not None:
+                # RF formatter supplies time+level (identical lines to the
+                # legacy setup); rich only coordinates placement.
+                console_handler = RichHandler(
+                    console=_shared,
+                    show_time=False,
+                    show_level=False,
+                    show_path=False,
+                    markup=False,
+                    rich_tracebacks=False,
+                )
+                console_handler.setFormatter(_redacting_formatter)
+            else:
+                console_handler = logging.StreamHandler()
+                console_handler.setFormatter(_redacting_formatter)
+        else:
+            # Plain fallback: stderr, one line per record.
+            console_handler = logging.StreamHandler()  # stderr by default
+            console_handler.setFormatter(_redacting_formatter)
+        try:
+            console_handler.addFilter(_NoteDedupFilter())
+        except Exception:
+            pass
+        handlers.append(console_handler)
+
+        # ---- Optional file handler (always plain text) ----
+        if log_file:
+            try:
+                file_handler = logging.FileHandler(log_file, encoding="utf-8")
+                try:
+                    file_handler.setFormatter(RF(log_format))
+                except Exception:
+                    file_handler.setFormatter(logging.Formatter(log_format))
+                handlers.append(file_handler)
+            except Exception:
+                # File logging is best-effort; never fail the tool.
+                pass
+
+        # ---- Apply ----
+        for h in handlers:
+            try:
+                h.setLevel(level)
+            except Exception:
+                pass
+
+        try:
+            root.setLevel(level)
+        except Exception:
+            pass
+        for h in handlers:
+            try:
+                root.addHandler(h)
+            except Exception:
+                pass
+
+    except Exception:
+        # Never let logging configuration break the pipeline.
+        # (Explicit handler, not basicConfig: handlers were removed above,
+        # but basicConfig is a no-op if any handler was re-added.)
+        try:
+            _fallback = logging.StreamHandler()
+            logging.getLogger().addHandler(_fallback)
+            logging.getLogger().setLevel(logging.INFO)
+        except Exception:
+            pass
 
 
 class Palette:
@@ -19095,6 +19329,32 @@ def main() -> int:
     except Exception:
         pass
 
+    # ---- Logging setup (Stage C3.6) ----
+    # After CLI overrides so RichHandler is used only when display output
+    # is wanted; before any branch that emits log records.
+    try:
+        _setup_logging(config)
+    except Exception:
+        pass
+
+    # ---- Auth state for pipeline branches (Stage C3.6) ----
+    # Computed once here so the summary can be emitted inside the
+    # progress context (above the bar) instead of mid-pipeline.
+    try:
+        _diag_providers = load_providers(config)
+    except Exception:
+        _diag_providers = {}
+    try:
+        _set_providers_registry(_diag_providers)
+    except Exception:
+        pass
+    try:
+        _auth_info = load_api_keys(_diag_providers, config)
+    except Exception:
+        _auth_info = {"present": [], "missing": [], "misconfigured": [],
+                      "disabled": [], "no_auth": [], "not_required": [],
+                      "missing_env": {}}
+
     # ---- List-providers mode (Stage A3: instant, read-only discovery) ----
     if getattr(args, "list_providers", False):
         try:
@@ -19152,6 +19412,10 @@ def main() -> int:
             print(f"Warning: --test-providers uses only the first target "
                   f"({targets[0]}). Ignoring {len(targets) - 1} additional target(s).",
                   file=sys.stderr)
+        try:
+            _log_auth_summary(_auth_info, config)
+        except Exception:
+            pass
         return test_providers(targets[0], config)
 
     # Cache initialization (Stage 20: schema + purge expired)
@@ -19274,6 +19538,11 @@ def main() -> int:
         _scan_start = time.time()
         with _progress_context(config, total_stages=13,
                                stage_name=f"Scanning {targets[0]}") as _progress:
+            # Auth summary above the bar (Stage C3.6), not mid-pipeline.
+            try:
+                _log_auth_summary(_auth_info, config, progress=_progress)
+            except Exception:
+                pass
             result = _process_single_target(targets[0], config, args,
                                             progress=_progress)
         try:
@@ -19378,6 +19647,11 @@ def main() -> int:
 
     with _progress_context(config, total_stages=13,
                            stage_name=f"Batch ({len(targets)} targets)") as _bprogress:
+        # Auth summary above the bar (Stage C3.6), not mid-pipeline.
+        try:
+            _log_auth_summary(_auth_info, config, progress=_bprogress)
+        except Exception:
+            pass
         batch_result = batch_process(targets, config, args, workers=workers,
                                      progress=_bprogress)
 

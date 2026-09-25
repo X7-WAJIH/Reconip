@@ -1,3 +1,9 @@
+# ─────────────────────────────────────────────────────────────
+# ReconIP version.
+# Shown in the banner, the footer, and every report.
+# Must be updated on every release.
+# ─────────────────────────────────────────────────────────────
+version: "v47.4"
 general: {timeout: 5, max_retries: 2, user_agent: "ReconIP/21.2", proxy: ""}
 api_keys: {ipinfo: "", abuseipdb: "", virustotal: "", alienvault: "", greynoise: ""}
 geo_validation:
@@ -660,6 +666,10 @@ logging:
     - "summary: one WARNING line listing all missing keys"
     - "per_provider: one WARNING line per missing provider (legacy behavior)"
     - "off: no warnings for missing keys (silent mode)"
+    - "Console logs are routed through rich.RichHandler when display is enabled."
+    - "On non-TTY (piped) output, RichHandler automatically falls back to plain text."
+    - "In 'off' mode, logs use a plain stderr StreamHandler."
+    - "File logging is independent and always plain text."
 
 # Terminal display configuration (Stage B1: infrastructure only)
 display:
