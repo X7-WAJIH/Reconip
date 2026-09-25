@@ -3,7 +3,7 @@
 # Shown in the banner, the footer, and every report.
 # Must be updated on every release.
 # ─────────────────────────────────────────────────────────────
-version: "v47.4"
+version: "v48.0"
 general: {timeout: 5, max_retries: 2, user_agent: "ReconIP/21.2", proxy: ""}
 api_keys: {ipinfo: "", abuseipdb: "", virustotal: "", alienvault: "", greynoise: ""}
 geo_validation:
