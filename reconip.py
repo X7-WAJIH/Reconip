@@ -16121,27 +16121,19 @@ def _setup_logging(config: Dict[str, Any]) -> None:
             _redacting_formatter = logging.Formatter(log_format)
 
         if _RICH_AVAILABLE and _RICH_LOG_AVAILABLE and display_enabled:
-            # Shared console: rich coordinates log lines with the live
-            # progress region instead of interleaving raw streams.
-            try:
-                _shared = _console(config)
-            except Exception:
-                _shared = None
-            if _shared is not None:
-                # RF formatter supplies time+level (identical lines to the
-                # legacy setup); rich only coordinates placement.
-                console_handler = RichHandler(
-                    console=_shared,
-                    show_time=False,
-                    show_level=False,
-                    show_path=False,
-                    markup=False,
-                    rich_tracebacks=False,
-                )
-                console_handler.setFormatter(_redacting_formatter)
-            else:
-                console_handler = logging.StreamHandler()
-                console_handler.setFormatter(_redacting_formatter)
+            # RichHandler with its own (stderr) console: logs stay off
+            # stdout, which is reserved for machine-readable output.
+            # show_path MUST stay False: internal file paths are not
+            # operator information. No custom formatter: RichHandler
+            # renders [LEVEL] + message; file handler keeps the full
+            # timestamped format with secret redaction.
+            console_handler = RichHandler(
+                show_time=False,
+                show_level=True,
+                show_path=False,
+                markup=False,
+                rich_tracebacks=False,
+            )
         else:
             # Plain fallback: stderr, one line per record.
             console_handler = logging.StreamHandler()  # stderr by default
