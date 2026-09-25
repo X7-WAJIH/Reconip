@@ -685,12 +685,12 @@ display:
   progress_refresh_per_second: 10 # progress redraw rate (rich default)
   banner_style: "block"          # block | compact | none
   section_spacing: 1              # blank lines between sections (default 1)
-  truncation:                     # operator-tunable display limits (C3.7)
-    asn_name: 30
-    organization_name: 30
+  truncation:                     # operator-tunable display limits (C3.7, tightened C3.9.3)
+    asn_name: 18
+    organization_name: 18
     subject_cn: 30
-    issuer_cn: 20
-    issuer_o: 30
+    issuer_cn: 14
+    issuer_o: 18
     ns_preview: 40
     passive_dns_timeline: 5
     node_types_preview: 4
@@ -721,6 +721,8 @@ display:
     - "box_style controls the border style of every section."
     - "colors control the palette used across all sections."
     - "section_spacing: number of blank lines between sections (default 1)."
+    - "display.truncation controls per-field character limits in the terminal only."
+    - "Reports always contain full, untruncated values."
     - "show_progress: show a transient spinner and progress bar during the pipeline."
     - "force_progress: show progress even when stdout is not a TTY."
     - "In batch mode with parallel workers, progress forces workers=1."

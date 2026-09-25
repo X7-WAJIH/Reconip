@@ -16986,14 +16986,14 @@ def _render_04_network(report, config):
 
         rows: List[Tuple[str, Any]] = [
             ("ASN",          asn.get("asn")),
-            ("ASN Name",     _shorten(asn.get("asn_name"), _trunc_limit(config, "asn_name", 30))),
+            ("ASN Name",     _shorten(asn.get("asn_name"), _trunc_limit(config, "asn_name", 18))),
             ("ASN Type",     asn.get("type")),
             ("Country",      asn.get("country")),
             ("Prefix",       prefix.get("cidr")),
             ("Prefix Len",   prefix.get("prefix_length")),
             ("RIR",          prefix.get("rir")),
             ("Allocated",    prefix.get("allocated")),
-            ("Organization", _shorten(org.get("name"), _trunc_limit(config, "organization_name", 30))),
+            ("Organization", _shorten(org.get("name"), _trunc_limit(config, "organization_name", 18))),
             ("Abuse Email",  org.get("abuse_email")),
             ("Origin ASN",   origin.get("origin_asn")),
             ("Routing",      origin.get("routing_status")),
@@ -17246,8 +17246,8 @@ def _render_06_certificate(report, config):
         if live:
             rows.extend([
                 ("Subject CN",  _shorten(live.get("subject_cn"), _trunc_limit(config, "subject_cn", 30))),
-                ("Issuer CN",   _shorten(live.get("issuer_cn"), _trunc_limit(config, "issuer_cn", 20))),
-                ("Issuer O",    _shorten(live.get("issuer_o"), _trunc_limit(config, "issuer_o", 30))),
+                ("Issuer CN",   _shorten(live.get("issuer_cn"), _trunc_limit(config, "issuer_cn", 14))),
+                ("Issuer O",    _shorten(live.get("issuer_o"), _trunc_limit(config, "issuer_o", 18))),
                 ("Valid From",  _short_date(live.get("not_before"))),
                 ("Valid To",    _short_date(live.get("not_after"))),
                 ("Key",         _key_summary(live)),
