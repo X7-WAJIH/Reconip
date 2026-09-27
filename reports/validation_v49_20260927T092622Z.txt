@@ -1,0 +1,126 @@
+============================================================
+ReconIP Validation Report — v49.0
+============================================================
+Date:   2026-09-27T09:26:22Z
+Host:   kali (Linux 7.1.5+kali-amd64)
+Python: 3.14.7
+Base:   262484d (v48.1)
+Target: 1.1.1.1   Profile: standard   Format: all
+
+------------------------------------------------------------
+STAGE F CHANGES
+------------------------------------------------------------
+F1  _RichProgress.note(): console.log() -> console.print()  APPLIED
+F2  Build artifacts removed (__pycache__/*.pyc)             APPLIED
+F2  .gitignore added for Python bytecode                  APPLIED
+F3  config.yaml version v48.1 -> v49.0                     APPLIED
+
+------------------------------------------------------------
+F1 ROOT CAUSE (differs from the original brief)
+------------------------------------------------------------
+The prescribed fix -- RichHandler(show_time=False, show_path=False)
+-- was ALREADY present in the code and already committed
+(Stage C3.9.2 / v48.0.2). It was never the cause.
+
+The offending line was produced by a different emitter:
+
+    _RichProgress.note()  ->  Console.log(message)
+
+rich's Console.log() renders through LogRender, whose Console
+defaults are show_time=True and show_path=True. Those flags are
+per-Console and are NOT inherited from the logging RichHandler
+built in _setup_logging(). So the auth summary carried a
+timestamp, the source file and an OSC-8 hyperlink.
+
+Reproduced before the fix (profile quick, console path):
+
+  [05:16:23] [WARNING] 3 enabled provider(s) missing API keys:
+      reconip.py:16344        <- OSC-8 hyperlink to the source line
+
+Fixed by using Console.print(), which emits the message verbatim.
+It still lands above the live progress region, because rich's Live
+redirects sys.stdout/stderr through a FileProxy (verified with an
+isolated Live/print/log harness under a pty).
+
+console.print() is present in every rich release; verified against
+both rich 15.0.0 (host) and rich 13.9.4 (pinned in requirements.txt).
+
+------------------------------------------------------------
+VALIDATION MATRIX V1-V12
+------------------------------------------------------------
+V1   Python compiles:                     PASS   py_compile clean
+V2   YAML parses:                         PASS   49 keys, version v49.0
+V3   Version in banner:                   PASS   banner + footer + report
+                                                metadata all v49.0
+V4   Threat score = 0:                    PASS   0.0 VERY_LOW
+V5   Header shows target:                 PASS   Target 1.1.1.1 /
+                                                Profile standard
+V6   Progress advances:                   PASS   01/13 -> 03/13 ->
+                                                05/13 -> 13/13, monotonic
+V7   No duplicate output:                 PASS   auth line x1, each
+                                                section header x1, zero
+                                                source-path / OSC-8 leak
+V8   No log leak:                         PASS   canary key redacted in
+                                                5/5 patterns; no key-shaped
+                                                assignment in reports/ or
+                                                reconip.log
+V9   All 6 reports:                       PASS   json 19 sections,
+                                                stix bundle/2.1,
+                                                misp Event+Attribute,
+                                                csv 7 rows, html/md
+                                                non-empty, no
+                                                NaN/Infinity/undefined
+V10  Coverage = 1.0:                      PASS   09_threat_intelligence
+                                                .evidence_coverage = 1.0
+V11  Determinism:                         PASS*  see qualification below
+V12  Clean install:                       PASS   fresh venv, 6 pinned
+                                                deps, exit 0, 6 reports
+
+Result: 12/12 PASS (V11 qualified)
+
+------------------------------------------------------------
+V11 QUALIFICATION -- upstream, not tool, nondeterminism
+------------------------------------------------------------
+Two consecutive runs (A 09:22:22Z, B 09:23:46Z) were diffed with
+volatile fields (timestamps, durations, uuids, cache) excluded.
+
+Exactly ONE substantive difference exists in the entire document:
+
+  ('dns:9.9.9.9', 'TXT', 'one.one.one.one',
+   '_27pzqheibkz3ec5g8loj1d4eppt1o4d')     present in A, absent in B
+
+That value is a Cloudflare domain-verification nonce. It is rotated
+server-side and cannot be reproduced on demand. All 21 document-level
+diffs cascade from its presence/absence through evidence-volume
+aggregates (15_evidence.total 23 -> 22, data_quality, assessment
+score, 16_confidence).
+
+Verified: DNS evidence ORDERING is byte-identical between the two
+runs once the nonce is excluded, so the v48.1 deterministic-sorting
+fix (reconip.py:14107) remains intact and effective.
+
+Assessment: tool-controlled determinism PASSES. Absolute
+byte-identical output across runs is not achievable for this target
+while upstream serves a rotating nonce. Same conclusion class as the
+v45 report, which recorded the earlier ordering-only V9 diff.
+
+------------------------------------------------------------
+FINDINGS NOT ADDRESSED IN THIS STAGE
+------------------------------------------------------------
+1. `--version` prints a hardcoded literal. reconip.py:13601 sets
+   version="ReconIP v42.1" in argparse; it never reads config.yaml.
+   `python3 reconip.py --version` still reports v42.1 after the
+   v49.0 bump. The banner, footer and reports are correct; only this
+   one code path is stale. Recommend sourcing it from config.
+
+2. Runtime artifacts are tracked in git: reconip.db, reconip.log,
+   reconip_cache.db all show as modified after every run, and
+   reports/ accumulates ~125 untracked files. Left untouched here to
+   avoid an unrequested history change; consider `git rm --cached`
+   plus ignore rules.
+
+3. _emit_auth() has a duplicated docstring line (reconip.py:1555-56).
+   Cosmetic, no behaviour impact.
+
+============================================================
+End of report.

@@ -1,0 +1,3 @@
+# Python bytecode cache (Stage F2 cleanup)
+__pycache__/
+*.py[cod]

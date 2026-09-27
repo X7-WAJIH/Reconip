@@ -16339,9 +16339,20 @@ class _RichProgress:
         )
 
     def note(self, message: str) -> None:
-        """Emit a log line through rich's console."""
+        """
+        Emit a log line through rich's console, above the live bar.
+
+        v49.0: use print(), not log(). Console.log() renders through
+        rich's LogRender, whose Console defaults are show_time=True and
+        show_path=True, so it appended a timestamp, the source file and an
+        OSC-8 hyperlink (reconip.py:16344) to every note. Those flags are
+        per-Console and are NOT inherited from the logging RichHandler
+        configured in _setup_logging(). print() writes the message as-is
+        and still lands above the live region, because Live redirects
+        sys.stdout/stderr through a FileProxy.
+        """
         try:
-            self._progress.console.log(message)
+            self._progress.console.print(message)
         except Exception:
             pass
 
