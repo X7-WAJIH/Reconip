@@ -1,0 +1,4 @@
+# one target per line; '#' comments and blank lines are ignored
+8.8.8.8
+1.1.1.1
+# example.com

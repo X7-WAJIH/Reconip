@@ -1,3 +1,43 @@
-# Python bytecode cache (Stage F2 cleanup)
+# Python bytecode cache
 __pycache__/
 *.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# ReconIP runtime artifacts (local only, never publish)
+reconip.db
+reconip_cache.db
+reconip.log
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Generated reports (local scan output, never publish)
+reports/
+
+# Secrets and local overrides
+.env
+.env.*
+*.pem
+*.key
+config.local.yaml
+config.override.yaml
+
+# Editor / OS artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/

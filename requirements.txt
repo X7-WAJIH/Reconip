@@ -1,6 +1,6 @@
 # ReconIP — Runtime Requirements
 # Python >= 3.10 required (3.11+ recommended)
-# Generated for ReconIP v44.1
+# Generated for ReconIP v53.0
 # Do not add dependencies without updating the import audit.
 #
 # Install with:

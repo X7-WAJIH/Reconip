@@ -1,0 +1,16 @@
+# Prometheus scrape config for ReconIP server mode.
+# Run: python3 reconip.py --server --port 8080
+# (bearer token required unless phase_m.require_auth is false)
+scrape_configs:
+  - job_name: reconip
+    scrape_interval: 60s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+    # Uncomment for authenticated scraping:
+    # authorization:
+    #   credentials: "RECONIP_API_TOKEN"
+    # metric_relabel_configs:
+    #   - source_labels: [__name__]
+    #     regex: "reconip_.*"
+    #     action: keep

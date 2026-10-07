@@ -6,6 +6,7 @@ import csv, io
 import ipaddress, subprocess, hashlib, math, asyncio, sqlite3
 import threading, uuid, random, shutil, signal, pathlib
 import hmac, urllib.request, urllib.error, urllib.parse
+import fnmatch
 import html as _html
 import concurrent.futures
 from contextlib import contextmanager
@@ -54,10 +55,15 @@ except ImportError:
     _RICH_LOG_AVAILABLE = False
 
 # ---- Identity constants (Stage B2, config-overridable) ----
+# Public product signature: RECONIP / X7 SECURITY INTELLIGENCE / X7ΛΞX.
+# Display-only defaults; config.yaml `identity` may override tool_name and
+# tagline, but the X7ΛΞX signature is always shown (banner + footer).
 
 DEFAULT_TOOL_NAME = "RECONIP"
 
-DEFAULT_TAGLINE = "EVIDENCE-DRIVEN OSINT PLATFORM"
+DEFAULT_TAGLINE = "X7 SECURITY INTELLIGENCE"
+
+DEFAULT_SIGNATURE = "X7ΛΞX"
 
 # ASCII art for the tool name (block letters for the default name).
 # ─────────────────────────────────────────────────────────────
@@ -132,7 +138,7 @@ def _select_banner_art(term_width: int) -> Optional[str]:
             continue
     return None
 
-import yaml, requests, dns.resolver, dns.reversename, dns.exception, dns.rdatatype
+import yaml, requests, dns.resolver, dns.reversename, dns.exception, dns.rdatatype, dns.query
 try: import geoip2.database; GEOIP2 = True
 except ImportError: geoip2 = None; GEOIP2 = False
 try:
@@ -255,7 +261,7 @@ def _banner():
     pad = (w - 4 - len(sub)) // 2
     lines.append(C.DRED + "║ " + C.RST + C.RED + " " * pad + sub +
                  " " * (w - 4 - len(sub) - pad) + C.RST + C.DRED + " ║" + C.RST)
-    sig = "X7  •  X7Λ†ΞX"
+    sig = "X7ΛΞX"
     pad = (w - 4 - len(sig)) // 2
     lines.append(C.DRED + "║ " + C.RST + C.GRY + " " * pad + sig +
                  " " * (w - 4 - len(sig) - pad) + C.RST + C.DRED + " ║" + C.RST)
@@ -286,11 +292,129 @@ _SECRETS = [re.compile(p, re.I) for p in (
     r"(x-otx-api-key\s*[:=]\s*)\S+", r"(authorization\s*[:=]\s*)\S+",
     r"(password\s*[:=]\s*)\S+", r"(token\s*[:=]\s*)\S+")]
 
-def redact(s):
-    if s is None: return s
-    s = str(s)
-    for p in _SECRETS: s = p.sub(lambda m: m.group(1) + "***", s)
+# Key names whose *value* is a credential. The regexes above only match a
+# secret that shares a string with its own label ("api_key: X"), so a
+# structured {"api_key": "X"} slips through -- it did so in the old
+# repr-based redact too, because repr() inserts quotes the pattern
+# cannot cross. Masking by key name closes that for every JSON emitter.
+_SECRET_KEY_WORDS = frozenset({
+    "apikey", "token", "password", "passwd", "pwd", "passphrase",
+    "secret", "secrets", "authorization", "credential", "credentials",
+    "bearer", "apisecret", "accesskey", "privatekey", "authkey",
+    "clientsecret", "sessionid", "signature",
+})
+
+# Two-word forms: api_key, auth_key, access_token, client_secret, ...
+_SECRET_KEY_PAIRS = frozenset({
+    frozenset(("api", "key")), frozenset(("access", "key")),
+    frozenset(("private", "key")), frozenset(("secret", "key")),
+    frozenset(("auth", "key")), frozenset(("client", "secret")),
+    frozenset(("access", "token")), frozenset(("refresh", "token")),
+    frozenset(("id", "token")),
+})
+
+# A trailing descriptor means the value names *where* the secret lives
+# (e.g. api_key_env -> "VIRUSTOTAL_API_KEY"), not the secret itself.
+# Masking those would destroy legitimate provider metadata in the output.
+_KEY_NAME_DESCRIPTOR = frozenset({
+    "env", "name", "names", "var", "variable", "path", "file", "source",
+    "len", "length", "present", "missing", "required", "configured",
+    "type", "id", "hint", "url", "param", "header",
+})
+
+
+def _is_secret_key(key: Any) -> bool:
+    """True when a mapping key names a credential rather than metadata."""
+    try:
+        toks = [t for t in re.split(r"[^a-z0-9]+", str(key).lower()) if t]
+        if not toks:
+            return False
+        if toks[-1] in _KEY_NAME_DESCRIPTOR:
+            return False
+        if any(t in _SECRET_KEY_WORDS for t in toks):
+            return True
+        return any(frozenset(toks[i:i + 2]) in _SECRET_KEY_PAIRS
+                   for i in range(len(toks) - 1))
+    except Exception:
+        return False
+
+
+def _mask_leaf(s: str) -> str:
+    """Apply the label regexes, then the registry of actually-loaded keys."""
+    try:
+        for p in _SECRETS:
+            s = p.sub(lambda m: m.group(1) + "***", s)
+    except Exception:
+        pass
+    # Registered provider keys, which carry no label of their own.
+    try:
+        s = _scrub(s)
+    except Exception:
+        pass
     return s
+
+
+def _redact_struct(s: Any, depth: int = 0) -> Any:
+    """Recursively redact, preserving the container type."""
+    if depth > 64:
+        return s
+    if isinstance(s, dict):
+        out = {}
+        for k, v in s.items():
+            if _is_secret_key(k) and isinstance(v, str):
+                out[k] = "***"
+            else:
+                out[k] = _redact_struct(v, depth + 1)
+        return out
+    if isinstance(s, list):
+        return [_redact_struct(v, depth + 1) for v in s]
+    if isinstance(s, tuple):
+        return tuple(_redact_struct(v, depth + 1) for v in s)
+    if isinstance(s, set):
+        return {_redact_struct(v, depth + 1) for v in s}
+    if isinstance(s, str):
+        return _mask_leaf(s)
+    # int/float/bool/bytes/None carry no credential material; keep types so
+    # json.dumps and API consumers see the original schema.
+    if s is None or isinstance(s, (int, float, bool, bytes)):
+        return s
+    try:
+        return str(s)
+    except Exception:
+        return s
+
+
+def redact(s):
+    """
+    Mask secrets, preserving the shape of structured input.
+
+    Stage G1 fix: this used to do `s = str(s)` unconditionally, so
+    redact(dict) returned a Python *repr string*. Every JSON emitter
+    then did json.dumps(redact(x)) and produced a quoted string
+    instead of a JSON object -- breaking `-o json`, the HTTP API body
+    and two other dumps. Strings keep the original single-pass regex
+    behaviour (this is the logging hot path via RF.format); structures
+    are walked so the emitters produce real JSON.
+    """
+    if s is None: return s
+    if isinstance(s, str):
+        for p in _SECRETS: s = p.sub(lambda m: m.group(1) + "***", s)
+        # Registered provider keys carry no label of their own, so the
+        # regexes cannot see them. This is the logging hot path (RF.format);
+        # the extra pass is a handful of str.replace over a few registered
+        # values, which is cheaper than the 7 case-insensitive regexes above.
+        try:
+            s = _scrub(s)
+        except Exception:
+            pass
+        return s
+    try:
+        return _redact_struct(s)
+    except Exception:
+        try:
+            return str(s)
+        except Exception:
+            return s
 
 class RF(logging.Formatter):
     def format(self, r):
@@ -319,9 +443,26 @@ socket.setdefaulttimeout(3.0)
 # ============================================================
 #  CONFIG
 # ============================================================
+def _yaml_load_fast(stream):
+    """
+    Parse YAML with the libyaml C loader when available (Stage H1).
+
+    yaml.safe_load() is always pure-Python -- even with libyaml installed
+    -- and measured 1.2-1.8s on config.yaml. CSafeLoader parses
+    identically (verified key-for-key against safe_load on this file) in
+    ~20ms. Falls back to safe_load where libyaml is absent, so behavior
+    never depends on a system package.
+    """
+    try:
+        loader = yaml.CSafeLoader
+    except AttributeError:
+        return yaml.safe_load(stream)
+    return yaml.load(stream, Loader=loader)
+
+
 def load_cfg(p="config.yaml"):
     if not os.path.exists(p): return {}
-    try: return yaml.safe_load(open(p, encoding="utf-8")) or {}
+    try: return _yaml_load_fast(open(p, encoding="utf-8")) or {}
     except Exception as e: log.error(f"config: {e}"); return {}
 
 DEFAULTS = {
@@ -358,7 +499,11 @@ DEFAULTS = {
     "phase_c": {"relationship_confidence": {"base_per_source": 20.0, "min_base": 40.0, "max_confidence": 100.0}},
     "phase_d": {"workers": 8, "cache": {"enabled": True, "db_path": "./reconip_cache.db", "ttl": {}},
                 "rate_limits_per_minute": {"default": 60}},
-    "phase_e": {"enabled": True, "db_path": "./reconip.db", "retention": {}},
+    # phase_e.retention.max_snapshots: cap on stored snapshots per target
+    # (Stage G5). Unbounded growth is the only way this table can fail,
+    # and it fails silently -- so the cap is enforced at write time.
+    "phase_e": {"enabled": True, "db_path": "./reconip.db",
+                "retention": {"evidence_days": 180, "max_snapshots": 100}},
     "phase_f": {"retry": {"max_attempts": 3, "base_delay": 0.5, "max_delay": 5.0, "jitter": 0.2},
                 "circuit": {"fail_threshold": 5, "recovery_timeout": 60}},
     "phase_g": {"dns": {"record_types": ["A","AAAA","PTR","CNAME","MX","NS","TXT","CAA"],
@@ -393,13 +538,15 @@ DEFAULTS = {
            "known_mail_providers": {"google": ["google.com", "googlemail.com", "gmail.com"], "microsoft": ["outlook.com", "office365.com", "protection.outlook.com"], "cloudflare": ["cloudflare.net", "cloudflare.com"], "amazon": ["amazonaws.com", "ses.amazonaws.com"], "proofpoint": ["pphosted.com", "proofpoint.com"], "mimecast": ["mimecast.com"], "zoho": ["zoho.com"], "yandex": ["yandex.net", "yandex.ru"]}},
     "infrastructure": {"include_peering": True, "include_history": True, "rdap_endpoint": "https://rdap.arin.net/registry/ip/{ip}", "asn_lookup_source": "team-cymru", "classify_asn": True, "related_infrastructure": True, "max_sibling_prefixes": 5, "asn_type_patterns": {"hosting": ["google", "amazon", "microsoft", "cloudflare", "akamai", "fastly", "hosting", "datacenter", "vps", "cloud"], "education": ["university", "college", "edu"], "government": ["government", "gov", "ministry"], "isp": ["telecom", "mobile", "broadband", "isp"]}},
     "certificate": {"include_expired": True, "include_san": True, "include_fingerprint": True, "live_handshake": True, "ct_source": "crt.sh", "ct_timeout": 15, "near_expiry_days": 30, "weak_algorithms": ["sha1", "md5"], "min_rsa_key_size": 2048, "max_wildcards_before_warning": 5, "max_shared_san_before_warning": 3, "ignore_private_certs": False},
-    "passive_dns": {"timeline": True, "churn_threshold": 5, "active_window_days": 30, "short_lived_days": 7, "max_related_domains": 50, "max_churn_domains": 20, "sources": []},
+    "passive_dns": {"timeline": True, "churn_threshold": 5, "active_window_days": 30, "short_lived_days": 7, "max_related_domains": 50, "max_churn_domains": 20, "sources": [{"name": "circl_passive_dns", "url": "https://www.circl.lu/pdns/query/{target}", "format": "json", "enabled": True, "reliability": 0.8}, {"name": "rapid7_opendata", "url": "https://opendata.rapid7.com/sonar.fdns_v2/{target}/", "format": "json", "enabled": True, "reliability": 0.7}, {"name": "urlhaus_pdns", "url": "https://urlhaus-api.abuse.ch/v1/host/", "format": "json", "enabled": False, "reliability": 0.8}]},
     "history": {"enabled": True, "db_path": "reconip.db", "compare_fields": ["dns", "asn", "prefix", "certificate", "whois", "threat", "domains"], "severity_map": {"certificate.fingerprint_sha256": "critical", "certificate.issuer_cn": "high", "asn.asn": "critical", "asn.asn_name": "moderate", "prefix.cidr": "high", "prefix.rir": "moderate", "dns.NS": "high", "dns.MX": "moderate", "dns.A": "moderate", "dns.AAAA": "moderate", "dns.TXT": "low", "dns.CAA": "low", "whois.abuse_email": "critical", "whois.org": "moderate", "whois.country": "moderate", "threat.observed_threat_score": "high", "threat.threat_confidence": "high", "domains": "low"}, "max_changes_in_report": 100},
     "anomaly": {"enabled": True, "checks": ["dns", "cert", "asn", "history", "infra", "provider", "stale"], "max_stale_seconds": 86400, "max_anomalies_in_report": 200, "severity_buckets": {"informational": 0, "low": 1, "moderate": 2, "high": 3}},
+    "mitre_mapping": {"anomalies": {"suspicious_dns": ["T1071.004", "T1568"], "certificate_mismatch": ["T1587.003"], "unusual_asn": ["T1583.003"], "fast_flux": ["T1568.001"], "suspicious_tls": ["T1573.002"]}, "patterns": {"high_exposure": ["T1190"], "no_dmarc": ["T1566.001"]}},
+    "threat_actors": {"apt29": {"aliases": ["Cozy Bear", "NOBELIUM"], "indicators": {"asns": ["AS20912", "AS..."], "certificate_issuers": ["..."], "dns_patterns": ["*.mail.*"], "mitre_techniques": ["T1071.001", "..."]}, "confidence_threshold": 0.7}, "lazarus": {"aliases": ["Hidden Cobra"], "indicators": {"asns": [], "certificate_issuers": [], "dns_patterns": [], "mitre_techniques": []}, "confidence_threshold": 0.7}},
     "correlation": {"enabled": True, "min_shared": 1, "include_nodes": True, "include_edges": True, "max_shared_in_report": 100, "max_related_targets": 50, "node_types": ["ip", "asn", "prefix", "organization", "domain", "nameserver", "mailserver", "certificate", "san", "passive_dns_domain", "history", "threat_intel"], "edge_types": ["belongs_to_asn", "in_prefix", "announces", "owned_by", "resolves_to", "has_ptr", "has_nameserver", "has_mailserver", "has_cname", "uses_certificate", "certificate_covers", "appears_in_passive_dns", "has_history", "has_threat_intel"], "notes": ["A shared relationship indicates shared infrastructure, not shared intent.", "Shared ASN, prefix, or nameserver may be normal for CDNs, hosting providers, or cloud platforms.", "Shared certificate is a stronger signal of shared ownership, but can also be a shared CDN certificate.", "Correlation is evidence, not a verdict. Always validate before drawing conclusions."]},
-    "vulnerability": {"enabled": True, "require_validation": True, "use_nvd_api": False, "nvd_api_key_env": "NVD_API_KEY", "min_technology_confidence": 0.7, "max_candidates": 50, "severity_buckets": {"critical": 9.0, "high": 7.0, "medium": 4.0, "low": 0.0}, "notes": ["A CVE matching a version is a CANDIDATE, not a confirmation.", "A candidate is not a vulnerability.", "A vulnerability is not an exploit.", "An exploit is not an impact.", "Validation on the target is required before any conclusion."]},
+    "vulnerability": {"enabled": True, "require_validation": True, "use_nvd_api": False, "nvd_api_key_env": "NVD_API_KEY", "min_technology_confidence": 0.7, "max_candidates": 50, "severity_buckets": {"critical": 9.0, "high": 7.0, "medium": 4.0, "low": 0.0}, "safe_validation": {"enabled": True, "allow_network_probe": True, "timeout": 5, "http_ports": [80, 443, 8080, 8443]}, "notes": ["A CVE matching a version is a CANDIDATE, not a confirmation.", "A candidate is not a vulnerability.", "A vulnerability is not an exploit.", "An exploit is not an impact.", "Validation on the target is required before any conclusion."]},
     "fingerprinting": {"enabled": True, "min_confidence": 0.7, "active_banner_grab": False, "passive_hints": True, "http_head_request": False, "tls_extension_probe": False, "ssh_banner": False, "smtp_banner": False, "dns_version_probe": False, "max_banner_length": 4096, "notes": ["A banner is a hint, not a fact.", "A version is a claim, not a certainty.", "If evidence is insufficient, the tool returns UNKNOWN.", "Active banner grabbing is disabled by default."]},
-    "attack_surface": {"enabled": True, "port_scan": False, "authorized": False, "authorized_targets": [], "include_sensitive": True, "max_services_in_report": 200, "imported_services": [], "notes": ["OPEN \u2260 VULNERABLE.", "A detected service is not a confirmed vulnerability.", "Active scanning is disabled by default.", "No exploitation is performed."]},
+    "attack_surface": {"enabled": True, "authorized": False, "authorized_targets": [], "port_scan": False, "banner_grab": False, "service_probe": False, "max_ports": 1000, "scan_timeout": 300, "include_sensitive": True, "max_services_in_report": 200, "imported_services": [], "notes": ["OPEN \u2260 VULNERABLE.", "A detected service is not a confirmed vulnerability.", "Active scanning is disabled by default.", "No exploitation is performed."]},
     "timeouts": {"default": 10, "dns": 5, "http": 10},
     "confidence": {"enabled": True, "separate": True, "weights": {"data": 0.4, "threat": 0.3, "geo": 0.2, "assessment": 0.1}, "data_weights": {"freshness": 0.4, "status": 0.3, "coverage": 0.3}, "threat_weights": {"coverage": 0.4, "agreement": 0.3, "freshness": 0.3}, "geo_weights": {"country_agreement": 0.5, "field_availability": 0.5}, "labels": {"high": 0.85, "moderate": 0.65, "low": 0.40, "very_low": 0.0}, "notes": ["Confidence is not accuracy.", "Confidence is not certainty.", "Confidence is the tool's own estimation of how much it knows.", "A low-confidence report is not a bad report — it is an honest one."]},
     "scoring": {"enabled": True, "explain": True, "weights": {"threat": 1.0, "infra": 0.8, "data_quality": 0.6, "exposure": 0.7, "anomaly": 0.5, "coverage": 0.4}, "labels": {"very_low": 0.0, "low": 20.0, "moderate": 40.0, "high": 60.0, "very_high": 80.0}, "notes": ["A score is not a verdict.", "A score is not a fact.", "A score is an explainable estimate.", "Every score must answer: WHY this number?"]},
@@ -412,8 +559,8 @@ DEFAULTS = {
                            "warning": "yellow", "danger": "red", "muted": "dim",
                            "highlight": "bold white", "border": "cyan",
                            "label": "bold", "value": ""}},
-    "batch": {"enabled": True, "max_workers": 4, "max_workers_hard_limit": 16, "max_targets": 1000, "correlate": True, "quiet": False, "input_file": {"allow_comments": True, "allow_blank_lines": True, "strip_whitespace": True}, "notes": ["Each target is processed in isolation.", "One target's failure does not affect another.", "Cross-target correlation is evidence-driven.", "A shared relationship across targets is not shared intent."]},
-    "performance": {"parallel": True, "max_workers": 8, "timeout_budget": 30, "min_timeout_budget": 10, "max_timeout_budget": 120, "default_min_interval": 0.0, "rate_limits": {"abuseipdb": 2.0, "virustotal": 15.0, "threatfox": 1.0, "alienvault": 6.0, "greynoise": 3.0, "spamhaus_drop": 5.0, "urlhaus": 2.0, "feodo": 2.0, "sslbl": 2.0, "cins": 2.0}, "priority_weights": {"reliability": 0.5, "weight": 0.3, "configured_bonus": 0.2}, "circuit_breaker": {"error_rate_threshold": 0.8, "penalty": 1.0}, "cache": {"enabled": True, "ttl_seconds": 3600}, "notes": ["Speed is a property of execution, not a property of evidence.", "Every provider still returns an Evidence object.", "Failed providers are never silently skipped.", "Rate limits are enforced locally per provider.", "Timeout budget caps total provider time."]},
+    "batch": {"enabled": True, "max_workers": 4, "max_workers_hard_limit": 32, "max_targets": 1000, "correlate": True, "quiet": False, "input_file": {"allow_comments": True, "allow_blank_lines": True, "strip_whitespace": True}, "notes": ["Each target is processed in isolation.", "One target's failure does not affect another.", "Cross-target correlation is evidence-driven.", "A shared relationship across targets is not shared intent."]},
+    "performance": {"parallel": True, "max_workers": 8, "timeout_budget": 30, "min_timeout_budget": 10, "max_timeout_budget": 120, "default_min_interval": 0.0, "provider_timeouts": {"abuseipdb": 5, "virustotal": 8, "threatfox": 4, "alienvault": 6, "greynoise": 5, "cins": 3, "feodo": 3, "spamhaus_drop": 4, "sslbl": 3, "urlhaus": 4}, "rate_limits": {"abuseipdb": 2.0, "virustotal": 15.0, "threatfox": 1.0, "alienvault": 6.0, "greynoise": 3.0, "spamhaus_drop": 5.0, "urlhaus": 2.0, "feodo": 2.0, "sslbl": 2.0, "cins": 2.0}, "priority_weights": {"reliability": 0.5, "weight": 0.3, "configured_bonus": 0.2}, "circuit_breaker": {"error_rate_threshold": 0.8, "penalty": 1.0}, "cache": {"enabled": True, "ttl_seconds": 3600}, "notes": ["Speed is a property of execution, not a property of evidence.", "Every provider still returns an Evidence object.", "Failed providers are never silently skipped.", "Rate limits are enforced locally per provider.", "Timeout budget caps total provider time."]},
     "cache": {"enabled": True, "db_path": "reconip_cache.db", "ttl_seconds": 3600, "stale_threshold": 7200, "expired_threshold": 86400, "purge_expired": True, "cache_failures": False, "cache_provider_results": True, "cache_dns": True, "cache_whois": True, "cache_certificates": True, "cache_passive_dns": True, "provider_ttls": {"abuseipdb": 1800, "virustotal": 3600, "alienvault": 3600, "greynoise": 1800, "spamhaus_drop": 7200, "threatfox": 1800, "urlhaus": 1800, "feodo": 3600, "sslbl": 3600, "cins": 3600}, "section_ttls": {"dns": 3600, "whois": 86400, "certificate": 86400, "passive_dns": 3600}, "notes": ["Cache is a memory, not a source of truth.", "FRESH cache may skip a query.", "STALE cache is marked and used only as fallback.", "EXPIRED cache is never used.", "Failed providers are never cached."]},
 }
 
@@ -455,9 +602,60 @@ def http_class(s):
     if 400 <= s < 500: return EC.PERMANENT.value
     return EC.TRANSIENT.value
 
+def _is_dns_failure(e: BaseException) -> bool:
+    """
+    True when the exception means "this hostname does not resolve".
+
+    Stage H1: measured 12.1s burned retrying api.bgpview.io, a host that
+    returns NXDOMAIN from this network. Retrying an unresolvable name
+    inside one scan never succeeds -- each attempt just pays the
+    resolver's own timeout again (0.2s, 8.6s, 5.0s observed) -- so it is
+    classified PERMANENT and fails fast. Anything else keeps the existing
+    classification: a refused/timeout connection may genuinely recover.
+    """
+    seen = set()
+    stack = [e]
+    while stack:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        name = type(cur).__name__
+        if name in ("NameResolutionError",):
+            return True
+        if isinstance(cur, socket.gaierror):
+            return True
+        try:
+            msg = str(cur)
+        except Exception:
+            msg = ""
+        if msg and ("Failed to resolve" in msg or "Name or service not known" in msg
+                    or "nodename nor servname" in msg):
+            return True
+        for nxt in (getattr(cur, "__cause__", None), getattr(cur, "__context__", None)):
+            if isinstance(nxt, BaseException):
+                stack.append(nxt)
+        try:
+            args = getattr(cur, "args", ())
+        except Exception:
+            args = ()
+        for a in args if isinstance(args, tuple) else ():
+            if isinstance(a, BaseException):
+                stack.append(a)
+    return False
+
+
 def exc_class(e):
     if isinstance(e, requests.exceptions.Timeout): return EC2.TIMEOUT
-    if isinstance(e, requests.exceptions.ConnectionError): return EC2.NETWORK
+    if isinstance(e, requests.exceptions.ConnectionError):
+        # DNS failure is permanent for the duration of a scan; everything
+        # else connection-shaped stays retryable.
+        try:
+            if _is_dns_failure(e):
+                return EC.PERMANENT.value
+        except Exception:
+            pass
+        return EC2.NETWORK
     if isinstance(e, json.JSONDecodeError): return EC3.INVALID
     if isinstance(e, socket.gaierror): return EC2.NETWORK
     if isinstance(e, (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer)): return EC.PERMANENT.value
@@ -1353,11 +1551,28 @@ def _ip_in_cidr(ip: str, cidr: str) -> bool:
 def load_providers(config: Dict[str, Any]) -> Dict[str, BaseProvider]:
     """Instantiate all enabled providers from config (Stage 3)."""
     providers: Dict[str, BaseProvider] = {}
+    # Stage H3: performance.provider_timeouts wins over a provider
+    # block's own `timeout` when present and positive; anything else
+    # falls back silently to the block value.
+    try:
+        _timeouts = (config.get("performance", {}) or {}).get("provider_timeouts", {}) or {}
+    except Exception:
+        _timeouts = {}
+    if not isinstance(_timeouts, dict):
+        _timeouts = {}
     for name, pconfig in (config.get("providers", {}) or {}).items():
         if not pconfig.get("enabled", True):
             continue
         ptype = pconfig.get("type", "http")
         if ptype == "http":
+            try:
+                _t = _timeouts.get(name)
+                _t = float(_t) if _t is not None else None
+                if _t is not None and _t > 0:
+                    pconfig = dict(pconfig)
+                    pconfig["timeout"] = _t
+            except Exception:
+                pass
             providers[name] = HTTPProvider(name, pconfig)
             PROVIDERS_REGISTRY[name] = HTTPProvider
         else:
@@ -1685,11 +1900,17 @@ def _get_session() -> "requests.Session":
     """
     if not hasattr(_thread_local, "session"):
         session = requests.Session()
-        # Sensible defaults for connection reuse
+        # Sensible defaults for connection reuse.
+        #
+        # Stage H1: sized for the provider fan-out (8 workers over up to
+        # ~10 distinct hosts). pool_connections is the number of per-host
+        # pools kept alive; pool_maxsize caps connections per host. Both
+        # comfortably exceed the fan-out so a worker never blocks waiting
+        # for another worker's connection to free up.
         try:
             adapter = requests.adapters.HTTPAdapter(
-                pool_connections=4,
-                pool_maxsize=8,
+                pool_connections=10,
+                pool_maxsize=16,
                 max_retries=0  # retries handled explicitly
             )
             session.mount("https://", adapter)
@@ -2700,6 +2921,117 @@ class Health:
 _health = {}
 _hl = threading.Lock()
 
+# ============================================================
+#  METRICS & OBSERVABILITY — Phase K4 (Prometheus)
+#  In-process counters only: no files, no network, no new deps.
+#  Rendered as Prometheus text exposition (GET /metrics with
+#  `Accept: text/plain`, or `python3 reconip.py --metrics`).
+#  Recording never raises and never affects scan results.
+# ============================================================
+_METRICS_LOCK = threading.Lock()
+_METRICS = {
+    "scans": {},            # "success" | "failed" -> count
+    "duration_count": 0,    # scans with a measured duration
+    "duration_sum": 0.0,    # total scan wall-clock seconds
+    "threat": {},           # target -> last observed threat score
+}
+
+
+def metrics_record_scan(out: Dict[str, Any]) -> None:
+    """Record one finished recon() call. Never raises."""
+    try:
+        if not isinstance(out, dict):
+            return
+        status = str(out.get("scan_status", "") or "").upper()
+        key = "failed" if status == "FAILED" else "success"
+        try:
+            duration = float(out.get("execution_time", 0) or 0)
+        except Exception:
+            duration = 0.0
+        if duration < 0:
+            duration = 0.0
+        target = out.get("ip") or out.get("input") or out.get("target")
+        score = None
+        try:
+            ti = out.get("threat_intelligence", {}) or {}
+            if isinstance(ti, dict) and ti.get("observed_threat_score") is not None:
+                score = float(ti.get("observed_threat_score"))
+        except Exception:
+            score = None
+        with _METRICS_LOCK:
+            _METRICS["scans"][key] = _METRICS["scans"].get(key, 0) + 1
+            _METRICS["duration_count"] += 1
+            _METRICS["duration_sum"] += duration
+            if score is not None and target is not None:
+                try:
+                    _METRICS["threat"][str(target)] = score
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _prom_escape(value: Any) -> str:
+    """Escape a Prometheus label value. Never raises."""
+    try:
+        return (str(value).replace("\\", "\\\\")
+                           .replace('"', '\\"')
+                           .replace("\n", "\\n"))
+    except Exception:
+        return "?"
+
+
+def render_prometheus() -> str:
+    """Render the full metrics registry in Prometheus exposition format."""
+    try:
+        with _METRICS_LOCK:
+            scans = dict(_METRICS.get("scans", {}) or {})
+            dcount = int(_METRICS.get("duration_count", 0) or 0)
+            dsum = float(_METRICS.get("duration_sum", 0.0) or 0.0)
+            threats = dict(_METRICS.get("threat", {}) or {})
+    except Exception:
+        scans, dcount, dsum, threats = {}, 0, 0.0, {}
+    try:
+        with _hl:
+            health = list(_health.items())
+    except Exception:
+        health = []
+    lines = [
+        "# HELP reconip_scans_total Total finished scans by status.",
+        "# TYPE reconip_scans_total counter",
+    ]
+    try:
+        for status in ("success", "failed"):
+            lines.append(f'reconip_scans_total{{status="{status}"}} '
+                         f'{int(scans.get(status, 0) or 0)}')
+        lines += [
+            "# HELP reconip_scan_duration_seconds Scan wall-clock duration.",
+            "# TYPE reconip_scan_duration_seconds summary",
+            f"reconip_scan_duration_seconds_count {dcount}",
+            f"reconip_scan_duration_seconds_sum {dsum:.3f}",
+            "# HELP reconip_threat_score Last observed threat score (0-100) by target.",
+            "# TYPE reconip_threat_score gauge",
+        ]
+        for target in sorted(threats):
+            try:
+                lines.append(f'reconip_threat_score{{target="{_prom_escape(target)}"}} '
+                             f'{float(threats[target]):.1f}')
+            except Exception:
+                continue
+        lines += [
+            "# HELP reconip_provider_errors_total Total provider failures by provider.",
+            "# TYPE reconip_provider_errors_total counter",
+        ]
+        for name, h in sorted(health, key=lambda kv: str(kv[0])):
+            try:
+                lines.append(f'reconip_provider_errors_total{{provider="{_prom_escape(name)}"}} '
+                             f'{int(getattr(h, "fail", 0) or 0)}')
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return "\n".join(lines) + "\n"
+
 def H(n):
     with _hl:
         if n not in _health: _health[n] = Health(n)
@@ -3019,20 +3351,68 @@ def geo_maxmind(ip):
 GEO = {"ip_api": geo_ipapi, "ipinfo": geo_ipinfo,
        "freegeoip": geo_freegeoip, "maxmind_local": geo_maxmind}
 
-def collect_geo(ip):
-    evs, att, resp = [], 0, 0
-    for name in CFG["sources"]["geo"]["enabled"]:
-        fn = GEO.get(name)
-        if not fn: continue
-        att += 1
+def _collect_geo_from_source(name, fn, ip):
+    """
+    Query one geo source and return its evidence list (Stage H1 worker).
+
+    The body is the per-source logic formerly inline in collect_geo(),
+    unchanged: same norm_geo() shaping, same soft-fail. Returns
+    (evidences, answered). Never raises.
+    """
+    try:
         try:
             r = fn(ip)
             if r is not None:
-                resp += 1
-                evs.extend(norm_geo(r, name, ip))
+                return norm_geo(r, name, ip), True
+            return [], False
         except Exception as e:
             log.warning(f"geo {name}: {e}")
             H(name).failure(exc_class(e), 0)
+            return [], False
+    except Exception:
+        return [], False
+
+
+def collect_geo(ip):
+    """
+    Geo collector — sequential sources, Stage H1 parallel fan-out.
+
+    Stage H1: geo sources are independent HTTP lookups, queried
+    concurrently (one worker each) instead of stacking their latencies.
+    Results rejoin in configured-source order, so the emitted evidence
+    list is ordered exactly as the old sequential loop produced it.
+    """
+    evs, att, resp = [], 0, 0
+    sources = [(name, GEO.get(name)) for name in CFG["sources"]["geo"]["enabled"]]
+    sources = [(name, fn) for name, fn in sources if fn]
+    att = len(sources)
+    if not sources:
+        return evs, module_status(att, resp)
+    if len(sources) == 1:
+        name, fn = sources[0]
+        src_evs, answered = _collect_geo_from_source(name, fn, ip)
+        evs.extend(src_evs)
+        if answered:
+            resp += 1
+        return evs, module_status(att, resp)
+    per_source: Dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=len(sources),
+                            thread_name_prefix="reconip-geo") as ex:
+        future_map = {
+            ex.submit(_collect_geo_from_source, name, fn, ip): name
+            for name, fn in sources
+        }
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                per_source[name] = future.result()
+            except Exception:
+                per_source[name] = ([], False)
+    for name, _fn in sources:
+        src_evs, answered = per_source.get(name, ([], False))
+        evs.extend(src_evs)
+        if answered:
+            resp += 1
     return evs, module_status(att, resp)
 
 # ============================================================
@@ -3138,20 +3518,21 @@ def asn_whois(ip):
 ASN = {"ripe": asn_ripe, "bgpview": asn_bgpview,
        "bgp_he": asn_bgp_he, "whois": asn_whois}
 
-def collect_asn(ip):
+def _collect_asn_from_source(name, fn, ip):
     """
-    ASN/WHOIS collector — Stage 2 refactored to Evidence (v31).
-    Wraps each field via make_evidence for traceability.
+    Query one ASN source and return its evidence list (Stage H1 worker).
+
+    The body is the per-source logic formerly inline in collect_asn(),
+    unchanged field for field: same confidence defaults, same metadata,
+    same soft-fail (exception or None result yields no evidence from this
+    source, never an abort). Returns (evidences, answered) where answered
+    mirrors the inline loop's resp increment.
     """
-    evs, att, resp = [], 0, 0
-    for name in CFG["sources"]["network"]["asn_sources"]:
-        fn = ASN.get(name)
-        if not fn: continue
-        att += 1
+    try:
+        evs = []
         try:
             r = fn(ip)
             if r is not None:
-                resp += 1
                 for f in ("asn", "organization", "prefix", "rir", "country",
                           "abuse_contact", "created", "updated"):
                     v = r.get(f)
@@ -3168,9 +3549,57 @@ def collect_asn(ip):
                             metadata={"field": f, "data_type": "asn", "target": ip, "raw_value": v, "provider": name}
                         )
                         evs.append(ev)
+                return evs, True
+            return [], False
         except Exception as e:
             log.warning(f"asn {name}: {e}")
             H(name).failure(exc_class(e), 0)
+            return [], False
+    except Exception:
+        return [], False
+
+
+def collect_asn(ip):
+    """
+    ASN/WHOIS collector — Stage 2 refactored to Evidence (v31).
+    Wraps each field via make_evidence for traceability.
+
+    Stage H1: ASN sources are queried concurrently (one worker each), so
+    total latency is bounded by the slowest source instead of the sum.
+    Results rejoin in configured-source order -- the emitted evidence
+    list is ordered exactly as the old sequential loop produced it.
+    """
+    evs, att, resp = [], 0, 0
+    sources = [(name, ASN.get(name)) for name in CFG["sources"]["network"]["asn_sources"]]
+    sources = [(name, fn) for name, fn in sources if fn]
+    att = len(sources)
+    if not att:
+        return evs, MS.SKIPPED.value
+    if len(sources) == 1:
+        name, fn = sources[0]
+        src_evs, answered = _collect_asn_from_source(name, fn, ip)
+        evs.extend(src_evs)
+        if answered:
+            resp += 1
+    else:
+        per_source: Dict[str, Any] = {}
+        with ThreadPoolExecutor(max_workers=len(sources),
+                                thread_name_prefix="reconip-asn") as ex:
+            future_map = {
+                ex.submit(_collect_asn_from_source, name, fn, ip): name
+                for name, fn in sources
+            }
+            for future in as_completed(future_map):
+                name = future_map[future]
+                try:
+                    per_source[name] = future.result()
+                except Exception:
+                    per_source[name] = ([], False)
+        for name, _fn in sources:
+            src_evs, answered = per_source.get(name, ([], False))
+            evs.extend(src_evs)
+            if answered:
+                resp += 1
     if not att: st = MS.SKIPPED.value
     elif resp == 0: st = MS.FAILED.value
     elif len(evs) > 0: st = MS.SUCCESS.value
@@ -3356,8 +3785,53 @@ def prefix_analysis(ip: str, config: Dict[str, Any], asn_data: Dict[str, Any]) -
         result["confidence"] = 0.9
     return result
 
+def _extract_rdap_entities(rdap_data):
+    """Extract all entities from RDAP vCard (Stage I3)."""
+    result = {
+        "abuse_email": None,
+        "admin_email": None,
+        "tech_email": None,
+        "registrant_email": None,
+    }
+    try:
+        entities = (rdap_data or {}).get("entities", []) or []
+    except Exception:
+        return result
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        roles = entity.get("roles", []) or []
+        vcard = entity.get("vcardArray", []) or []
+        if len(vcard) > 1 and isinstance(vcard[1], list):
+            for item in vcard[1]:
+                # Guard the index: one malformed vCard item must not
+                # cost the other contacts.
+                if not isinstance(item, list) or len(item) <= 3:
+                    continue
+                if item[0] == "email":
+                    email = item[3]
+                    if "abuse" in roles:
+                        result["abuse_email"] = email
+                    elif "administrative" in roles:
+                        result["admin_email"] = email
+                    elif "technical" in roles:
+                        result["tech_email"] = email
+                    elif "registrant" in roles:
+                        result["registrant_email"] = email
+    return result
+
+
 def _rdap_lookup(ip: str, config: Dict[str, Any]) -> Dict[str, Any]:
-    """Query RDAP for IP information via ARIN (Stage 6)."""
+    """Query RDAP for IP information via ARIN (Stage 6).
+
+    Stage H1: two changes, both behavior-preserving for callers.
+    (1) The pooled thread-local session is used instead of a fresh
+    requests.get per call (connection reuse; H1 pooling theme).
+    (2) Successful answers are cached (RDAP registrations change on a
+    timescale of months; the whois section TTL of 86400s applies). Only
+    complete answers are cached -- errors and empty results are always
+    re-queried, so a transient ARIN failure can never poison the cache.
+    """
     result: Dict[str, Any] = {
         "handle": None,
         "name": None,
@@ -3372,6 +3846,16 @@ def _rdap_lookup(ip: str, config: Dict[str, Any]) -> Dict[str, Any]:
         "confidence": 0.0,
         "source": "rdap"
     }
+    cache_key = f"rdap:{ip}"
+    try:
+        cached = cache_get(cache_key, config)
+        if isinstance(cached, dict) and cached.get("status") == "FRESH":
+            try:
+                return json.loads(json.dumps(cached["value"]))
+            except Exception:
+                pass
+    except Exception:
+        pass
     try:
         url = f"https://rdap.arin.net/registry/ip/{ip}"
         timeout = 10
@@ -3379,7 +3863,7 @@ def _rdap_lookup(ip: str, config: Dict[str, Any]) -> Dict[str, Any]:
             timeout = int(config.get("timeouts", {}).get("http", 10))
         except Exception:
             pass
-        resp = requests.get(url, timeout=timeout, headers={"Accept": "application/rdap+json"})
+        resp = _get_session().get(url, timeout=timeout, headers={"Accept": "application/rdap+json"})
         if resp.status_code != 200:
             result["error"] = f"RDAP HTTP {resp.status_code}"
             return result
@@ -3415,6 +3899,46 @@ def _rdap_lookup(ip: str, config: Dict[str, Any]) -> Dict[str, Any]:
             result["netrange"] = result["cidr"]
         result["status"] = data.get("status", [])
         result["confidence"] = 0.9
+        # Stage I3: follow the registrant handle to its entity record.
+        # The IP-level response carries no contact emails at all
+        # (measured for 8.8.8.8: one registrant entity, zero vCard
+        # emails); ARIN keeps abuse/admin/tech contacts on the entity
+        # object. Soft on any failure: IP-level data stands on its own.
+        try:
+            _handle = None
+            for _ent in (data.get("entities", []) or []):
+                if not isinstance(_ent, dict):
+                    continue
+                _roles = [str(_r).lower()
+                          for _r in (_ent.get("roles", []) or [])]
+                if "registrant" in _roles and _ent.get("handle"):
+                    _handle = str(_ent["handle"])
+                    break
+            if _handle:
+                _ent_resp = _get_session().get(
+                    f"https://rdap.arin.net/registry/entity/{_handle}",
+                    timeout=timeout,
+                    headers={"Accept": "application/rdap+json"})
+                if _ent_resp.status_code == 200:
+                    _contacts = _extract_rdap_entities(_ent_resp.json() or {})
+                    for _k in ("abuse_email", "admin_email",
+                               "tech_email", "registrant_email"):
+                        if _contacts.get(_k):
+                            result[_k] = _contacts[_k]
+        except Exception:
+            pass
+        # Cache complete answers only (see docstring): a handle means
+        # ARIN actually answered for this IP.
+        if result.get("handle"):
+            try:
+                ttl = 86400
+                try:
+                    ttl = int(((config.get("cache", {}) or {}).get("section_ttls", {}) or {}).get("whois", 86400))
+                except Exception:
+                    pass
+                cache_set(cache_key, result, config, ttl_seconds=ttl, source="rdap")
+            except Exception:
+                pass
     except Exception as e:
         result["error"] = str(e)
     return result
@@ -3540,6 +4064,41 @@ def dns_val(rt, ans):
         except: return str(ans)
     return str(ans)
 
+def _sorted_dns_answers(resolver, name: str, rtype: str):
+    """
+    Resolve one RRset and return its answers in canonical order.
+
+    Stage G2: recursive resolvers rotate the order of an RRset between
+    queries. Cloudflare/OpenDNS answers 208.67.222.222 as
+    [1.1.1.1, 1.0.0.1] on one call and [1.0.0.1, 1.1.1.1] on the next, so
+    two scans of the same host produced different evidence list orders
+    for an identical record set. dns_val() always returns a str, so
+    ordering on the rendered value is well defined and total.
+
+    Fails soft exactly as the previous inline loop did: every resolver
+    exception yields an empty list rather than propagating.
+    """
+    try:
+        answers = list(resolver.resolve(name, rtype))
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer,
+            dns.resolver.NoNameservers, dns.exception.Timeout):
+        return []
+    except Exception:
+        return []
+
+    def _key(ans):
+        try:
+            return dns_val(rtype, ans)
+        except Exception:
+            return str(ans)
+
+    try:
+        answers.sort(key=_key)
+    except Exception:
+        pass
+    return answers
+
+
 def format_caa(caa_records):
     """
     Convert CAA records from bytes to human-readable strings (B1 fix).
@@ -3555,25 +4114,80 @@ def format_caa(caa_records):
         formatted.append({'flags': flags, 'tag': tag, 'value': value})
     return formatted
 
-def collect_dns(ip, domain=None):
+class _DaemonPool:
     """
-    DNS collector — Stage 2 refactored to return Evidence objects (v31).
-    Every record is wrapped via make_evidence with source, timestamp, confidence, freshness.
-    Returns List[Evidence] for traceability while remaining compatible with legacy Ev pipeline.
+    Minimal executor with daemon workers (Stage H1).
+
+    Used ONLY for fan-outs that deliberately abandon stragglers (the DNS
+    nameserver join deadline). An abandoned worker's answer is explicitly
+    expendable, so letting it die with the process is correct; a default
+    pool's non-daemon threads would hold interpreter exit on a socket
+    timeout that no longer matters to anyone. Fan-outs that always join
+    their workers keep the standard ThreadPoolExecutor.
+
+    Implements just the surface collect_dns() uses -- submit(), cancel()
+    via the returned Future, concurrent.futures.wait() compatibility
+    (standard Future objects), and shutdown() -- with a semaphore
+    bounding concurrency at max_workers.
     """
-    evs, att, resp = [], 0, 0
-    rtypes = tuple(PG["dns"].get("record_types", ["A","AAAA","PTR","CNAME","MX","NS","TXT","CAA"]))
-    try: rev = dns.reversename.from_address(ip)
-    except Exception: rev = None
-    for ns in CFG["sources"]["dns"]["nameservers"]:
-        att += 1; found = False
+    def __init__(self, max_workers=1, thread_name_prefix="reconip-daemon"):
+        import threading as _th
+        self._sem = _th.BoundedSemaphore(max(1, int(max_workers or 1)))
+        self._prefix = thread_name_prefix
+        self._count = 0
+
+    def submit(self, fn, *args, **kwargs):
+        import threading as _th
+        fut = concurrent.futures.Future()
+
+        def _run():
+            with self._sem:
+                try:
+                    _res = fn(*args, **kwargs)
+                except BaseException as _e:
+                    try:
+                        fut.set_exception(_e)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        fut.set_result(_res)
+                    except Exception:
+                        pass
+        self._count += 1
+        t = _th.Thread(target=_run, daemon=True,
+                       name=f"{self._prefix}-{self._count}")
+        t.start()
+        return fut
+
+    def shutdown(self, wait=True, **kwargs):
+        pass
+
+
+def _collect_dns_from_ns(ns, ip, domain, rtypes):
+    """
+    Query one nameserver for PTR + forward records (Stage H2 worker).
+
+    The body is the per-nameserver logic formerly inline in collect_dns(),
+    unchanged query for query: same resolver settings, same evidence
+    shapes, same health accounting. Returns (evidences, found) where
+    found mirrors the inline loop's per-NS success flag. Never raises --
+    a dead nameserver yields ([], False), exactly as before.
+    """
+    try:
+        evs = []
+        try:
+            rev = dns.reversename.from_address(ip)
+        except Exception:
+            rev = None
+        found = False
         try:
             r = dns.resolver.Resolver()
             r.nameservers = [ns]; r.timeout = 2; r.lifetime = 2
             ptr_hosts = []
             if "PTR" in rtypes and rev:
                 try:
-                    for a in r.resolve(rev, "PTR"):
+                    for a in _sorted_dns_answers(r, rev, "PTR"):
                         v = str(a.target).rstrip(".")
                         ptr_hosts.append(v)
                         # Stage 2: Evidence via make_evidence (with dict raw_value for network_intel)
@@ -3601,34 +4215,109 @@ def collect_dns(ip, domain=None):
                 direction = "forward" if (domain and name == domain) else "forward_from_ptr"
                 for rt in rtypes:
                     if rt == "PTR": continue
-                    try:
-                        for ans in r.resolve(name, rt):
-                            v = dns_val(rt, ans)
-                            ev = make_evidence(
-                                source=f"dns:{ns}",
-                                value=v,
-                                normalized_value=str(v).strip().lower() if isinstance(v, str) else str(v).lower(),
-                                confidence=CFG.get("evidence", {}).get("confidence_defaults", {}).get("dns", 0.95),
-                                status="OK",
-                                ttl_key="dns",
-                                metadata={"record_type": rt, "ns": ns, "name": name, "direction": direction,
-                                          "data_type": "dns", "field": rt, "target": ip, "raw_value": {"ns": ns, "name": name, "direction": direction, "value": v}}
-                            )
-                            evs.append(ev)
-                            found = True
-                    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer,
-                            dns.resolver.NoNameservers, dns.exception.Timeout):
-                        continue
-                    except Exception:
-                        continue
+                    for ans in _sorted_dns_answers(r, name, rt):
+                        v = dns_val(rt, ans)
+                        ev = make_evidence(
+                            source=f"dns:{ns}",
+                            value=v,
+                            normalized_value=str(v).strip().lower() if isinstance(v, str) else str(v).lower(),
+                            confidence=CFG.get("evidence", {}).get("confidence_defaults", {}).get("dns", 0.95),
+                            status="OK",
+                            ttl_key="dns",
+                            metadata={"record_type": rt, "ns": ns, "name": name, "direction": direction,
+                                      "data_type": "dns", "field": rt, "target": ip, "raw_value": {"ns": ns, "name": name, "direction": direction, "value": v}}
+                        )
+                        evs.append(ev)
+                        found = True
             if found:
-                resp += 1; H(f"dns:{ns}").success(0)
+                H(f"dns:{ns}").success(0)
             else:
                 H(f"dns:{ns}").failure(EC.PERMANENT.value, 0)
         except dns.exception.Timeout:
             H(f"dns:{ns}").failure(EC2.TIMEOUT, 0)
         except Exception as e:
             H(f"dns:{ns}").failure(exc_class(e), 0)
+        return evs, found
+    except Exception:
+        return [], False
+
+
+def collect_dns(ip, domain=None):
+    """
+    DNS collector — Stage 2 refactored to return Evidence objects (v31).
+    Every record is wrapped via make_evidence with source, timestamp, confidence, freshness.
+    Returns List[Evidence] for traceability while remaining compatible with legacy Ev pipeline.
+
+    Stage H2: the configured nameservers are queried concurrently (one
+    worker each), so total latency is bounded by the slowest nameserver
+    instead of the sum. Results rejoin in configured-nameserver order --
+    the emitted evidence list is ordered exactly as the old sequential
+    loop produced it, so downstream consumers see no structural change.
+    """
+    evs, att, resp = [], 0, 0
+    rtypes = tuple(PG["dns"].get("record_types", ["A","AAAA","PTR","CNAME","MX","NS","TXT","CAA"]))
+    nameservers = list(CFG["sources"]["dns"]["nameservers"])
+    att = len(nameservers)
+    if not nameservers:
+        return evs, module_status(att, resp)
+    if len(nameservers) == 1:
+        ns_evs, found = _collect_dns_from_ns(nameservers[0], ip, domain, rtypes)
+        evs.extend(ns_evs)
+        if found:
+            resp += 1
+        return evs, module_status(att, resp)
+    per_ns: Dict[str, Any] = {}
+    # Stage H1: join deadline. Each query inside a worker is already
+    # capped by the resolver lifetime (2s), but a lossy nameserver can
+    # burn that once per query -- measured 4.2s from one slow NS while
+    # the other two answered in 0.5s. The deadline keeps the completed
+    # nameservers' data and drops the straggler instead of stacking its
+    # timeouts onto the scan. DNS answers are replicated across the
+    # configured nameservers by design, so a dropped straggler loses
+    # redundancy, not unique data. 3.0s is ~6x the healthy 0.5s fan-out.
+    _NS_JOIN_BUDGET = 3.0
+    _ns_ex = _DaemonPool(max_workers=len(nameservers),
+                           thread_name_prefix="reconip-dns-ns")
+    try:
+        future_map = {
+            _ns_ex.submit(_collect_dns_from_ns, ns, ip, domain, rtypes): ns
+            for ns in nameservers
+        }
+        _done, _not_done = wait(list(future_map.keys()),
+                                timeout=_NS_JOIN_BUDGET,
+                                return_when=concurrent.futures.ALL_COMPLETED)
+        for future in _done:
+            ns = future_map[future]
+            try:
+                per_ns[ns] = future.result()
+            except Exception:
+                per_ns[ns] = ([], False)
+        for future in _not_done:
+            ns = future_map[future]
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            if ns not in per_ns:
+                log.debug(f"dns nameserver {ns} exceeded join budget; "
+                          f"continuing with the answering nameservers")
+                H(f"dns:{ns}").failure(EC2.TIMEOUT, int(_NS_JOIN_BUDGET * 1000))
+                per_ns[ns] = ([], False)
+    finally:
+        # Do NOT wait for stragglers: the budget is a hard cap. Abandoned
+        # workers finish their (lifetime-capped) queries on their own.
+        try:
+            _ns_ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            try:
+                _ns_ex.shutdown(wait=False)
+            except Exception:
+                pass
+    for ns in nameservers:
+        ns_evs, found = per_ns.get(ns, ([], False))
+        evs.extend(ns_evs)
+        if found:
+            resp += 1
     return evs, module_status(att, resp)
 
 # ============================================================
@@ -3656,10 +4345,102 @@ def _normalize_dns_record(rtype: str, raw: str) -> str:
         return re.sub(r'\s+', ' ', raw).strip()
     return raw
 
-def dns_collect(target: str, config: Dict[str, Any]) -> List[Evidence]:
+def _resolve_one(target: str, rtype: str, config: Dict[str, Any]) -> List[Evidence]:
     """
-    Collect DNS records for a target and return them as Evidence objects (Stage 5).
-    Handles both IP targets (PTR) and domain targets (A, AAAA, NS, MX, TXT, CAA, SOA, CNAME).
+    Resolve exactly one record type and return its evidence list (Stage H2).
+
+    The body is the per-type logic formerly inline in dns_collect(),
+    unchanged outcome for outcome: OK answers, PARTIAL no-answer/NXDOMAIN,
+    FAILED no-nameservers/timeout/unexpected. Never raises -- a resolver
+    fault for one type is evidence, not an exception, so a dead CAA query
+    can never cost the operator the A/AAAA/MX answers.
+
+    Each call builds its own Resolver: resolvers hold per-query socket
+    state, so sharing one instance across the H2 worker threads would
+    trade a microseconds-cheap constructor for a correctness question.
+    """
+    timeout = 5
+    try:
+        timeout = int((config.get("timeouts", {}) or {}).get("dns", 5))
+    except Exception:
+        timeout = 5
+    # Also check phase_g or other
+    if timeout == 5 and (config.get("phase_g", {}) or {}).get("dns", {}).get("timeout"):
+        try:
+            timeout = int(config["phase_g"]["dns"]["timeout"])
+        except Exception:
+            pass
+    evidences: List[Evidence] = []
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = timeout
+        resolver.lifetime = timeout
+    except Exception:
+        return [make_evidence(
+            source="dns", value=None, normalized_value=None,
+            confidence=0.0, status="FAILED", ttl_key="dns",
+            metadata={"record_type": rtype, "reason": "resolver init failed",
+                      "data_type": "dns", "field": rtype, "target": target}
+        )]
+    try:
+        answers = resolver.resolve(target, rtype, raise_on_no_answer=False)
+        if answers is None or answers.rrset is None:
+            evidences.append(make_evidence(
+                source="dns", value=None, normalized_value=None,
+                confidence=0.0, status="PARTIAL", ttl_key="dns",
+                metadata={"record_type": rtype, "reason": "no_answer", "data_type": "dns", "field": rtype, "target": target}
+            ))
+            return evidences
+        ttl = answers.rrset.ttl
+        for rdata in answers:
+            raw = rdata.to_text()
+            normalized = _normalize_dns_record(rtype, raw)
+            evidences.append(make_evidence(
+                source="dns",
+                value=raw,
+                normalized_value=normalized,
+                confidence=0.95,
+                status="OK",
+                ttl_key="dns",
+                metadata={"record_type": rtype, "ttl": ttl, "data_type": "dns", "field": rtype, "target": target, "raw_value": raw}
+            ))
+    except dns.resolver.NXDOMAIN:
+        evidences.append(make_evidence(
+            source="dns", value=None, normalized_value=None,
+            confidence=0.0, status="PARTIAL", ttl_key="dns",
+            metadata={"record_type": rtype, "reason": "NXDOMAIN", "data_type": "dns", "field": rtype, "target": target}
+        ))
+    except dns.resolver.NoNameservers:
+        evidences.append(make_evidence(
+            source="dns", value=None, normalized_value=None,
+            confidence=0.0, status="FAILED", ttl_key="dns",
+            metadata={"record_type": rtype, "reason": "no_nameservers", "data_type": "dns", "field": rtype, "target": target}
+        ))
+    except dns.exception.Timeout:
+        evidences.append(make_evidence(
+            source="dns", value=None, normalized_value=None,
+            confidence=0.0, status="FAILED", ttl_key="dns",
+            metadata={"record_type": rtype, "reason": "timeout", "data_type": "dns", "field": rtype, "target": target}
+        ))
+    except Exception as e:
+        evidences.append(make_evidence(
+            source="dns", value=None, normalized_value=None,
+            confidence=0.0, status="FAILED", ttl_key="dns",
+            metadata={"record_type": rtype, "reason": str(e), "data_type": "dns", "field": rtype, "target": target}
+        ))
+    return evidences
+
+
+def dns_collect_parallel(target: str, config: Dict[str, Any]) -> List[Evidence]:
+    """
+    Resolve all applicable record types concurrently (Stage H2).
+
+    One worker per type; total latency is bounded by the slowest type
+    instead of the sum of all types. Reassembly is in record_types order
+    with each type's answers sorted by normalized value -- thread
+    completion order never reaches the caller, which keeps the G2
+    determinism invariant (wire-order rotation canonicalized, same as
+    _sorted_dns_answers for collect_dns).
     """
     evidences: List[Evidence] = []
     # Support both new top-level dns config and legacy sources.dns
@@ -3671,20 +4452,6 @@ def dns_collect(target: str, config: Dict[str, Any]) -> List[Evidence]:
     # Also check for legacy record_types key
     if not record_types:
         record_types = DNS_RECORD_TYPES
-    timeout = 5
-    try:
-        timeout = int(config.get("timeouts", {}).get("dns", 5))
-    except Exception:
-        timeout = 5
-    # Also check phase_g or other
-    if timeout == 5 and config.get("phase_g", {}).get("dns", {}).get("timeout"):
-        try:
-            timeout = int(config["phase_g"]["dns"]["timeout"])
-        except Exception:
-            pass
-    resolver = dns.resolver.Resolver()
-    resolver.timeout = timeout
-    resolver.lifetime = timeout
     # Detect if target is an IP
     is_ip = False
     try:
@@ -3697,54 +4464,51 @@ def dns_collect(target: str, config: Dict[str, Any]) -> List[Evidence]:
         record_types = ["PTR"]
     else:
         record_types = [rt for rt in record_types if rt != "PTR"]
-    for rtype in record_types:
-        try:
-            answers = resolver.resolve(target, rtype, raise_on_no_answer=False)
-            if answers is None or answers.rrset is None:
-                evidences.append(make_evidence(
+    if not record_types:
+        return []
+    per_type: Dict[str, List[Evidence]] = {}
+    with ThreadPoolExecutor(max_workers=len(record_types),
+                            thread_name_prefix="reconip-dns") as ex:
+        future_map = {
+            ex.submit(_resolve_one, target, rtype, config): rtype
+            for rtype in record_types
+        }
+        for future in as_completed(future_map):
+            rtype = future_map[future]
+            try:
+                per_type[rtype] = future.result()
+            except Exception as e:
+                # _resolve_one never raises by contract; this is the belt
+                # for the suspenders -- a failed type still yields FAILED
+                # evidence rather than an empty hole.
+                per_type[rtype] = [make_evidence(
                     source="dns", value=None, normalized_value=None,
-                    confidence=0.0, status="PARTIAL", ttl_key="dns",
-                    metadata={"record_type": rtype, "reason": "no_answer", "data_type": "dns", "field": rtype, "target": target}
-                ))
-                continue
-            ttl = answers.rrset.ttl
-            for rdata in answers:
-                raw = rdata.to_text()
-                normalized = _normalize_dns_record(rtype, raw)
-                evidences.append(make_evidence(
-                    source="dns",
-                    value=raw,
-                    normalized_value=normalized,
-                    confidence=0.95,
-                    status="OK",
-                    ttl_key="dns",
-                    metadata={"record_type": rtype, "ttl": ttl, "data_type": "dns", "field": rtype, "target": target, "raw_value": raw}
-                ))
-        except dns.resolver.NXDOMAIN:
-            evidences.append(make_evidence(
-                source="dns", value=None, normalized_value=None,
-                confidence=0.0, status="PARTIAL", ttl_key="dns",
-                metadata={"record_type": rtype, "reason": "NXDOMAIN", "data_type": "dns", "field": rtype, "target": target}
+                    confidence=0.0, status="FAILED", ttl_key="dns",
+                    metadata={"record_type": rtype, "reason": f"worker fault: {e}",
+                              "data_type": "dns", "field": rtype, "target": target}
+                )]
+    for rtype in record_types:
+        chunk = per_type.get(rtype, [])
+        try:
+            chunk = sorted(chunk, key=lambda ev: (
+                str(getattr(ev, "normalized_value", "") or ""),
+                str(getattr(ev, "value", "") or ""),
             ))
-        except dns.resolver.NoNameservers:
-            evidences.append(make_evidence(
-                source="dns", value=None, normalized_value=None,
-                confidence=0.0, status="FAILED", ttl_key="dns",
-                metadata={"record_type": rtype, "reason": "no_nameservers", "data_type": "dns", "field": rtype, "target": target}
-            ))
-        except dns.exception.Timeout:
-            evidences.append(make_evidence(
-                source="dns", value=None, normalized_value=None,
-                confidence=0.0, status="FAILED", ttl_key="dns",
-                metadata={"record_type": rtype, "reason": "timeout", "data_type": "dns", "field": rtype, "target": target}
-            ))
-        except Exception as e:
-            evidences.append(make_evidence(
-                source="dns", value=None, normalized_value=None,
-                confidence=0.0, status="FAILED", ttl_key="dns",
-                metadata={"record_type": rtype, "reason": str(e), "data_type": "dns", "field": rtype, "target": target}
-            ))
+        except Exception:
+            pass
+        evidences.extend(chunk)
     return evidences
+
+
+def dns_collect(target: str, config: Dict[str, Any]) -> List[Evidence]:
+    """
+    Collect DNS records for a target and return them as Evidence objects (Stage 5).
+    Handles both IP targets (PTR) and domain targets (A, AAAA, NS, MX, TXT, CAA, SOA, CNAME).
+
+    Delegates to dns_collect_parallel() (Stage H2); kept as the stable
+    entry point for recon() and existing callers.
+    """
+    return dns_collect_parallel(target, config)
 
 def _dns_consistency(by_type: Dict[str, List[Evidence]]) -> Dict[str, Any]:
     result: Dict[str, Any] = {
@@ -4006,9 +4770,282 @@ def _dns_anomalies(by_type: Dict[str, List[Evidence]], analysis: Dict[str, Any],
         })
     return anomalies
 
-def dns_analyze(evidences: List[Evidence], config: Dict[str, Any]) -> Dict[str, Any]:
+def _shannon_entropy(text: str) -> float:
+    """Shannon entropy in bits/char; 0.0 for empty input (Stage I4)."""
+    try:
+        if not text:
+            return 0.0
+        freq: Dict[str, int] = {}
+        for ch in text:
+            freq[ch] = freq.get(ch, 0) + 1
+        n = len(text)
+        return round(-sum((c / n) * math.log2(c / n) for c in freq.values()), 3) + 0.0
+    except Exception:
+        return 0.0
+
+
+def _analyze_dnssec(domain: Optional[str], timeout: int = 2) -> Dict[str, Any]:
+    """
+    Determine whether a domain is DNSSEC-signed (Stage I4).
+
+    Signed == a DNSKEY RRset answers for the apex. Outcome vocabulary
+    is type-derived (never raw messages), so results are deterministic
+    and log-safe. Never raises; every resolver outcome maps to a
+    signed True/False/None verdict.
+    """
+    if not domain:
+        return {"signed": None, "reason": "no_domain"}
+    try:
+        ipaddress.ip_address(str(domain))
+        return {"signed": None, "reason": "ip_target"}
+    except Exception:
+        pass
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = timeout
+        resolver.lifetime = timeout
+        answers = resolver.resolve(str(domain).rstrip("."), "DNSKEY")
+        keys = list(answers) if answers is not None else []
+        if keys:
+            return {"signed": True, "dnskey_count": len(keys)}
+        return {"signed": False, "reason": "no_dnskey"}
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        return {"signed": False, "reason": "no_dnskey"}
+    except dns.resolver.NoNameservers:
+        return {"signed": None, "reason": "no_nameservers"}
+    except dns.exception.Timeout:
+        return {"signed": None, "reason": "timeout"}
+    except Exception:
+        return {"signed": None, "reason": "error"}
+
+
+def _analyze_tunneling(txt_values: List[str]) -> Dict[str, Any]:
+    """
+    Flag DNS-tunneling-shaped TXT records (Stage I4, pure function).
+
+    Rules: a TXT value longer than 100 chars, Shannon entropy above
+    4.5 bits/char, or more than 10 TXT records at all is worth a look.
+    Returns the verdict plus per-record reasons. Deterministic.
+    """
+    flagged: List[Dict[str, Any]] = []
+    for raw in txt_values or []:
+        try:
+            text = str(raw or "")
+        except Exception:
+            continue
+        reasons: List[str] = []
+        if len(text) > 100:
+            reasons.append(f"length_{len(text)}")
+        ent = _shannon_entropy(text)
+        if ent > 4.5:
+            reasons.append(f"high_entropy_{ent}")
+        if reasons:
+            flagged.append({"value": text[:120], "length": len(text),
+                            "entropy": ent, "reasons": reasons})
+    try:
+        count = len(list(txt_values or []))
+    except Exception:
+        count = 0
+    suspicious = bool(flagged) or count > 10
+    return {"suspicious": suspicious, "txt_count": count,
+            "flagged": flagged,
+            "note": "many_txt_records" if count > 10 and not flagged else None}
+
+
+def _analyze_subdomains(target: Optional[str],
+                        cert_sans: List[str],
+                        dns_names: List[str]) -> Dict[str, Any]:
+    """
+    Enumerate subdomains from CT SANs + observed DNS names (Stage I4,
+    pure function). Keeps names strictly below the apex, sorted.
+    """
+    subs: Dict[str, List[str]] = {}
+    try:
+        apex = str(target or "").strip().rstrip(".").lower()
+    except Exception:
+        apex = ""
+    if not apex:
+        return {"count": 0, "subdomains": [], "from_ct": 0, "from_dns": 0}
+    try:
+        suffix = "." + apex
+        for raw in (cert_sans or []) + (dns_names or []):
+            try:
+                name = str(raw or "").strip().rstrip(".").lower()
+            except Exception:
+                continue
+            if not name or name == apex or not name.endswith(suffix):
+                continue
+            bucket = subs.setdefault(name, [])
+            marker = "ct" if raw in (cert_sans or []) else "dns"
+            if marker not in bucket:
+                bucket.append(marker)
+    except Exception:
+        pass
+    names = sorted(subs)
+    return {"count": len(names), "subdomains": names,
+            "from_ct": sum(1 for v in subs.values() if "ct" in v),
+            "from_dns": sum(1 for v in subs.values() if "dns" in v)}
+
+
+def _analyze_wildcard(domain: Optional[str],
+                      known_a: List[str],
+                      timeout: int = 2) -> Dict[str, Any]:
+    """
+    Determine whether *.domain resolves (Stage I4).
+
+    Probes one fixed bogus label -- fixed, not random, so consecutive
+    scans are comparable (G2 determinism). If it resolves, the zone
+    answers everything: wildcard. Never raises.
+    """
+    if not domain:
+        return {"wildcard": None, "reason": "no_domain"}
+    try:
+        ipaddress.ip_address(str(domain))
+        return {"wildcard": None, "reason": "ip_target"}
+    except Exception:
+        pass
+    label = "nxd-probe-7f3a9c1e." + str(domain).strip().rstrip(".")
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = timeout
+        resolver.lifetime = timeout
+        answers = resolver.resolve(label, "A")
+        addrs = sorted({str(r) for r in (answers or [])})
+        if addrs:
+            try:
+                overlap = sorted(set(addrs) & {str(a) for a in (known_a or [])})
+            except Exception:
+                overlap = []
+            return {"wildcard": True, "probe": label,
+                    "addresses": addrs, "matches_known_a": overlap}
+        return {"wildcard": False, "probe": label, "addresses": []}
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        return {"wildcard": False, "probe": label, "addresses": []}
+    except dns.resolver.NoNameservers:
+        return {"wildcard": None, "reason": "no_nameservers"}
+    except dns.exception.Timeout:
+        return {"wildcard": None, "reason": "timeout"}
+    except Exception:
+        return {"wildcard": None, "reason": "error"}
+
+
+def _analyze_zone_transfer(domain: Optional[str],
+                           ns_names: List[str],
+                           config: Dict[str, Any],
+                           timeout: int = 5) -> Dict[str, Any]:
+    """
+    Attempt a DNS zone transfer, authorization-gated (Stage I4).
+
+    Same gate as active_recon (Stage I2): without explicit
+    authorization for exactly this target, nothing is attempted -- no
+    sockets, no probes. Authorized: tries up to 3 nameservers in order,
+    first completed transfer wins, capped at 500 records. Never raises.
+    """
+    try:
+        as_cfg = (config or {}).get("attack_surface", {}) or {}
+    except Exception:
+        as_cfg = {}
+    if not as_cfg.get("authorized", False):
+        return {"attempted": False, "reason": "authorization required"}
+    if not domain:
+        return {"attempted": False, "reason": "no_domain"}
+    try:
+        ipaddress.ip_address(str(domain))
+        return {"attempted": False, "reason": "ip_target"}
+    except Exception:
+        pass
+    if str(domain) not in (as_cfg.get("authorized_targets", []) or []):
+        return {"attempted": False, "reason": "target not authorized"}
+    zone = str(domain).strip().rstrip(".")
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 2
+        resolver.lifetime = 2
+    except Exception:
+        return {"attempted": True, "transferred": False,
+                "reason": "resolver_init_failed"}
+    for ns in list(ns_names or [])[:3]:
+        try:
+            ns_host = str(ns or "").strip().rstrip(".")
+            if not ns_host:
+                continue
+            ans = resolver.resolve(ns_host, "A")
+            ips = [str(r) for r in (ans or [])][:2]
+            for ip in ips:
+                try:
+                    count = 0
+                    types: Dict[str, int] = {}
+                    for msg in dns.query.xfr(ip, zone, timeout=timeout):
+                        try:
+                            for (name, _ttl, rdata) in msg.answer:
+                                count += 1
+                                try:
+                                    t = dns.rdatatype.to_text(rdata.rdtype)
+                                except Exception:
+                                    t = str(getattr(rdata, "rdtype", "?"))
+                                types[t] = types.get(t, 0) + 1
+                                if count >= 500:
+                                    break
+                            if count >= 500:
+                                break
+                        except Exception:
+                            continue
+                    if count:
+                        return {"attempted": True, "transferred": True,
+                                "nameserver": ns_host, "address": ip,
+                                "record_count": count, "types": types}
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return {"attempted": True, "transferred": False,
+            "reason": "refused_or_failed"}
+
+
+def _analyze_caa(caa_values: List[str]) -> Dict[str, Any]:
+    """
+    Deep-parse CAA records into authorized CAs (Stage I4, pure).
+
+    Each record renders as "flags tag value". issue/issuewild values
+    (parameters after ';' stripped) name authorized CAs; iodef records
+    name the violation reporting endpoint. Deterministic.
+    """
+    cas: List[str] = []
+    iodef: List[str] = []
+    count = 0
+    for raw in caa_values or []:
+        try:
+            parts = str(raw or "").split(None, 2)
+        except Exception:
+            continue
+        if len(parts) != 3:
+            continue
+        count += 1
+        _flags, tag, value = parts
+        tag = tag.lower()
+        if tag in ("issue", "issuewild"):
+            ca = value.split(";")[0].strip().strip('"').rstrip(".")
+            if ca and ca not in cas:
+                cas.append(ca)
+        elif tag == "iodef":
+            if value not in iodef:
+                iodef.append(value)
+    return {"present": count > 0, "record_count": count,
+            "authorized_cas": sorted(cas), "iodef": sorted(iodef)}
+
+
+def dns_analyze(evidences: List[Evidence],
+                config: Dict[str, Any],
+                target: Optional[str] = None,
+                cert_sans: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Analyze DNS Evidence and produce DNS intelligence (Stage 5).
+
+    Stage I4: six advanced analyses join the report -- dnssec,
+    tunneling, subdomains, wildcard, zone_transfer, caa_analysis.
+    Live probes (dnssec/wildcard/zone-transfer) fail soft with
+    deterministic verdicts; pure derivations (tunneling/subdomains/caa)
+    cannot fail. Existing keys are untouched.
     """
     dns_cfg = config.get("dns", {}) or {}
     # Fallback to legacy
@@ -4042,6 +5079,82 @@ def dns_analyze(evidences: List[Evidence], config: Dict[str, Any]) -> Dict[str, 
     analysis["security"] = _dns_security_analysis(by_type)
     analysis["relationships"] = dns_relationships(by_type)
     analysis["anomalies"] = _dns_anomalies(by_type, analysis, is_ip=is_ip)
+    # ---- Stage I4: advanced DNS analysis ----
+    # Target: explicit argument wins; otherwise the most common evidence
+    # target (collectors stamp every record).
+    try:
+        _domain = str(target or "").strip() or None
+        if _domain is None:
+            _targets: Dict[str, int] = {}
+            for ev in evidences or []:
+                try:
+                    _t = str((ev.metadata or {}).get("target") or "").strip()
+                except Exception:
+                    _t = ""
+                if _t:
+                    _targets[_t] = _targets.get(_t, 0) + 1
+            if _targets:
+                _domain = sorted(_targets.items(),
+                                 key=lambda kv: (-kv[1], kv[0]))[0][0]
+    except Exception:
+        _domain = str(target or "").strip() or None
+    try:
+        _txt = [str(ev.normalized_value or ev.value or "")
+                for ev in (by_type.get("TXT", []) or [])]
+    except Exception:
+        _txt = []
+    try:
+        _caa = [str(ev.normalized_value or ev.value or "")
+                for ev in (by_type.get("CAA", []) or [])]
+    except Exception:
+        _caa = []
+    try:
+        _a = sorted({str(ev.normalized_value or "")
+                     for ev in (by_type.get("A", []) or [])
+                     if ev.normalized_value})
+    except Exception:
+        _a = []
+    try:
+        _ns = sorted({str(ev.normalized_value or "")
+                      for ev in (by_type.get("NS", []) or [])
+                      if ev.normalized_value})
+    except Exception:
+        _ns = []
+    try:
+        _names = sorted({str((ev.metadata or {}).get("name") or "")
+                         for ev in evidences or []
+                         if (ev.metadata or {}).get("name")})
+    except Exception:
+        _names = []
+    try:
+        analysis["dnssec"] = _analyze_dnssec(_domain)
+    except Exception:
+        analysis["dnssec"] = {"signed": None, "reason": "error"}
+    try:
+        analysis["tunneling"] = _analyze_tunneling(_txt)
+    except Exception:
+        analysis["tunneling"] = {"suspicious": False, "txt_count": 0,
+                                 "flagged": [], "note": None}
+    try:
+        analysis["subdomains"] = _analyze_subdomains(
+            _domain, list(cert_sans or []), _names)
+    except Exception:
+        analysis["subdomains"] = {"count": 0, "subdomains": [],
+                                  "from_ct": 0, "from_dns": 0}
+    try:
+        analysis["wildcard"] = _analyze_wildcard(_domain, _a)
+    except Exception:
+        analysis["wildcard"] = {"wildcard": None, "reason": "error"}
+    try:
+        analysis["zone_transfer"] = _analyze_zone_transfer(
+            _domain, _ns, config)
+    except Exception:
+        analysis["zone_transfer"] = {"attempted": False, "reason": "error"}
+    try:
+        analysis["caa_analysis"] = _analyze_caa(_caa)
+    except Exception:
+        analysis["caa_analysis"] = {"present": False, "record_count": 0,
+                                    "authorized_cas": [], "iodef": []}
     return analysis
 
 # ============================================================
@@ -4150,19 +5263,24 @@ def cert_weak_check(rec):
         w.append(f"ecdsa:{rec.key_bits}")
     return w
 
-def collect_certs(domain):
-    ci = {"records": {}}
-    evs = []; att, resp = 0, 0
-    now_ts = now()
-    for port in PH["ports"]:
-        att += 1
+def _probe_tls_port(domain, port, now_ts):
+    """
+    Probe one TLS port and build its record + evidence (Stage H1 worker).
+
+    Pure function of its arguments: no health accounting, no shared
+    mutation -- the caller replays the original H()/att/resp accounting
+    in port order, so concurrent probes are indistinguishable from the
+    old sequential loop. Returns an outcome dict; never raises.
+    """
+    try:
         der, peer, err = fetch_cert(domain, port)
         if not der and not peer:
-            H(f"tls:{port}").failure(exc_class(err) if err else "UNREACHABLE", 0)
-            continue
+            return {"ok": False, "fail": "unreachable", "err": err,
+                    "rec": None, "evs": []}
         parsed = parse_der(der) if der else None
         if not parsed:
-            H(f"tls:{port}").failure(EC3.INVALID, 0); continue
+            return {"ok": False, "fail": "invalid", "err": None,
+                    "rec": None, "evs": []}
         fp = (parsed.get("fp") or "").lower()
         rec = CertRec(id=fp or f"tls:{domain}:{port}", fp=fp,
                       serial=parsed.get("serial", ""),
@@ -4183,6 +5301,7 @@ def collect_certs(domain):
             rec.sans.append(n)
         cert_expiry_check(rec)
         rec.weak = cert_weak_check(rec)
+        port_evs = []
 
         def add_ev(f, v):
             # Stage 2: Evidence via make_evidence (v31)
@@ -4195,7 +5314,7 @@ def collect_certs(domain):
                 ttl_key="ct",
                 metadata={"field": f, "data_type": "cert", "target": domain, "fingerprint": fp, "raw_value": v, "port": port}
             )
-            evs.append(ev); rec.ev_ids.append(ev.metadata.get("id", fp or f))
+            port_evs.append(ev); rec.ev_ids.append(ev.metadata.get("id", fp or f))
 
         if fp: add_ev("current_fingerprint", fp)
         add_ev("current_status", "CURRENT")
@@ -4209,45 +5328,132 @@ def collect_certs(domain):
         if rec.is_expired: add_ev("expired", True)
         if rec.is_near: add_ev("near_expiry", True)
         for w in rec.weak: add_ev("weak_algorithm", w)
+        return {"ok": True, "fail": None, "err": None,
+                "rec": rec, "evs": port_evs}
+    except Exception as e:
+        return {"ok": False, "fail": "error", "err": e,
+                "rec": None, "evs": []}
+
+
+def _fetch_crtsh(domain, max_hist, now_ts):
+    """
+    Fetch historical certificates from crt.sh (Stage H1 worker).
+
+    Returns (evidences, records, is_list). Records its own single
+    H("crtsh") entry, exactly as the inline code did. Never raises.
+    """
+    try:
+        evs: List[Any] = []
+        recs: Dict[str, Any] = {}
+        data = http.get(f"https://crt.sh/?q={domain}&output=json", provider="crtsh")
+        if isinstance(data, list):
+            seen = set()
+            for entry in data[:max_hist]:
+                cid = str(entry.get("id", ""))
+                if not cid or cid in seen: continue
+                seen.add(cid)
+                rec = CertRec(id=f"crtsh:{cid}", crtsh_id=cid,
+                              issuer=entry.get("issuer_name", ""),
+                              subject=entry.get("common_name", "") or entry.get("name_value", ""),
+                              valid_from=entry.get("not_before", ""),
+                              valid_to=entry.get("not_after", ""),
+                              serial=entry.get("serial_number", ""),
+                              status="HISTORICAL",
+                              first_seen=entry.get("entry_timestamp", now_ts),
+                              last_seen=entry.get("entry_timestamp", now_ts),
+                              sources=["crtsh"], confidence=70.0)
+                for s in (entry.get("name_value", "") or "").split("\n"):
+                    n = norm_san(s)
+                    if not n: continue
+                    if n.startswith("*."): rec.wildcards.append(n)
+                    rec.sans.append(n)
+                # Stage 2: Evidence for historical cert
+                e = make_evidence(source="crtsh", value=cid, normalized_value=str(cid).lower(), confidence=0.85, status="OK", ttl_key="ct", metadata={"field": "historical_cert_id", "data_type": "cert", "target": domain, "crtsh_id": cid, "raw_value": cid})
+                evs.append(e); rec.ev_ids.append(e.metadata.get("id", cid))
+                for san in rec.sans:
+                    es = make_evidence(source="crtsh", value=san, normalized_value=str(san).lower(), confidence=0.8, status="OK", ttl_key="ct", metadata={"field": "historical_san", "data_type": "cert", "target": domain, "crtsh_id": cid, "raw_value": san})
+                    evs.append(es); rec.ev_ids.append(es.metadata.get("id", san))
+                recs[rec.id] = rec
+            H("crtsh").success(0)
+            return evs, recs, True
+        H("crtsh").failure(EC3.INVALID, 0)
+        return [], {}, False
+    except Exception as e:
+        try:
+            H("crtsh").failure(exc_class(e), 0)
+        except Exception:
+            pass
+        return [], {}, False
+
+
+def collect_certs(domain):
+    ci = {"records": {}}
+    evs = []; att, resp = 0, 0
+    now_ts = now()
+    ports = list(PH["ports"])
+    max_hist = PH["max_historical_certs"]
+    # Stage H1: the TLS port probes and the crt.sh fetch are independent
+    # (different transports, different result partitions), so they run
+    # concurrently -- bounded by the slower instead of the sum. Assembly
+    # below replays the original order and accounting exactly: TLS
+    # evidence/records first in port order with first-success-wins, then
+    # crt.sh records. Either phase may fail soft as before.
+    tls_outcomes: Dict[Any, Any] = {}
+    crt_outcome: Any = None
+    # Stage H1: only the crt.sh fetch runs concurrently. The TLS port
+    # probes stay strictly sequential in port order with first-success
+    # break -- probing a port that will never be used is pure loss, and
+    # worse, an abandoned probe's thread lingers on its socket timeout
+    # and delays process exit (non-daemon executor threads join at
+    # exit). Measured: 8443 burns the full 5s fetch timeout on EVERY
+    # scan while 443 already answered in 0.1s.
+    _cert_ex = ThreadPoolExecutor(max_workers=1,
+                                  thread_name_prefix="reconip-certs")
+    try:
+        _crt_future = _cert_ex.submit(_fetch_crtsh, domain, max_hist, now_ts)
+        for port in ports:
+            try:
+                tls_outcomes[port] = _probe_tls_port(domain, port, now_ts)
+            except Exception as _e:
+                tls_outcomes[port] = {"ok": False, "fail": "error",
+                                      "err": _e, "rec": None, "evs": []}
+            if tls_outcomes[port].get("ok"):
+                break
+        try:
+            crt_outcome = _crt_future.result()
+        except Exception:
+            crt_outcome = ([], {}, False)
+    finally:
+        try:
+            _cert_ex.shutdown(wait=True)
+        except Exception:
+            pass
+    for port in ports:
+        oc = tls_outcomes.get(port)
+        if oc is None:
+            # Never probed: the loop above already broke at the winner,
+            # exactly as the original sequential loop did.
+            continue
+        att += 1
+        if not oc.get("ok"):
+            if oc.get("fail") == "invalid":
+                H(f"tls:{port}").failure(EC3.INVALID, 0)
+            else:
+                err = oc.get("err")
+                H(f"tls:{port}").failure(exc_class(err) if err else "UNREACHABLE", 0)
+            continue
+        rec = oc["rec"]
+        evs.extend(oc.get("evs", []))
         ci["records"][rec.id] = rec
         H(f"tls:{port}").success(0); resp += 1
         break
 
     att += 1
-    max_hist = PH["max_historical_certs"]
-    data = http.get(f"https://crt.sh/?q={domain}&output=json", provider="crtsh")
-    if isinstance(data, list):
+    crt_evs, crt_recs, crt_hit = crt_outcome or ([], {}, False)
+    if crt_hit:
         resp += 1
-        seen = set()
-        for entry in data[:max_hist]:
-            cid = str(entry.get("id", ""))
-            if not cid or cid in seen: continue
-            seen.add(cid)
-            rec = CertRec(id=f"crtsh:{cid}", crtsh_id=cid,
-                          issuer=entry.get("issuer_name", ""),
-                          subject=entry.get("common_name", "") or entry.get("name_value", ""),
-                          valid_from=entry.get("not_before", ""),
-                          valid_to=entry.get("not_after", ""),
-                          serial=entry.get("serial_number", ""),
-                          status="HISTORICAL",
-                          first_seen=entry.get("entry_timestamp", now_ts),
-                          last_seen=entry.get("entry_timestamp", now_ts),
-                          sources=["crtsh"], confidence=70.0)
-            for s in (entry.get("name_value", "") or "").split("\n"):
-                n = norm_san(s)
-                if not n: continue
-                if n.startswith("*."): rec.wildcards.append(n)
-                rec.sans.append(n)
-            # Stage 2: Evidence for historical cert
-            e = make_evidence(source="crtsh", value=cid, normalized_value=str(cid).lower(), confidence=0.85, status="OK", ttl_key="ct", metadata={"field": "historical_cert_id", "data_type": "cert", "target": domain, "crtsh_id": cid, "raw_value": cid})
-            evs.append(e); rec.ev_ids.append(e.metadata.get("id", cid))
-            for san in rec.sans:
-                es = make_evidence(source="crtsh", value=san, normalized_value=str(san).lower(), confidence=0.8, status="OK", ttl_key="ct", metadata={"field": "historical_san", "data_type": "cert", "target": domain, "crtsh_id": cid, "raw_value": san})
-                evs.append(es); rec.ev_ids.append(es.metadata.get("id", san))
-            ci["records"][rec.id] = rec
-        H("crtsh").success(0)
-    else:
-        H("crtsh").failure(EC3.INVALID, 0)
+        evs.extend(crt_evs)
+        ci["records"].update(crt_recs)
 
     has_cur = any(r.status == "CURRENT" for r in ci["records"].values())
     has_hist = any(r.status == "HISTORICAL" for r in ci["records"].values())
@@ -4255,6 +5461,7 @@ def collect_certs(domain):
     elif has_hist: st = MS.PARTIAL.value
     else: st = MS.FAILED.value
     return evs, st, ci
+
 
 def cert_summary(ci):
     recs = list(ci["records"].values())
@@ -5135,6 +6342,73 @@ def init_snapshot_schema(db_path: str = "reconip.db") -> None:
         conn.commit()
 
 
+def _snapshot_retention_cap(config: Optional[Dict[str, Any]] = None) -> int:
+    """
+    Maximum number of snapshots kept per target.
+
+    Config: phase_e.retention.max_snapshots (default 100, 0 or negative
+    disables pruning). A corrupted or unparsable value falls back to the
+    default rather than disabling the cap silently.
+    """
+    default = 100
+    try:
+        cfg = config if isinstance(config, dict) else CFG
+        retention = (cfg.get("phase_e", {}) or {}).get("retention", {}) or {}
+        raw = retention.get("max_snapshots", default)
+        cap = int(raw)
+    except Exception:
+        return default
+    return cap if cap > 0 else 0
+
+
+def prune_snapshots(target: str,
+                    config: Optional[Dict[str, Any]] = None,
+                    db_path: str = "reconip.db") -> int:
+    """
+    Delete the oldest snapshots for `target`, keeping at most
+    _snapshot_retention_cap() rows. Returns the number of rows deleted.
+
+    Runs in the caller's transaction (same connection/lock as the
+    insert) so pruning can never interleave with a write. Deletes by id
+    via a subquery rather than by timestamp: timestamps have 1-second
+    resolution, so several snapshots of one target can legitimately
+    share a value, and id is the only total order here.
+    """
+    cap = _snapshot_retention_cap(config)
+    if cap <= 0:
+        return 0
+    try:
+        with sqlite3.connect(db_path, timeout=30) as conn:
+            cur = conn.execute(
+                "DELETE FROM snapshots WHERE id IN ("
+                "  SELECT id FROM snapshots WHERE target = ?"
+                "  ORDER BY id DESC LIMIT -1 OFFSET ?"
+                ")",
+                (target, cap)
+            )
+            deleted = cur.rowcount or 0
+            conn.commit()
+        if deleted:
+            log.debug(f"snapshot retention: pruned {deleted} snapshot(s) for {target}")
+        return max(0, int(deleted))
+    except Exception as e:
+        # Retention is housekeeping, never a reason to fail a scan.
+        log.debug(f"snapshot retention prune failed: {e}")
+        return 0
+
+
+def count_snapshots(target: str, db_path: str = "reconip.db") -> int:
+    """Number of stored snapshots for `target` (0 on any error)."""
+    try:
+        with sqlite3.connect(db_path, timeout=30) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM snapshots WHERE target = ?", (target,)
+            ).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
 def _extract_snapshot_fields(report: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extract a compact, comparable snapshot from a full report.
@@ -5210,6 +6484,39 @@ def _extract_snapshot_fields(report: Dict[str, Any]) -> Dict[str, Any]:
         "updated": rdap.get("updated")
     }
 
+    # Stage J5: ports + enumerated subdomains for watch/compare alerts.
+    # Stored sorted for deterministic comparison. Older snapshots lack
+    # these keys; alert code treats a missing key as "no baseline" and
+    # skips that alert type rather than flooding.
+    try:
+        as_intel = report.get("attack_surface_intelligence", {}) or {}
+        ports: List[Any] = []
+        for svc in (as_intel.get("services", []) or []):
+            if not isinstance(svc, dict):
+                continue
+            try:
+                p = int(svc.get("port"))
+                ports.append(p)
+            except Exception:
+                continue
+        snapshot["ports"] = sorted(set(ports))
+    except Exception:
+        snapshot["ports"] = []
+    try:
+        dns_intel = report.get("dns_intelligence", {}) or {}
+        subenum = dns_intel.get("subdomains_enum", {}) or {}
+        details = subenum.get("details", []) or []
+        subs: List[str] = []
+        for d in details:
+            if isinstance(d, dict) and d.get("domain"):
+                subs.append(str(d["domain"]).strip().lower())
+            elif isinstance(d, str):
+                subs.append(d.strip().lower())
+        # Also fold passive-DNS timeline domains that are subdomains.
+        snapshot["subdomains"] = sorted(set(subs))
+    except Exception:
+        snapshot["subdomains"] = []
+
     return snapshot
 
 
@@ -5220,6 +6527,12 @@ def snapshot_current_state(target: str,
     """
     Store a compact snapshot of the current report for future comparison.
     Only fields that are stable and comparable are stored.
+
+    Retention (Stage G5): the insert and the prune share one connection
+    and one transaction, so the cap can never be observed half-applied
+    by a concurrent reader. Deleting the oldest rows here — rather than
+    leaving it to a separate housekeeping pass — means the table is
+    already within cap when the caller returns.
     """
     snapshot = _extract_snapshot_fields(report)
     with _get_sqlite_lock():
@@ -5236,6 +6549,16 @@ def snapshot_current_state(target: str,
                     json.dumps(snapshot, sort_keys=True)
                 )
             )
+            cap = _snapshot_retention_cap(config)
+            if cap > 0:
+                # Keep the newest `cap` rows for this target.
+                conn.execute(
+                    "DELETE FROM snapshots WHERE id IN ("
+                    "  SELECT id FROM snapshots WHERE target = ?"
+                    "  ORDER BY id DESC LIMIT -1 OFFSET ?"
+                    ")",
+                    (target, cap)
+                )
             conn.commit()
 
 
@@ -5500,6 +6823,14 @@ def historical_intelligence(target: str,
     # Step 3: Load previous snapshot
     previous = load_previous_snapshot(target, db_path)
 
+    # Stage J2: full ordered history for the evolution timeline. The
+    # just-stored current snapshot is the newest row, so segments cover
+    # everything up to now.
+    try:
+        _history_rows = _load_snapshot_history(target, db_path)
+    except Exception:
+        _history_rows = []
+
     if previous is None:
         return {
             "enabled": True,
@@ -5508,7 +6839,8 @@ def historical_intelligence(target: str,
             "previous_timestamp": None,
             "current_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "changes": [],
-            "total_changes": 0
+            "total_changes": 0,
+            "timeline": []
         }
 
     # Step 4: Current snapshot
@@ -5521,13 +6853,23 @@ def historical_intelligence(target: str,
     # Step 6: Detect changes
     detection = change_detection(comparison, config)
 
+    # Stage J2: evolution timeline from the full ordered history.
+    # Change-only events keep repeated stable scans identical.
+    try:
+        timeline = _build_infra_timeline(_history_rows, target)
+        if not isinstance(timeline, list):
+            timeline = []
+    except Exception:
+        timeline = []
+
     return {
         "enabled": True,
         "status": "COMPARED",
         "previous_timestamp": previous.get("_timestamp"),
         "current_timestamp": current.get("_timestamp"),
         "comparison": comparison,
-        "detection": detection
+        "detection": detection,
+        "timeline": timeline
     }
 
 # ============================================================
@@ -5628,6 +6970,281 @@ def _collect_passive_services(target: str,
     return services
 
 
+# Ports probed by the authorized TCP connect scan (Stage I2). A scan
+# needs a finite candidate set; these are the commonly exposed ports.
+# attack_surface.max_ports caps how many are actually probed.
+DEFAULT_SCAN_PORTS = (
+    21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445,
+    993, 995, 1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443,
+    20, 69, 79, 119, 123, 161, 389, 636, 873, 902, 1080, 1433,
+    1521, 2049, 2375, 27017, 27018, 5000, 5601, 5672, 6443, 7000,
+    7001, 8000, 8001, 8081, 8088, 8090, 8118, 8181, 8200, 8280,
+    8444, 8888, 9000, 9001, 9042, 9080, 9090, 9100, 9200, 9300,
+    11211, 15672, 25565, 27015, 4848, 5985, 8009, 10000, 10443,
+    18080, 19000, 465, 989, 990, 2083, 2087, 2096, 9443,
+)
+
+# Ports where an HTTP-style probe is meaningful (Stage I2).
+_HTTP_LIKE_PORTS = frozenset({
+    80, 8080, 8000, 8888, 5000, 3000, 7000, 7001, 8001, 8081,
+    8088, 8090, 8118, 8181, 8200, 8280, 8880, 9000, 9001, 9080,
+    9090, 10000, 18080, 3000,
+})
+
+# Ports where TLS is expected before any application bytes (Stage I2).
+_TLS_LIKE_PORTS = frozenset({
+    443, 8443, 993, 995, 465, 636, 989, 990, 2083, 2087, 2096,
+    9443, 10443, 8444,
+})
+
+# Banner substrings mapped to (service family, product, version regex).
+# The family keeps technology matching working (fingerprint_technology
+# branches on known families); product/version ride the evidence text.
+_FINGERPRINT_PATTERNS = (
+    (r"nginx/?([\d.]+)?",          "http", "nginx"),
+    (r"Apache/?([\d.]+)?",         "http", "apache"),
+    (r"Microsoft-IIS/?([\d.]+)?",  "http", "iis"),
+    (r"openresty/?([\d.]+)?",      "http", "openresty"),
+    (r"Caddy",                     "http", "caddy"),
+    (r"LiteSpeed",                 "http", "litespeed"),
+    (r"gunicorn/?([\d.]+)?",       "http", "gunicorn"),
+    (r"lighttpd/?([\d.]+)?",       "http", "lighttpd"),
+    (r"Squid",                     "http", "squid"),
+    (r"OpenSSH[_ ]([\d.p]+)",      "ssh",  "openssh"),
+    (r"dropbear[_ ]?([\d.]+)?",    "ssh",  "dropbear"),
+    (r"220[^\r\n]*Postfix",        "smtp", "postfix"),
+    (r"220[^\r\n]*Exim ([\d.]+)?", "smtp", "exim"),
+    (r"220[^\r\n]*Sendmail",       "smtp", "sendmail"),
+    (r"220[^\r\n]*vsFTPd",         "ftp",  "vsftpd"),
+    (r"220[^\r\n]*FileZilla",      "ftp",  "filezilla"),
+)
+
+
+def _tcp_connect_scan(target, config):
+    """
+    TCP connect scan over the configured candidate ports (Stage I2).
+
+    Returns the sorted list of open ports. Probes run concurrently
+    (a sequential scan of hundreds of ports with per-port timeouts
+    would take longer than the scan_timeout budget allows); the
+    overall scan_timeout caps the join, and stragglers are dropped,
+    never waited out. Never raises -- returns what answered in time.
+    """
+    try:
+        as_cfg = (config or {}).get("attack_surface", {}) or {}
+    except Exception:
+        as_cfg = {}
+    try:
+        max_ports = int(as_cfg.get("max_ports", 1000))
+    except Exception:
+        max_ports = 1000
+    try:
+        budget = float(as_cfg.get("scan_timeout", 300))
+    except Exception:
+        budget = 300.0
+    ports = [p for p in DEFAULT_SCAN_PORTS][:max(0, max_ports)]
+    if not ports or budget <= 0:
+        return []
+    per_port = max(0.5, min(2.0, budget / max(1, len(ports))))
+
+    def _probe(port):
+        try:
+            with socket.create_connection((target, port),
+                                          timeout=per_port) as sock:
+                return port
+        except Exception:
+            return None
+
+    found: List[int] = []
+    with ThreadPoolExecutor(max_workers=min(64, len(ports)),
+                            thread_name_prefix="reconip-portscan") as ex:
+        future_map = {ex.submit(_probe, port): port for port in ports}
+        try:
+            done, _ = wait(list(future_map.keys()), timeout=budget,
+                           return_when=concurrent.futures.ALL_COMPLETED)
+        except Exception:
+            done = set()
+        for future in done:
+            try:
+                port = future.result()
+            except Exception:
+                continue
+            if port is not None:
+                found.append(port)
+    return sorted(set(found))
+
+
+def _banner_grab(target, port, config):
+    """
+    Grab a service banner from one open port (Stage I2).
+
+    Three steps, each bounded: (1) connect and read (banner-first
+    protocols: SSH/SMTP/FTP); (2) for HTTP-like ports, send a minimal
+    GET and read the response (Server header included); (3) for
+    TLS-like ports, TLS-handshake first, then as (2). Steps 2-3 are
+    service-specific probes and run only when service_probe is enabled;
+    when banner_grab itself is disabled, nothing is attempted at all.
+    Returns the banner text, or None.
+    """
+    try:
+        as_cfg = (config or {}).get("attack_surface", {}) or {}
+    except Exception:
+        as_cfg = {}
+    if not as_cfg.get("banner_grab", False):
+        return None
+    try:
+        port = int(port)
+    except Exception:
+        return None
+    probe_enabled = bool(as_cfg.get("service_probe", False))
+
+    def _read(sock, limit=2048):
+        try:
+            data = sock.recv(limit)
+        except Exception:
+            return b""
+        return data or b""
+
+    # Step 1: banner-first read.
+    try:
+        with socket.create_connection((target, port), timeout=2.0) as sock:
+            sock.settimeout(2.0)
+            banner = _read(sock)
+            if banner:
+                return banner.decode("utf-8", errors="replace").strip() or None
+    except Exception:
+        pass
+    if not probe_enabled:
+        return None
+    # Step 2: HTTP probe on HTTP-like ports.
+    if port in _HTTP_LIKE_PORTS:
+        try:
+            with socket.create_connection((target, port), timeout=2.0) as sock:
+                sock.settimeout(2.0)
+                try:
+                    sock.sendall(f"GET / HTTP/1.0\r\nHost: {target}\r\n\r\n".encode())
+                except Exception:
+                    return None
+                banner = _read(sock, limit=4096)
+                if banner:
+                    return banner.decode("utf-8", errors="replace").strip() or None
+        except Exception:
+            pass
+        return None
+    # Step 3: TLS handshake, then HTTP probe, on TLS-like ports.
+    if port in _TLS_LIKE_PORTS:
+        try:
+            raw = socket.create_connection((target, port), timeout=3.0)
+            try:
+                ctx = ssl.create_default_context()
+                with ctx.wrap_socket(raw, server_hostname=str(target)) as sock:
+                    sock.settimeout(3.0)
+                    try:
+                        sock.sendall(f"GET / HTTP/1.0\r\nHost: {target}\r\n\r\n".encode())
+                    except Exception:
+                        return None
+                    banner = _read(sock, limit=4096)
+                    if banner:
+                        return banner.decode("utf-8", errors="replace").strip() or None
+            finally:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return None
+
+
+def _fingerprint_service(banner):
+    """
+    Match a banner against known service patterns (Stage I2).
+
+    Returns {"service": family-or-None, "product": product-or-None,
+    "version": version-or-None}. The family is one of the names the
+    technology layer branches on (http/ssh/smtp/ftp), so a matched
+    banner keeps downstream fingerprinting working; product/version
+    ride the service record's evidence text.
+    """
+    result = {"service": None, "product": None, "version": None}
+    if not banner or not isinstance(banner, str):
+        return result
+    for pattern, family, product in _FINGERPRINT_PATTERNS:
+        try:
+            m = re.search(pattern, banner, re.IGNORECASE)
+        except Exception:
+            continue
+        if m:
+            result["service"] = family
+            result["product"] = product
+            try:
+                ver = m.group(1) if m.lastindex else None
+            except Exception:
+                ver = None
+            result["version"] = ver.strip() if isinstance(ver, str) and ver.strip() else None
+            return result
+    return result
+
+
+def active_recon(target, config):
+    """
+    Authorized active reconnaissance (Stage I2).
+
+    Gate first, scan second: without explicit authorization for exactly
+    this target, nothing is performed -- no sockets, no probes. Returns
+    {"status": "OK", "services": [...]} on success, where each service
+    carries port/protocol/state/service/evidence/source/confidence for
+    the attack-surface inventory.
+    """
+    try:
+        as_cfg = (config or {}).get("attack_surface", {}) or {}
+    except Exception:
+        as_cfg = {}
+    if not as_cfg.get("authorized", False):
+        return {
+            "status": "DISABLED",
+            "reason": "authorization required"
+        }
+
+    if target not in (as_cfg.get("authorized_targets", []) or []):
+        return {
+            "status": "DISABLED",
+            "reason": "target not authorized"
+        }
+
+    # 1. Port scan (TCP connect)
+    open_ports = _tcp_connect_scan(target, config)
+
+    services = []
+    # 2. Banner grab for open ports
+    for port in open_ports:
+        banner = _banner_grab(target, port, config)
+
+        # 3. Service fingerprint
+        fp = _fingerprint_service(banner) if banner else \
+            {"service": None, "product": None, "version": None}
+        service_name = fp.get("service")
+        evidence = banner or ""
+        if fp.get("product"):
+            evidence = (f"{fp['product']}"
+                        f"{' ' + fp['version'] if fp.get('version') else ''}"
+                        f"{' | ' + evidence if evidence else ''}")
+        services.append({
+            "port": port,
+            "protocol": "tcp",
+            "state": "open",
+            "service": service_name,
+            "evidence": evidence,
+            "source": "active_recon",
+            "confidence": 0.9 if banner else 0.6,
+        })
+
+    return {
+        "status": "OK",
+        "services": services
+    }
+
+
 def _collect_authorized_scan_services(target: str,
                                       config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
@@ -5649,9 +7266,26 @@ def _collect_authorized_scan_services(target: str,
     if target not in allowlist and "*" not in allowlist:
         return []
 
-    # No active scanning implemented in this stage.
-    # Return empty to avoid accidental active behavior.
-    return []
+    # Authorization gate
+    if not as_cfg.get("authorized", False):
+        return []
+
+    allowlist = as_cfg.get("authorized_targets", []) or []
+    if target not in allowlist and "*" not in allowlist:
+        return []
+
+    # Stage I2: authorized active reconnaissance. active_recon()
+    # re-checks the gate strictly (exact allowlist membership, no
+    # wildcard) and returns DISABLED unless scanning is truly
+    # authorized; only an OK result contributes services.
+    try:
+        res = active_recon(target, config)
+    except Exception:
+        return []
+    if not isinstance(res, dict) or res.get("status") != "OK":
+        return []
+    services = res.get("services", []) or []
+    return [s for s in services if isinstance(s, dict)]
 
 
 def service_inventory(services: List[Dict[str, Any]],
@@ -5826,8 +7460,12 @@ def attack_surface(target: str,
     # Step 2: Authorized active scan (disabled by default)
     active = _collect_authorized_scan_services(target, config)
 
-    # Step 3: Merge
-    all_services = (passive or []) + (active or [])
+    # Step 3: Merge. Active first: when an authorized scan ran, its
+    # banner evidence outranks the passive hint for the same
+    # (port, protocol) in the inventory dedup below. With authorization
+    # off (the default) active is empty, so the order is identical to
+    # passive-only.
+    all_services = (active or []) + (passive or [])
 
     # Step 4: Inventory
     inventory = service_inventory(all_services, config)
@@ -6220,6 +7858,337 @@ def cpe_to_cve(cpe_entry: Dict[str, Any],
     return results
 
 
+# ============================================================
+#  SAFE VALIDATION — Stage J4 (Automated Safe Validation)
+#  A candidate is a version-range match, not a finding. Validation
+#  answers one question with a read-only probe: is the claimed
+#  version confirmed on the target, contradicted, or unknowable
+#  without intrusive testing?
+#
+#  Safety contract (never violated):
+#    - HEAD / only, no payload, no auth, no path fuzzing.
+#    - Only the Server response header is read; the body is discarded.
+#    - Short timeout, fail-soft, never raises.
+#    - No exploitation, no version-specific payload, no login attempt.
+# ============================================================
+# Products whose version can appear in an HTTP Server header and can
+# therefore be checked with a safe HEAD probe.
+_SAFE_VALIDATION_HTTP_PRODUCTS = frozenset({
+    "nginx", "apache", "caddy", "iis", "litespeed", "openresty",
+    "gunicorn", "uvicorn", "werkzeug", "kestrel", "cloudflare",
+})
+
+# Validation statuses (Stage J4 contract — exact strings).
+_VALIDATION_STATUSES = ("CONFIRMED", "REJECTED", "INCONCLUSIVE")
+
+
+def _safe_validation_timeout(config: Dict[str, Any]) -> int:
+    try:
+        sv = ((config or {}).get("vulnerability", {}) or {}).get(
+            "safe_validation", {}) or {}
+        to = int(sv.get("timeout", 5))
+        return max(1, min(to, 30))
+    except Exception:
+        return 5
+
+
+def _safe_validation_allowed(config: Dict[str, Any]) -> bool:
+    try:
+        sv = ((config or {}).get("vulnerability", {}) or {}).get(
+            "safe_validation", {}) or {}
+        if not sv.get("enabled", True):
+            return False
+        return bool(sv.get("allow_network_probe", True))
+    except Exception:
+        return True
+
+
+def _safe_http_server_probe(host: str, port: int, use_tls: bool,
+                            timeout: int = 5) -> Optional[str]:
+    """HEAD / and return the Server response header (or None).
+
+    Read-only: sends one HEAD request, reads headers only, discards
+    the body. Returns None on any error, timeout, or missing header.
+    Never raises.
+    """
+    try:
+        import http.client as _httpc
+    except Exception:
+        return None
+    try:
+        host = str(host or "").strip()
+        if not host:
+            return None
+        try:
+            port = int(port)
+        except Exception:
+            return None
+        if use_tls:
+            conn = _httpc.HTTPSConnection(host, port, timeout=timeout)
+        else:
+            conn = _httpc.HTTPConnection(host, port, timeout=timeout)
+        try:
+            conn.request("HEAD", "/", headers={"Host": host,
+                                               "User-Agent": "ReconIP/21.2 (safe-validation)",
+                                               "Connection": "close"})
+            resp = conn.getresponse()
+            try:
+                server = resp.getheader("Server")
+            except Exception:
+                server = None
+            # Drain minimally so the socket closes cleanly; ignore body.
+            try:
+                resp.read(0)
+            except Exception:
+                pass
+            return server.strip() if server and str(server).strip() else None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
+def _validation_target_host(report: Dict[str, Any]) -> Tuple[str, bool]:
+    """Return (host, is_domain) for safe probing. Never raises."""
+    try:
+        rep = report if isinstance(report, dict) else {}
+        domain = rep.get("domain") or rep.get("input")
+        ip = (rep.get("infrastructure_intelligence", {}) or {}).get("ip") \
+            or rep.get("ip") or rep.get("resolved_ip")
+        # Prefer the domain when the scan was domain-typed: Host/SNI then
+        # match what a browser would send. Fall back to the IP.
+        try:
+            import ipaddress as _ipa
+            if domain and not ip:
+                try:
+                    _ipa.ip_address(str(domain).strip())
+                except Exception:
+                    return (str(domain).strip(), True)
+            if isinstance(rep.get("type"), str) and rep.get("type") == "domain" \
+                    and domain:
+                try:
+                    _ipa.ip_address(str(domain).strip())
+                except Exception:
+                    return (str(domain).strip(), True)
+        except Exception:
+            pass
+        if ip:
+            return (str(ip).strip(), False)
+        if domain:
+            return (str(domain).strip(), False)
+    except Exception:
+        pass
+    return ("", False)
+
+
+def _validate_single_candidate(candidate: Dict[str, Any],
+                               report: Dict[str, Any],
+                               config: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach a safe validation verdict to one candidate. Never raises."""
+    def _v(status: str, method: str, detail: str,
+           extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if status not in _VALIDATION_STATUSES:
+            status = "INCONCLUSIVE"
+        d: Dict[str, Any] = {
+            "status": status,
+            "method": method,
+            "detail": detail,
+            "checked_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+        }
+        if isinstance(extra, dict):
+            d.update(extra)
+        return d
+
+    try:
+        if not isinstance(candidate, dict):
+            return _v("INCONCLUSIVE", "none",
+                      "Invalid candidate record; nothing to validate.")
+        tech = candidate.get("technology", {}) or {}
+        product = str(tech.get("product") or "").lower().strip()
+        version = str(tech.get("version") or "").strip()
+        if not product or not version:
+            return _v("INCONCLUSIVE", "none",
+                      "No confident version claim; validation impossible.")
+        if product not in _SAFE_VALIDATION_HTTP_PRODUCTS:
+            return _v(
+                "INCONCLUSIVE", "no-safe-probe",
+                f"No safe network probe available for product class "
+                f"'{product}'; version claim remains unconfirmed. "
+                f"Validate manually in an authorized environment.",
+                {"product": product, "claimed_version": version})
+        if not _safe_validation_allowed(config):
+            return _v(
+                "INCONCLUSIVE", "disabled",
+                "Safe network probes are disabled in configuration; "
+                "version claim remains unconfirmed.",
+                {"product": product, "claimed_version": version})
+        host, _is_dom = _validation_target_host(report)
+        if not host:
+            return _v("INCONCLUSIVE", "no-target",
+                      "No target host available for safe probing.",
+                      {"product": product, "claimed_version": version})
+        timeout = _safe_validation_timeout(config)
+        # Probe port: the candidate's own HTTP port first, then defaults.
+        try:
+            cand_port = int((candidate.get("technology", {}) or {}).get(
+                "port", 0) or candidate.get("port", 0) or 0)
+        except Exception:
+            cand_port = 0
+        try:
+            http_ports = list((((config or {}).get("vulnerability", {}) or {})
+                               .get("safe_validation", {}) or {})
+                              .get("http_ports", [80, 443, 8080, 8443])) or [80, 443]
+        except Exception:
+            http_ports = [80, 443]
+        tried: List[Dict[str, Any]] = []
+        order: List[int] = []
+        for p in ([cand_port] if cand_port else []) + list(http_ports):
+            try:
+                pi = int(p)
+            except Exception:
+                continue
+            if pi not in order and 1 <= pi <= 65535:
+                order.append(pi)
+        server: Optional[str] = None
+        used_port: Optional[int] = None
+        used_tls: bool = False
+        for p in order[:4]:
+            for tls in (False, True) if p in (443, 8443) else (
+                    (True, False) if p not in (80, 8080) else (False, True)):
+                # For well-known plain ports try plain first; for TLS
+                # ports try TLS first; otherwise try both.
+                s = _safe_http_server_probe(host, p, tls, timeout=timeout)
+                tried.append({"port": p, "tls": tls,
+                              "server": s})
+                if s is not None:
+                    server, used_port, used_tls = s, p, tls
+                    break
+            if server is not None:
+                break
+        if server is None:
+            return _v(
+                "INCONCLUSIVE", "safe-http-head:Server",
+                "Target did not disclose a Server header or was "
+                "unreachable; version claim can be neither confirmed "
+                "nor rejected from passive evidence alone.",
+                {"product": product, "claimed_version": version,
+                 "probed_host": host, "probed_ports": order[:4]})
+        # Match the disclosed Server header against the claimed product.
+        m = _match_signatures(server, HTTP_SERVER_SIGNATURES)
+        if not m or str(m.get("product") or "").lower() != product:
+            disclosed = (m.get("product") if m else None) or server[:80]
+            return _v(
+                "REJECTED", "safe-http-head:Server",
+                f"Server header discloses '{server[:120]}', which does "
+                f"not match the claimed product '{product}'; the "
+                f"candidate is contradicted by live evidence.",
+                {"product": product, "claimed_version": version,
+                 "probed_host": host, "probed_port": used_port,
+                 "probed_tls": used_tls, "server_header": server,
+                 "disclosed_product": disclosed})
+        disclosed_version = (m or {}).get("version")
+        if not disclosed_version:
+            return _v(
+                "INCONCLUSIVE", "safe-http-head:Server",
+                f"Server header confirms product '{product}' but "
+                f"discloses no version ('{server[:120]}'); the claimed "
+                f"version '{version}' can be neither confirmed nor "
+                f"rejected.",
+                {"product": product, "claimed_version": version,
+                 "probed_host": host, "probed_port": used_port,
+                 "probed_tls": used_tls, "server_header": server})
+        # Compare disclosed vs claimed version exactly (normalized).
+        try:
+            dv = _parse_version(str(disclosed_version)) or ()
+            cv = _parse_version(str(version)) or ()
+            n = max(len(dv), len(cv))
+            dv_p = tuple(dv) + (0,) * (n - len(dv))
+            cv_p = tuple(cv) + (0,) * (n - len(cv))
+            same = (dv_p == cv_p)
+        except Exception:
+            same = (str(disclosed_version).strip() == str(version).strip())
+        if same:
+            return _v(
+                "CONFIRMED", "safe-http-head:Server",
+                f"Server header discloses '{server[:120]}', matching "
+                f"the claimed {product} {version}; the version "
+                f"assumption is confirmed by live evidence.",
+                {"product": product, "claimed_version": version,
+                 "probed_host": host, "probed_port": used_port,
+                 "probed_tls": used_tls, "server_header": server,
+                 "disclosed_version": disclosed_version})
+        return _v(
+            "REJECTED", "safe-http-head:Server",
+            f"Server header discloses {product} {disclosed_version}, "
+            f"not the claimed {version}; the candidate's version "
+            f"assumption is contradicted by live evidence.",
+            {"product": product, "claimed_version": version,
+             "probed_host": host, "probed_port": used_port,
+             "probed_tls": used_tls, "server_header": server,
+             "disclosed_version": disclosed_version})
+    except Exception as e:
+        try:
+            return _v("INCONCLUSIVE", "error",
+                      f"Validation probe failed safely: "
+                      f"{type(e).__name__}: {e}")
+        except Exception:
+            return {"status": "INCONCLUSIVE", "method": "error",
+                    "detail": "Validation probe failed safely."}
+
+
+def validate_vulnerability_candidates(
+        vuln_intel: Dict[str, Any],
+        report: Dict[str, Any],
+        config: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach safe validation verdicts to every candidate (Stage J4).
+
+    Mutates and returns vuln_intel. Fail-soft: a probe fault marks
+    that candidate INCONCLUSIVE and never aborts the scan.
+    """
+    try:
+        if not isinstance(vuln_intel, dict):
+            return vuln_intel
+        cands = vuln_intel.get("candidates", []) or []
+        if not isinstance(cands, list):
+            return vuln_intel
+        for c in cands:
+            try:
+                if not isinstance(c, dict):
+                    continue
+                if not isinstance(c.get("validation"), dict) or \
+                        c.get("validation", {}).get("status") not in \
+                        _VALIDATION_STATUSES:
+                    c["validation"] = _validate_single_candidate(
+                        c, report, config)
+            except Exception:
+                try:
+                    c["validation"] = {"status": "INCONCLUSIVE",
+                                       "method": "error",
+                                       "detail": "Validation probe failed "
+                                                 "safely."}
+                except Exception:
+                    pass
+        # Summary counts (additive; existing keys untouched).
+        try:
+            summary = vuln_intel.get("summary", {}) or {}
+            counts = {"CONFIRMED": 0, "REJECTED": 0, "INCONCLUSIVE": 0}
+            for c in cands:
+                st = (c.get("validation", {}) or {}).get("status")
+                if st in counts:
+                    counts[st] += 1
+            summary["validation"] = counts
+            vuln_intel["summary"] = summary
+        except Exception:
+            pass
+        return vuln_intel
+    except Exception:
+        return vuln_intel
+
+
 def vulnerability_candidates(report: Dict[str, Any],
                              config: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -6302,8 +8271,12 @@ def vulnerability_candidates(report: Dict[str, Any],
                 "technology": {
                     "product": tech["product"],
                     "version": tech["version"],
-                    "confidence": tech["confidence"]
+                    "confidence": tech["confidence"],
+                    "port": tech.get("port"),
+                    "service": tech.get("service")
                 },
+                "port": tech.get("port"),
+                "service": tech.get("service"),
                 "cpe": cpe_entry["cpe"],
                 "cve": cve.get("cve"),
                 "severity": cve.get("severity"),
@@ -6357,7 +8330,7 @@ def vulnerability_candidates(report: Dict[str, Any],
         "No exploitation is performed in this stage."
     ]
 
-    return {
+    result: Dict[str, Any] = {
         "enabled": True,
         "candidates": candidates,
         "cpes_built": cpes_built,
@@ -6371,6 +8344,14 @@ def vulnerability_candidates(report: Dict[str, Any],
         },
         "notes": notes
     }
+
+    # Stage J4: safe validation probes (read-only HEAD/Server check).
+    # Fail-soft: probe faults mark candidates INCONCLUSIVE, never abort.
+    try:
+        result = validate_vulnerability_candidates(result, report, config)
+    except Exception:
+        pass
+    return result
 
 
 def _banner_grab_authorized(ip: str, port: int,
@@ -6567,6 +8548,26 @@ def fingerprint_technology(service: Dict[str, Any],
         if grabbed:
             banner = grabbed
             evidence_sources.append("banner")
+
+    # 3. Banner attached by an authorized active scan (Stage I2).
+    # service_inventory preserves the active_recon banner in the
+    # record's evidence field. It counts as technology evidence only
+    # with its provenance intact: source active_recon plus a target
+    # that is authorized right now. Imported or passive records never
+    # qualify, so third-party banner claims cannot launder themselves
+    # into technology evidence, and flipping attack_surface.authorized
+    # off retroactively disqualifies previously grabbed banners too.
+    if banner is None:
+        try:
+            _rec_evidence = service.get("evidence") or ""
+            if _rec_evidence and service.get("source") == "active_recon":
+                _as_cfg = (config or {}).get("attack_surface", {}) or {}
+                _allowed = _as_cfg.get("authorized_targets", []) or []
+                if _as_cfg.get("authorized", False) and ip in _allowed:
+                    banner = str(_rec_evidence)
+                    evidence_sources.append("active_banner")
+        except Exception:
+            pass
     result["banner"] = banner
 
     # ---- Match signatures ----
@@ -7837,6 +9838,56 @@ class ThreatFox(Provider):
         return o
 
 # ---------------- Feodo Tracker ----------------
+# ---------------- Blocklist fetch with persistent cache ----------------
+def _fetch_blocklist(name: str, url: str, timeout, ttl_seconds: int) -> Optional[str]:
+    """
+    Download a threat blocklist, file-cache backed (Stage H1).
+
+    The four keyless bulk-feed providers (feodo, sslbl, cins,
+    spamhaus_drop) each re-downloaded a multi-hundred-KB blocklist on
+    EVERY scan -- their class-level _cache only survives within one
+    process. This helper adds the second tier: reconip_cache.db keyed
+    blocklist:{name} with the provider's own freshness TTL, so repeat
+    scans skip the download entirely.
+
+    Returns the response text, or None when the fetch failed (non-200
+    or exception). Only successful downloads are stored; a failed fetch
+    never poisons the cache, and callers keep their existing
+    PROVIDER_ERROR semantics for the None case.
+    """
+    try:
+        cfg = CFG if isinstance(CFG, dict) else {}
+    except Exception:
+        cfg = {}
+    key = f"blocklist:{name}"
+    try:
+        hit = cache_get(key, cfg)
+        if isinstance(hit, dict) and hit.get("status") == "FRESH":
+            try:
+                val = hit.get("value", {})
+                text = val.get("text") if isinstance(val, dict) else None
+                if isinstance(text, str) and text:
+                    return json.loads(json.dumps(text))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        r = http.s.get(url, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        text = r.text
+    except Exception:
+        return None
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        cache_set(key, {"text": text}, cfg, ttl_seconds=ttl_seconds, source=name)
+    except Exception:
+        pass
+    return text
+
+
 class FeodoTracker(Provider):
     name = "feodo"; env_var = ""; cfg_key = ""
     _cache = {"data": None, "ts": 0.0}
@@ -7849,12 +9900,13 @@ class FeodoTracker(Provider):
                 weight=s.weight, reliability=s.reliability)
         n = time.time()
         if not s._cache["data"] or (n - s._cache["ts"]) > 1800:
+            text = _fetch_blocklist("feodo",
+                                    "https://feodotracker.abuse.ch/downloads/ipblocklist.json",
+                                    (3, 8), 1800)
+            if text is None:
+                o.status = TS2.PROVIDER_ERROR; return o
             try:
-                r = http.s.get("https://feodotracker.abuse.ch/downloads/ipblocklist.json",
-                               timeout=(3, 8))
-                if r.status_code != 200:
-                    o.status = TS2.PROVIDER_ERROR; return o
-                data = r.json() or []
+                data = json.loads(text) or []
                 s._cache["data"] = {row.get("ip_address"): row for row in data
                                      if row.get("ip_address")}
                 s._cache["ts"] = n
@@ -7885,12 +9937,13 @@ class SSLBL(Provider):
                 weight=s.weight, reliability=s.reliability)
         n = time.time()
         if not s._cache["data"] or (n - s._cache["ts"]) > 3600:
+            text = _fetch_blocklist("sslbl",
+                                    "https://sslbl.abuse.ch/blacklist/sslipblacklist.json",
+                                    (3, 8), 3600)
+            if text is None:
+                o.status = TS2.PROVIDER_ERROR; return o
             try:
-                r = http.s.get("https://sslbl.abuse.ch/blacklist/sslipblacklist.json",
-                               timeout=(3, 8))
-                if r.status_code != 200:
-                    o.status = TS2.PROVIDER_ERROR; return o
-                data = r.json() or []
+                data = json.loads(text) or []
                 s._cache["data"] = {row.get("ip"): row for row in data if row.get("ip")}
                 s._cache["ts"] = n
             except Exception as e:
@@ -7966,12 +10019,13 @@ class CINS(Provider):
                 weight=s.weight, reliability=s.reliability)
         n = time.time()
         if not s._cache["data"] or (n - s._cache["ts"]) > 3600:
+            text = _fetch_blocklist("cins",
+                                    "http://cinsscore.com/list/ci-badguys.txt",
+                                    (3, 8), 3600)
+            if text is None:
+                o.status = TS2.PROVIDER_ERROR; return o
             try:
-                r = http.s.get("http://cinsscore.com/list/ci-badguys.txt",
-                               timeout=(3, 8))
-                if r.status_code != 200:
-                    o.status = TS2.PROVIDER_ERROR; return o
-                s._cache["data"] = set(r.text.splitlines())
+                s._cache["data"] = set(text.splitlines())
                 s._cache["ts"] = n
             except Exception as e:
                 o.status = TS2.PROVIDER_ERROR; o.error = str(e); return o
@@ -7996,13 +10050,14 @@ class SpamhausDROP(Provider):
                 weight=s.weight, reliability=s.reliability)
         n = time.time()
         if not s._cache["data"] or (n - s._cache["ts"]) > 3600:
+            text = _fetch_blocklist("spamhaus_drop",
+                                    "https://www.spamhaus.org/drop/drop.txt",
+                                    (3, 8), 3600)
+            if text is None:
+                o.status = TS2.PROVIDER_ERROR; return o
             try:
-                r = http.s.get("https://www.spamhaus.org/drop/drop.txt",
-                               timeout=(3, 8))
-                if r.status_code != 200:
-                    o.status = TS2.PROVIDER_ERROR; return o
                 nets = []
-                for ln in r.text.splitlines():
+                for ln in text.splitlines():
                     ln = ln.strip()
                     if not ln or ln.startswith(";"): continue
                     try:
@@ -8029,21 +10084,18 @@ class SpamhausDROP(Provider):
 PROVIDERS = [AbuseIPDB, VirusTotal, AlienVault, URLhaus, ThreatFox,
              FeodoTracker, SSLBL, GreyNoise, CINS, SpamhausDROP]
 
-def collect_threat(ip, per_provider_timeout=8.0):
-    """v21.11: hard timeout per provider via signal.alarm."""
+def _query_threat_provider(p, ip, per_provider_timeout):
+    """
+    Query one legacy threat provider with isolation (Stage H1 worker).
+
+    The body is the per-provider logic formerly inline in collect_threat(),
+    unchanged outcome for outcome: signal-alarm hard timeout on the main
+    thread, soft timeout (per-call HTTP timeouts) on worker threads, same
+    health accounting, same debug evidence. Returns the Obs. Never raises
+    -- a provider fault yields a PROVIDER_ERROR Obs, so one dead feed can
+    never cost the operator the other providers' answers.
+    """
     import signal as _sig
-    heavy_names = {"feodo", "sslbl", "cins", "spamhaus_drop"}
-    heavy_enabled = os.environ.get("RECONIP_BULK_FEEDS", "1") != "0"
-    ps = []
-    for cls in PROVIDERS:
-        try:
-            p = cls()
-            if not p.enabled: continue
-            if p.name in heavy_names and not heavy_enabled: continue
-            ps.append(p)
-        except Exception as e:
-            log.warning(f"provider {cls.__name__}: {e}")
-    if not ps: return [], MS.SKIPPED.value
 
     def _alarm_handler(signum, frame):
         raise TimeoutError("provider hard timeout")
@@ -8065,44 +10117,84 @@ def collect_threat(ip, per_provider_timeout=8.0):
             except Exception:
                 pass
 
-    obs_list = []
-    for p in ps:
-        t0 = time.monotonic()
+    t0 = time.monotonic()
+    try:
+        o = _query_with_timeout(p, ip, per_provider_timeout)
+    except TimeoutError:
+        o = Obs(provider=p.name, status=TS2.PROVIDER_ERROR, timestamp=now(),
+                weight=p.weight, reliability=p.reliability,
+                error=f"hard timeout ({per_provider_timeout}s)")
+        log.warning(f"[HARD-TIMEOUT] {p.name}")
+    except Exception as e:
+        o = Obs(provider=p.name, status=TS2.PROVIDER_ERROR, timestamp=now(),
+                weight=p.weight, reliability=p.reliability, error=str(e))
+    ms = (time.monotonic() - t0) * 1000
+    if o.status in (TS2.POSITIVE, TS.NO_THREAT.value):
+        H(p.name).success(ms)
+    elif o.status == TS2.RATE_LIMITED:
+        H(p.name).failure(EC.RATE_LIMITED.value, ms)
+    elif o.status == TS2.PROVIDER_ERROR:
+        H(p.name).failure(EC.TRANSIENT.value, ms)
+    # Stage 2: Evidence traceability for each threat provider
+    try:
+        ev_threat = make_evidence(
+            source=p.name,
+            value=getattr(o, 'score', None),
+            normalized_value=getattr(o, 'score', None),
+            confidence=(getattr(o, 'confidence', 50) / 100.0) if getattr(o, 'confidence', None) else 0.5,
+            status="OK" if o.status in (TS2.POSITIVE, TS.NO_THREAT.value, TS.NO_DATA.value) else "FAILED",
+            ttl_key="threat",
+            metadata={"provider": p.name, "status": o.status, "categories": getattr(o, 'categories', []), "error": getattr(o, 'error', None), "data_type": "threat", "field": p.name, "target": ip, "raw_value": getattr(o, 'score', None)}
+        )
+        # Keep evidence for debugging / future report pipeline
+        format_evidence(ev_threat)
+    except Exception:
+        pass
+    return o
+
+
+def collect_threat(ip, per_provider_timeout=8.0):
+    """v21.11: hard timeout per provider via signal.alarm.
+
+    Stage H1: providers are queried concurrently (one worker each), so
+    total latency is bounded by the slowest provider instead of the sum.
+    Results rejoin in provider-registration order -- obs_list is ordered
+    exactly as the old sequential loop produced it.
+    """
+    heavy_names = {"feodo", "sslbl", "cins", "spamhaus_drop"}
+    heavy_enabled = os.environ.get("RECONIP_BULK_FEEDS", "1") != "0"
+    ps = []
+    for cls in PROVIDERS:
         try:
-            o = _query_with_timeout(p, ip, per_provider_timeout)
-        except TimeoutError:
-            o = Obs(provider=p.name, status=TS2.PROVIDER_ERROR, timestamp=now(),
-                    weight=p.weight, reliability=p.reliability,
-                    error=f"hard timeout ({per_provider_timeout}s)")
-            log.warning(f"[HARD-TIMEOUT] {p.name}")
+            p = cls()
+            if not p.enabled: continue
+            if p.name in heavy_names and not heavy_enabled: continue
+            ps.append(p)
         except Exception as e:
-            o = Obs(provider=p.name, status=TS2.PROVIDER_ERROR, timestamp=now(),
-                    weight=p.weight, reliability=p.reliability, error=str(e))
-        ms = (time.monotonic() - t0) * 1000
-        if o.status in (TS2.POSITIVE, TS.NO_THREAT.value):
-            H(p.name).success(ms)
-        elif o.status == TS2.RATE_LIMITED:
-            H(p.name).failure(EC.RATE_LIMITED.value, ms)
-        elif o.status == TS2.PROVIDER_ERROR:
-            H(p.name).failure(EC.TRANSIENT.value, ms)
-        # Stage 2: Evidence traceability for each threat provider
-        try:
-            ev_threat = make_evidence(
-                source=p.name,
-                value=getattr(o, 'score', None),
-                normalized_value=getattr(o, 'score', None),
-                confidence=(getattr(o, 'confidence', 50) / 100.0) if getattr(o, 'confidence', None) else 0.5,
-                status="OK" if o.status in (TS2.POSITIVE, TS.NO_THREAT.value, TS.NO_DATA.value) else "FAILED",
-                ttl_key="threat",
-                metadata={"provider": p.name, "status": o.status, "categories": getattr(o, 'categories', []), "error": getattr(o, 'error', None), "data_type": "threat", "field": p.name, "target": ip, "raw_value": getattr(o, 'score', None)}
-            )
-            # Keep evidence for debugging / future report pipeline
-            format_evidence(ev_threat)
-        except Exception:
-            pass
-        obs_list.append(o)
+            log.warning(f"provider {cls.__name__}: {e}")
+    if not ps: return [], MS.SKIPPED.value
+
+    obs_list: List[Any] = [None] * len(ps)
+    if len(ps) == 1:
+        obs_list[0] = _query_threat_provider(ps[0], ip, per_provider_timeout)
+    else:
+        with ThreadPoolExecutor(max_workers=len(ps),
+                                thread_name_prefix="reconip-threat") as ex:
+            future_map = {
+                ex.submit(_query_threat_provider, p, ip, per_provider_timeout): i
+                for i, p in enumerate(ps)
+            }
+            for future in as_completed(future_map):
+                i = future_map[future]
+                try:
+                    obs_list[i] = future.result()
+                except Exception as e:
+                    obs_list[i] = Obs(provider=ps[i].name, status=TS2.PROVIDER_ERROR,
+                                      timestamp=now(), weight=ps[i].weight,
+                                      reliability=ps[i].reliability,
+                                      error=f"worker fault: {e}")
     att = len(ps)
-    resp = sum(1 for o in obs_list if o.status in
+    resp = sum(1 for o in obs_list if o is not None and o.status in
                (TS2.POSITIVE, TS.NO_THREAT.value, TS.NO_DATA.value))
     return obs_list, module_status(att, resp)
 
@@ -9807,6 +11899,21 @@ def analyze_ct_subdomains(cert_records):
             "total_certs": len(cert_records)}
 
 def whois_enhanced(target):
+    # Stage H1: persistent cache. WHOIS registrations change on a
+    # timescale of months, yet every scan shelled out to the whois binary
+    # (measured 0.4-3.3s, server-dependent). Only non-empty answers are
+    # cached, so a transient whois failure is always retried next scan.
+    try:
+        _cfg = CFG if isinstance(CFG, dict) else {}
+        _hit = cache_get(f"whois:{target}", _cfg)
+        if isinstance(_hit, dict) and _hit.get("status") == "FRESH" \
+                and isinstance(_hit.get("value"), dict) and _hit["value"]:
+            try:
+                return json.loads(json.dumps(_hit["value"]))
+            except Exception:
+                pass
+    except Exception:
+        pass
     try:
         t0 = time.monotonic()
         out, _ = safe_subprocess("whois", [target], timeout=PN["subprocess_timeout"])
@@ -9841,7 +11948,19 @@ def whois_enhanced(target):
             "status": grab(r"(Status|status):\s*([^\n]+)"),
             "dnssec": grab(r"(DNSSEC):\s*([^\n]+)"),
         }
-        return {k: v for k, v in result.items() if v}
+        result = {k: v for k, v in result.items() if v}
+        if result:
+            try:
+                _cfg = CFG if isinstance(CFG, dict) else {}
+                _ttl = 86400
+                try:
+                    _ttl = int(((_cfg.get("cache", {}) or {}).get("section_ttls", {}) or {}).get("whois", 86400))
+                except Exception:
+                    pass
+                cache_set(f"whois:{target}", result, _cfg, ttl_seconds=_ttl, source="whois")
+            except Exception:
+                pass
+        return result
     except Exception as e:
         H("whois_enhanced").failure(exc_class(e), 0); return None
 
@@ -10247,9 +12366,15 @@ class PassiveOSINT:
     @staticmethod
     def otx_passive_dns(ip):
         try:
+            # Stage H1: (2, 1). Measured 8.2s burned on EVERY scan waiting
+            # out the original 8s read timeout against a hanging endpoint,
+            # then 3s, then 2s at progressively tighter bounds -- always
+            # for an empty result. OTX answers healthy queries in well
+            # under a second; a socket silent for a full second is not
+            # going to deliver enrichment worth stalling triage for.
             r = http.s.get(
                 f"https://otx.alienvault.com/api/v1/indicators/IPv4/{ip}/passive_dns",
-                timeout=(3, 8))
+                timeout=(2, 1))
             if r.status_code != 200: return []
             d = r.json() or {}
             return [{"hostname": row.get("hostname"),
@@ -10333,6 +12458,12 @@ def weighted_agreement(vals):
         b[v] = b.get(v, 0) + w; tot += w
     if not b: return None, 0.0
     best = max(b, key=b.get)
+    # Degraded runs can reach here with every weight at 0.0 (all
+    # contributing evidences FAILED with zero confidence). Agreement
+    # over zero total weight is 0 by definition -- previously this
+    # divided by zero and aborted core scoring on exactly the runs
+    # that most needed a degraded answer.
+    if not tot: return best, 0.0
     return best, round(b[best] / tot * 100, 1)
 
 def validate_field(field, evs):
@@ -11597,6 +13728,746 @@ def _find_related_targets(graph: Dict[str, Any],
     return related
 
 
+def map_mitre_techniques(report: Dict[str, Any],
+                          config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Map detected anomalies and exposure patterns to MITRE ATT&CK
+    technique IDs (Stage I5).
+
+    Inputs: anomaly names from the configured mitre_mapping.anomalies
+    table matched exactly against detected anomaly subtypes, types and
+    categories; patterns evaluated as conditions (no_dmarc ==
+    missing_dmarc anomaly present; high_exposure == externally exposed
+    with sensitive services or a broad open-port footprint).
+    Mapping keys with no corresponding finding never fire -- technique
+    IDs are asserted from evidence, never invented.
+
+    Returns {"techniques": sorted unique IDs, "evidence": {id: [reasons]}}.
+    Pure function of (report, config); never raises.
+    """
+    techniques: Dict[str, List[str]] = {}
+
+    def _add(tids: List[str], reason: str) -> None:
+        for tid in tids or []:
+            try:
+                tid = str(tid).strip()
+            except Exception:
+                continue
+            if tid:
+                techniques.setdefault(tid, []).append(reason)
+
+    try:
+        mapping = (config or {}).get("mitre_mapping", {}) or {}
+    except Exception:
+        mapping = {}
+    if not isinstance(mapping, dict):
+        mapping = {}
+    anomaly_map = mapping.get("anomalies", {}) or {}
+    pattern_map = mapping.get("patterns", {}) or {}
+    if not isinstance(anomaly_map, dict):
+        anomaly_map = {}
+    if not isinstance(pattern_map, dict):
+        pattern_map = {}
+
+    try:
+        rep = report if isinstance(report, dict) else {}
+        # Anomalies from every layer available at correlate time: the
+        # stage-11 report (batch/multi-pass flows), DNS analysis and
+        # attack-surface findings (single-pass order: correlate runs
+        # before stage 11 is computed).
+        found: List[Dict[str, Any]] = []
+        try:
+            found.extend(((rep.get("anomaly_intelligence", {}) or {})
+                          .get("anomalies", []) or []))
+        except Exception:
+            pass
+        try:
+            found.extend((((rep.get("dns_intelligence", {}) or {})
+                           .get("analysis", {}) or {}).get("anomalies", [])
+                          or []))
+        except Exception:
+            pass
+        try:
+            found.extend((rep.get("attack_surface_intelligence", {}) or {})
+                         .get("anomalies", []) or [])
+        except Exception:
+            pass
+        for anomaly in found:
+            if not isinstance(anomaly, dict):
+                continue
+            names = {str(anomaly.get("subtype", "") or ""),
+                     str(anomaly.get("type", "") or ""),
+                     str(anomaly.get("category", "") or "")} - {""}
+            for key, tids in anomaly_map.items():
+                try:
+                    if str(key) in names:
+                        _add(list(tids or []),
+                             f"anomaly:{key} "
+                             f"({anomaly.get('severity', '?')})")
+                except Exception:
+                    continue
+        # Pattern: no_dmarc -- a missing_dmarc anomaly asserts exactly
+        # the condition the pattern names.
+        try:
+            tids = pattern_map.get("no_dmarc") or []
+            if tids and any(isinstance(a, dict) and (
+                    a.get("subtype") == "missing_dmarc"
+                    or a.get("type") == "missing_dmarc")
+                    for a in found):
+                _add(list(tids), "pattern:no_dmarc (missing_dmarc present)")
+        except Exception:
+            pass
+        # Pattern: high_exposure -- externally exposed services with
+        # sensitive footprint or broad open-port count.
+        try:
+            tids = pattern_map.get("high_exposure") or []
+            if tids:
+                as_intel = rep.get("attack_surface_intelligence", {}) or {}
+                exposure = as_intel.get("exposure", {}) or {}
+                ext = int(exposure.get("external_count", 0) or 0)
+                sens = int(as_intel.get("sensitive_count", 0) or 0)
+                if (exposure.get("classification") == "external"
+                        and (sens > 0 or ext >= 5)):
+                    _add(list(tids),
+                         f"pattern:high_exposure "
+                         f"(external={ext} sensitive={sens})")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return {"techniques": sorted(techniques),
+            "evidence": {k: sorted(set(v)) for k, v in techniques.items()}}
+
+
+def attribute_actors(report: Dict[str, Any],
+                     techniques: List[str],
+                     config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Match evidence against known threat actor profiles (Stage I6).
+
+    Four indicator categories per profile: exact ASN strings,
+    case-insensitive issuer equality, glob dns_patterns (fnmatch)
+    against observed domains, and membership in the mapped MITRE
+    techniques. Confidence is matched/total indicators, equal weight;
+    an actor is reported only at or above its confidence_threshold.
+    Skeleton placeholders ("AS...", "...") match nothing by design.
+
+    Pure function; never raises. An empty list is the honest answer
+    when nothing matches -- attribution is evidence, not assumption.
+    """
+    results: List[Dict[str, Any]] = []
+    try:
+        actors = (config or {}).get("threat_actors", {}) or {}
+    except Exception:
+        actors = {}
+    if not isinstance(actors, dict):
+        return results
+    try:
+        rep = report if isinstance(report, dict) else {}
+        infra = rep.get("infrastructure_intelligence", {}) or {}
+        asn = ((infra.get("asn", {}) or {}).get("asn") or "")
+        try:
+            target_asns = {str(asn).strip().upper()} - {""}
+        except Exception:
+            target_asns = set()
+        cert = rep.get("certificate_intelligence", {}) or {}
+        issuers: List[str] = []
+        try:
+            live = cert.get("live_certificate") or {}
+            if isinstance(live, dict) and live.get("issuer_cn"):
+                issuers.append(str(live["issuer_cn"]))
+            for entry in (cert.get("ct_certificates", []) or []):
+                if isinstance(entry, dict) and entry.get("issuer_cn"):
+                    issuers.append(str(entry["issuer_cn"]))
+        except Exception:
+            pass
+        try:
+            target_issuers = {s.strip().lower() for s in issuers if s.strip()}
+        except Exception:
+            target_issuers = set()
+        domains: List[str] = []
+        try:
+            for t in ((rep.get("passive_dns_intelligence", {}) or {})
+                      .get("timeline", []) or []):
+                if isinstance(t, dict) and t.get("domain"):
+                    domains.append(str(t["domain"]))
+            for ev in ((rep.get("dns_intelligence", {}) or {})
+                       .get("evidence", []) or []):
+                if isinstance(ev, dict):
+                    nm = ((ev.get("metadata", {}) or {}).get("name")
+                          or ev.get("normalized_value") or "")
+                    if nm and "." in str(nm):
+                        domains.append(str(nm))
+        except Exception:
+            pass
+        try:
+            target_domains = sorted({d.strip().lower()
+                                     for d in domains if d.strip()})
+        except Exception:
+            target_domains = []
+        try:
+            tech_set = {str(t) for t in (techniques or [])}
+        except Exception:
+            tech_set = set()
+
+        for actor, prof in actors.items():
+            try:
+                if not isinstance(prof, dict):
+                    continue
+                inds = prof.get("indicators", {}) or {}
+                if not isinstance(inds, dict):
+                    continue
+                try:
+                    threshold = float(prof.get("confidence_threshold", 0.7))
+                except Exception:
+                    threshold = 0.7
+                total = 0
+                hits = 0
+                matches: List[Dict[str, str]] = []
+                for raw_asn in (inds.get("asns", []) or []):
+                    try:
+                        want = str(raw_asn or "").strip().upper()
+                    except Exception:
+                        continue
+                    if not want:
+                        continue
+                    total += 1
+                    if want in target_asns:
+                        hits += 1
+                        matches.append({"type": "asn", "value": want})
+                for raw_iss in (inds.get("certificate_issuers", []) or []):
+                    try:
+                        want = str(raw_iss or "").strip().lower()
+                    except Exception:
+                        continue
+                    if not want:
+                        continue
+                    total += 1
+                    if want in target_issuers:
+                        hits += 1
+                        matches.append({"type": "certificate_issuer",
+                                        "value": want})
+                for pat in (inds.get("dns_patterns", []) or []):
+                    try:
+                        pattern = str(pat or "").strip().lower()
+                    except Exception:
+                        continue
+                    if not pattern:
+                        continue
+                    total += 1
+                    try:
+                        hit_domains = sorted(
+                            d for d in target_domains
+                            if fnmatch.fnmatchcase(d, pattern))
+                    except Exception:
+                        hit_domains = []
+                    if hit_domains:
+                        hits += 1
+                        matches.append({"type": "dns_pattern",
+                                        "value": pattern,
+                                        "matched": ",".join(hit_domains[:5])})
+                for tech in (inds.get("mitre_techniques", []) or []):
+                    try:
+                        want = str(tech or "").strip()
+                    except Exception:
+                        continue
+                    if not want:
+                        continue
+                    total += 1
+                    if want in tech_set:
+                        hits += 1
+                        matches.append({"type": "mitre_technique",
+                                        "value": want})
+                if total <= 0:
+                    continue
+                confidence = round(hits / total, 2)
+                if confidence >= threshold:
+                    results.append({"actor": str(actor),
+                                    "confidence": confidence,
+                                    "matches": matches})
+            except Exception:
+                continue
+    except Exception:
+        return results
+    try:
+        results.sort(key=lambda r: (-r.get("confidence", 0), r.get("actor", "")))
+    except Exception:
+        pass
+    return results
+
+
+# ============================================================
+#  SUBDOMAIN ENUMERATION ENGINE (Stage J1)
+# ============================================================
+# Candidate names for the always-on wordlist pass and the authorized
+# brute-force pass. Static data every wordlist scan needs; the
+# brute list is deliberately larger and only runs gated (see below).
+COMMON_SUBDOMAINS = (
+    "www", "mail", "ftp", "admin", "dev", "test", "api", "blog",
+    "shop", "portal", "vpn", "remote", "secure", "login", "webmail",
+    "ns1", "ns2", "mx1", "mx2", "cdn", "static", "assets", "img",
+    "images", "docs", "support", "help", "status", "app", "mobile",
+    "m", "beta", "staging", "stage", "demo", "internal", "intranet",
+    "corp", "owa", "exchange", "autodiscover",
+)
+
+BRUTE_SUBDOMAINS = (
+    "db", "sql", "mysql", "postgres", "mongo", "redis", "backup",
+    "bak", "old", "new", "archive", "files", "uploads", "download",
+    "videos", "music", "photos", "gallery", "forum", "community",
+    "chat", "crm", "erp", "hr", "finance", "billing", "pay",
+    "checkout", "cart", "order", "orders", "customer", "customers",
+    "partner", "partners", "vendor", "suppliers", "api1", "api2",
+    "apiv1", "apiv2", "rest", "soap", "graphql", "webhook", "hooks",
+    "ci", "cd", "jenkins", "gitlab", "github", "jira", "confluence",
+    "wiki", "kb", "lms", "training", "learn", "school",
+    "mail1", "mail2", "smtp", "pop", "pop3", "imap", "email",
+    "newsletter", "marketing", "sales", "info", "contact", "about",
+    "careers", "jobs", "press", "media", "news", "events", "calendar",
+    "maps", "geo", "location", "weather", "search", "sso", "auth",
+    "oauth", "account", "accounts", "profile", "user", "users",
+    "dashboard", "panel", "console", "manage", "manager", "admin1",
+    "administrator", "root", "sysadmin", "netadmin", "monitor",
+    "monitoring", "nagios", "zabbix", "grafana", "kibana", "logs",
+    "metrics", "stats", "analytics", "tracking", "pixel", "ads",
+)
+
+# Substring hints marking a subdomain worth a second look (Stage J1).
+INTERESTING_KEYWORDS = frozenset({
+    "admin", "dev", "test", "stag", "internal", "private", "corp",
+    "vpn", "login", "portal", "secret", "backup", "db", "mysql",
+    "staging", "prod", "secure", "auth", "sso", "manage",
+})
+
+# Per-source confidence for enumerated subdomains (Stage J1): directly
+# observed answers outrank third-party listings, stale history trails.
+_SUBDOMAIN_SOURCE_CONFIDENCE = {
+    "wordlist": 0.95,
+    "brute": 0.9,
+    "ct": 0.85,
+    "cert_sans": 0.85,
+    "passive_dns": 0.7,
+    "historical": 0.5,
+}
+
+
+def _resolve_subdomain_candidates(domain: str,
+                                  names: List[str],
+                                  timeout: int = 2) -> Dict[str, List[str]]:
+    """
+    Resolve candidate subdomains to A records (Stage J1 worker pool).
+
+    Returns {fqdn: [addresses]} for names that resolve, omitting the
+    rest. One shared resolver pattern per worker thread (own Resolver
+    instance, as in _resolve_one). Fail-soft per name; never raises.
+    The single network choke point for wordlist/brute passes, so the
+    hermetic harness can stub exactly this function.
+    """
+    try:
+        apex = str(domain or "").strip().rstrip(".")
+        cands = sorted({str(n or "").strip().rstrip(".").lower()
+                        for n in (names or []) if str(n or "").strip()})
+    except Exception:
+        return {}
+    if not apex or not cands:
+        return {}
+
+    def _one(fqdn: str):
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = timeout
+            resolver.lifetime = timeout
+            answers = resolver.resolve(fqdn, "A")
+            addrs = sorted({str(r) for r in (answers or [])})
+            return (fqdn, addrs) if addrs else None
+        except Exception:
+            return None
+
+    hits: Dict[str, List[str]] = {}
+    with ThreadPoolExecutor(max_workers=min(32, len(cands)),
+                            thread_name_prefix="reconip-subenum") as ex:
+        future_map = {ex.submit(_one, fqdn): fqdn for fqdn in cands}
+        for future in as_completed(future_map):
+            try:
+                res = future.result()
+            except Exception:
+                continue
+            if res:
+                hits[res[0]] = res[1]
+    return hits
+
+
+def _load_snapshot_history(target: str,
+                           db_path: str = "reconip.db") -> List[Dict[str, Any]]:
+    """
+    Load every stored snapshot for a target, oldest first (Stage J1/J2).
+
+    Returns [{timestamp, data}] with data parsed ({} on corrupt rows).
+    Read-only; never raises.
+    """
+    rows: List[Dict[str, Any]] = []
+    try:
+        with sqlite3.connect(db_path, timeout=30) as conn:
+            cur = conn.execute(
+                "SELECT timestamp, data FROM snapshots "
+                "WHERE target = ? ORDER BY id",
+                (target,)
+            )
+            fetched = cur.fetchall()
+    except Exception:
+        return rows
+    for ts, data in fetched or []:
+        try:
+            parsed = json.loads(data) if isinstance(data, str) else {}
+            if not isinstance(parsed, dict):
+                parsed = {}
+        except Exception:
+            parsed = {}
+        rows.append({"timestamp": ts, "data": parsed})
+    return rows
+
+
+def _snapshot_month(ts: Any) -> str:
+    """Truncate an ISO timestamp to YYYY-MM for timeline display."""
+    try:
+        return str(ts or "")[:7]
+    except Exception:
+        return ""
+
+
+def _build_infra_timeline(snaps: List[Dict[str, Any]],
+                          target: str) -> List[Dict[str, Any]]:
+    """
+    Build an infrastructure evolution timeline (Stage J2).
+
+    Diffs consecutive snapshots oldest-first and emits one event per
+    observed change: DNS record add/remove/change per type, certificate
+    issued/rotated/removed, ASN/prefix changes, newly seen subdomains.
+    Only actual changes emit events -- identical consecutive snapshots
+    contribute nothing, which keeps repeated scans of stable
+    infrastructure byte-identical (V19) and the artifact compact.
+
+    Each event carries event_date (full ISO; normalized away in
+    deterministic exports like every other clock field). Capped at the
+    200 most recent events. Never raises.
+    """
+    events: List[Dict[str, Any]] = []
+    try:
+        pairs = list(snaps or [])
+    except Exception:
+        return events
+    if len(pairs) < 2:
+        return events
+
+    def _dns_sets(data: Dict[str, Any]) -> Dict[str, List[str]]:
+        try:
+            raw = (data or {}).get("dns", {}) or {}
+            return {str(k): sorted({str(v) for v in (vals or [])})
+                    for k, vals in raw.items() if isinstance(vals, list)}
+        except Exception:
+            return {}
+
+    def _cert_fp(data: Dict[str, Any]) -> Optional[str]:
+        try:
+            return ((data or {}).get("certificate", {}) or {}) \
+                .get("fingerprint_sha256") or None
+        except Exception:
+            return None
+
+    def _cert_issuer(data: Dict[str, Any]) -> Optional[str]:
+        try:
+            return ((data or {}).get("certificate", {}) or {}) \
+                .get("issuer_cn") or None
+        except Exception:
+            return None
+
+    def _asn(data: Dict[str, Any]) -> Optional[str]:
+        try:
+            return ((data or {}).get("asn", {}) or {}).get("asn") or None
+        except Exception:
+            return None
+
+    def _prefix(data: Dict[str, Any]) -> Optional[str]:
+        try:
+            return ((data or {}).get("prefix", {}) or {}).get("cidr") or None
+        except Exception:
+            return None
+
+    def _subdomains_of(data: Dict[str, Any], apex: str) -> List[str]:
+        try:
+            out = set()
+            for d in ((data or {}).get("domains", []) or []):
+                try:
+                    n = str(d or "").strip().rstrip(".").lower()
+                except Exception:
+                    continue
+                if n and n != apex and n.endswith("." + apex):
+                    out.add(n)
+            return sorted(out)
+        except Exception:
+            return []
+
+    try:
+        apex = str(target or "").strip().rstrip(".").lower()
+    except Exception:
+        apex = ""
+    for prev, curr in zip(pairs, pairs[1:]):
+        try:
+            ts = curr.get("timestamp")
+            pd, cd = prev.get("data", {}) or {}, curr.get("data", {}) or {}
+            # DNS per-type diffs.
+            p_dns, c_dns = _dns_sets(pd), _dns_sets(cd)
+            for rtype in sorted(set(p_dns) | set(c_dns)):
+                old = p_dns.get(rtype, [])
+                new = c_dns.get(rtype, [])
+                if old == new:
+                    continue
+                added = [v for v in new if v not in old]
+                removed = [v for v in old if v not in new]
+                if added and not removed:
+                    for v in added:
+                        events.append({"event_date": ts,
+                                       "event": f"{rtype} record added ({v})"})
+                elif removed and not added:
+                    for v in removed:
+                        events.append({"event_date": ts,
+                                       "event": f"{rtype} record removed ({v})"})
+                else:
+                    if rtype == "NS":
+                        events.append(
+                            {"event_date": ts,
+                             "event": "NS changed (from "
+                                      f"{', '.join(old) or 'none'} to "
+                                      f"{', '.join(new) or 'none'})"})
+                    elif rtype in ("A", "AAAA") and new:
+                        events.append(
+                            {"event_date": ts,
+                             "event": f"{rtype} record changed "
+                                      f"({', '.join(new)})"})
+                    else:
+                        for v in added:
+                            events.append({"event_date": ts,
+                                           "event": f"{rtype} record added ({v})"})
+                        for v in removed:
+                            events.append({"event_date": ts,
+                                           "event": f"{rtype} record removed ({v})"})
+            # Certificate lifecycle.
+            old_fp, new_fp = _cert_fp(pd), _cert_fp(cd)
+            if old_fp != new_fp:
+                if not old_fp and new_fp:
+                    issuer = _cert_issuer(cd) or new_fp[:12]
+                    events.append({"event_date": ts,
+                                   "event": f"Certificate issued ({issuer})"})
+                elif old_fp and not new_fp:
+                    events.append({"event_date": ts,
+                                   "event": "Certificate removed"})
+                else:
+                    issuer = _cert_issuer(cd) or (new_fp or "")[:12]
+                    events.append({"event_date": ts,
+                                   "event": f"Certificate rotated ({issuer})"})
+            # ASN / prefix.
+            if _asn(pd) != _asn(cd) and (_asn(pd) or _asn(cd)):
+                events.append({"event_date": ts,
+                               "event": f"ASN changed ({_asn(pd) or 'none'} "
+                                        f"-> {_asn(cd) or 'none'})"})
+            if _prefix(pd) != _prefix(cd) and (_prefix(pd) or _prefix(cd)):
+                events.append({"event_date": ts,
+                               "event": f"Prefix changed ({_prefix(pd) or 'none'} "
+                                        f"-> {_prefix(cd) or 'none'})"})
+            # New subdomains.
+            if apex:
+                old_subs = set(_subdomains_of(pd, apex))
+                for d in _subdomains_of(cd, apex):
+                    if d not in old_subs:
+                        events.append({"event_date": ts,
+                                       "event": f"Subdomain {d} added"})
+        except Exception:
+            continue
+    return events[-200:]
+
+
+def enumerate_subdomains_full(target: str,
+                              out: Dict[str, Any],
+                              config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Subdomain enumeration engine (Stage J1).
+
+    Six sources, one deduplicated answer:
+      ct            names from crt.sh-derived certificates
+      passive_dns   names from the passive-DNS timeline
+      wordlist      common names resolved live (always on, domains only)
+      brute         extended names resolved live (AUTHORIZED ONLY --
+                    same strict gate as active_recon: authorized flag
+                    plus exact allowlist membership)
+      cert_sans     names from the live certificate SANs
+      historical    names seen in past snapshots but gone now
+
+    Live resolution is skipped entirely for IP targets (enumeration
+    is domain-only) and inside wildcard zones (everything would
+    falsely hit). Returns exactly
+    {"total", "sources", "interesting", "details"} where details
+    carries per-domain sources and confidence.
+    """
+    empty = {"total": 0, "sources": {}, "interesting": [],
+             "details": []}
+    try:
+        tgt = str(target or "").strip().rstrip(".").lower()
+    except Exception:
+        return empty
+    if not tgt:
+        return empty
+    try:
+        ipaddress.ip_address(tgt)
+        return empty
+    except Exception:
+        pass
+    try:
+        rep = out if isinstance(out, dict) else {}
+        cert = rep.get("certificate_intelligence", {}) or {}
+        pdns = rep.get("passive_dns_intelligence", {}) or {}
+        dns_an = ((rep.get("dns_intelligence", {}) or {})
+                  .get("analysis", {}) or {})
+    except Exception:
+        return empty
+
+    found: Dict[str, List[str]] = {}
+
+    def _add(name: str, source: str) -> None:
+        try:
+            n = str(name or "").strip().rstrip(".").lower()
+        except Exception:
+            return
+        if not n or n == tgt or not n.endswith("." + tgt):
+            return
+        bucket = found.setdefault(n, [])
+        if source not in bucket:
+            bucket.append(source)
+
+    # ct: crt.sh-derived certificates (ct_certificates came from crt.sh).
+    try:
+        for entry in (cert.get("ct_certificates", []) or []):
+            if not isinstance(entry, dict):
+                continue
+            for key in ("common_name", "name_value", "subject"):
+                try:
+                    for part in str(entry.get(key) or "").split():
+                        _add(part.strip().rstrip("*.").strip("*"), "ct")
+                except Exception:
+                    continue
+            try:
+                for san in (entry.get("sans", []) or []):
+                    _add(san, "ct")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # cert_sans: live certificate SANs.
+    try:
+        live = cert.get("live_certificate") or {}
+        if isinstance(live, dict):
+            for san in (live.get("san_domains", []) or []):
+                _add(san, "cert_sans")
+    except Exception:
+        pass
+    # passive_dns: timeline domains.
+    try:
+        for t in (pdns.get("timeline", []) or []):
+            if isinstance(t, dict) and t.get("domain"):
+                _add(t["domain"], "passive_dns")
+    except Exception:
+        pass
+    # historical: domains in past snapshots.
+    try:
+        _hcfg = (config.get("history", {}) if isinstance(config, dict) else {}) or {}
+        _db = _hcfg.get("db_path", "reconip.db") or "reconip.db"
+        for snap in _load_snapshot_history(target, _db):
+            try:
+                data = snap.get("data", {}) or {}
+                for d in (data.get("domains", []) or []):
+                    _add(d, "historical")
+                for values in (data.get("dns", {}) or {}).values():
+                    for v in (values or []):
+                        try:
+                            # DNS values may carry decorations an apex
+                            # match must ignore: MX preference ("10 mx.x"),
+                            # CIDR separators (skipped below), whitespace.
+                            s = str(v or "").strip()
+                            if not s or "/" in s:
+                                continue
+                            # MX-style "preference exchange": keep the host.
+                            if " " in s:
+                                s = s.split()[-1].strip().rstrip(".")
+                                if not s:
+                                    continue
+                            if "." not in s:
+                                continue
+                            try:
+                                ipaddress.ip_address(s)
+                            except Exception:
+                                _add(s, "historical")
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Wildcard guard: inside a wildcard zone every candidate resolves,
+    # so validation-by-resolution is meaningless. Skip both live
+    # passes (documented, deterministic).
+    wildcard_on = False
+    try:
+        wildcard_on = bool((dns_an.get("wildcard", {}) or {}).get("wildcard"))
+    except Exception:
+        pass
+    if not wildcard_on:
+        # wordlist: always on for domains.
+        try:
+            hits = _resolve_subdomain_candidates(
+                tgt, [f"{w}.{tgt}" for w in COMMON_SUBDOMAINS])
+            for name in hits:
+                _add(name, "wordlist")
+        except Exception:
+            pass
+        # brute: authorized only (strict gate, same shape as I2/AXFR).
+        try:
+            as_cfg = (config.get("attack_surface", {}) or {}) if isinstance(config, dict) else {}
+            if (as_cfg.get("authorized", False) and
+                    str(target) in (as_cfg.get("authorized_targets", []) or [])):
+                hits = _resolve_subdomain_candidates(
+                    tgt, [f"{w}.{tgt}" for w in BRUTE_SUBDOMAINS])
+                for name in hits:
+                    _add(name, "brute")
+        except Exception:
+            pass
+
+    sources: Dict[str, int] = {}
+    details: List[Dict[str, Any]] = []
+    for name in sorted(found):
+        srcs = sorted(found[name])
+        for s in srcs:
+            sources[s] = sources.get(s, 0) + 1
+        try:
+            conf = max(_SUBDOMAIN_SOURCE_CONFIDENCE.get(s, 0.5) for s in srcs)
+            if len(srcs) > 1:
+                conf = min(0.99, conf + 0.05 * (len(srcs) - 1))
+            conf = round(conf, 2)
+        except Exception:
+            conf = 0.5
+        details.append({"domain": name, "sources": srcs,
+                        "confidence": conf})
+    try:
+        interesting = sorted({d["domain"] for d in details
+                              if any(k in d["domain"]
+                                     for k in INTERESTING_KEYWORDS)})
+    except Exception:
+        interesting = []
+    return {"total": len(details),
+            "sources": sources,
+            "interesting": interesting,
+            "details": details}
+
+
 def correlate(reports: List[Dict[str, Any]],
               targets: List[str],
               config: Dict[str, Any]) -> Dict[str, Any]:
@@ -11676,11 +14547,70 @@ def correlate(reports: List[Dict[str, Any]],
     if max_related and max_related > 0:
         related_targets = related_targets[:max_related]
 
+    # Stage I5/I6: MITRE mapping + actor attribution, unioned across
+    # the correlated reports (single-target flows collapse to one).
+    # Computed per report, then merged: techniques unioned, actors
+    # merged by name keeping the strongest confidence.
+    mitre_all: Dict[str, List[str]] = {}
+    actor_best: Dict[str, Dict[str, Any]] = {}
+    for report in reports or []:
+        if not isinstance(report, dict):
+            continue
+        try:
+            mapped = map_mitre_techniques(report, config)
+        except Exception:
+            mapped = {"techniques": [], "evidence": {}}
+        try:
+            for tid in mapped.get("techniques", []) or []:
+                for reason in (mapped.get("evidence", {}) or {}).get(tid, [tid]):
+                    mitre_all.setdefault(tid, [])
+                    if reason not in mitre_all[tid]:
+                        mitre_all[tid].append(reason)
+        except Exception:
+            pass
+        try:
+            for entry in attribute_actors(
+                    report, mapped.get("techniques", []) or [], config):
+                if not isinstance(entry, dict) or not entry.get("actor"):
+                    continue
+                name = entry["actor"]
+                prev = actor_best.get(name)
+                if prev is None or entry.get("confidence", 0) > prev.get("confidence", 0):
+                    merged_matches = list(entry.get("matches", []) or [])
+                    if prev:
+                        try:
+                            seen = {(m.get("type"), m.get("value"))
+                                    for m in merged_matches}
+                            for m in prev.get("matches", []) or []:
+                                if isinstance(m, dict) and (
+                                        m.get("type"), m.get("value")) not in seen:
+                                    merged_matches.append(m)
+                        except Exception:
+                            pass
+                    actor_best[name] = {"actor": name,
+                                        "confidence": entry.get("confidence", 0),
+                                        "matches": merged_matches}
+        except Exception:
+            pass
+    try:
+        mitre_techniques = sorted(mitre_all)
+        mitre_evidence = {k: sorted(v) for k, v in mitre_all.items()}
+        actor_attribution = sorted(actor_best.values(),
+                                   key=lambda r: (-r.get("confidence", 0),
+                                                  r.get("actor", "")))
+    except Exception:
+        mitre_techniques = []
+        mitre_evidence = {}
+        actor_attribution = []
+
     return {
         "enabled": True,
         "graph": merged_graph,
         "shared": shared,
         "related_targets": related_targets,
+        "mitre_techniques": mitre_techniques,
+        "mitre_evidence": mitre_evidence,
+        "actor_attribution": actor_attribution,
         "notes": notes,
         "summary": {
             "targets_correlated": len(targets or []),
@@ -11754,6 +14684,16 @@ class DB:
         c = sqlite3.connect(s.p, timeout=30, isolation_level=None)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
+        # Stage H1: synchronous=NORMAL. Measured: persist() issues ~400
+        # autocommitted statements per scan, and on fsync-bound disks each
+        # commit cost ~15ms (6s+ per scan). WAL + NORMAL is still
+        # crash-safe for application crashes (only an OS crash could lose
+        # the last transaction), which is the right tradeoff for a scan
+        # database that is fully rebuildable from the next run.
+        try:
+            c.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
         return c
     def start_scan(s, target, ttype):
         with s._l:
@@ -12102,7 +15042,10 @@ def _section_dns(report: Dict[str, Any]) -> Dict[str, Any]:
         dns = {}
     return {
         "evidence": dns.get("evidence", []),
-        "analysis": dns.get("analysis", {})
+        "analysis": dns.get("analysis", {}),
+        "subdomains": dns.get("subdomains_enum", {"total": 0, "sources": {},
+                                                  "interesting": [],
+                                                  "details": []})
     }
 
 
@@ -12138,7 +15081,8 @@ def _section_history(report: Dict[str, Any]) -> Dict[str, Any]:
         "status": hist.get("status"),
         "previous_timestamp": hist.get("previous_timestamp"),
         "current_timestamp": hist.get("current_timestamp"),
-        "detection": hist.get("detection", {})
+        "detection": hist.get("detection", {}),
+        "timeline": hist.get("timeline", [])
     }
 
 
@@ -12172,6 +15116,9 @@ def _section_correlation(report: Dict[str, Any]) -> Dict[str, Any]:
         "graph_stats": graph.get("stats", {}),
         "shared": corr.get("shared", {}),
         "related_targets": corr.get("related_targets", []),
+        "mitre_techniques": corr.get("mitre_techniques", []),
+        "mitre_evidence": corr.get("mitre_evidence", {}),
+        "actor_attribution": corr.get("actor_attribution", []),
         "notes": corr.get("notes", [])
     }
 
@@ -12525,6 +15472,81 @@ def generate_report(target: str,
     }
 
 
+# ============================================================
+#  DETERMINISTIC EXPORT (Stage G2)
+# ============================================================
+# Measured: 5 back-to-back runs of `8.8.8.8 --profile forensic` differ in
+# exactly 88 leaves, and every one of them is a wall-clock value:
+#
+#    40  05_dns_intelligence.evidence[].timestamp
+#    40  15_evidence.items[].timestamp            (the same records)
+#     4  09_threat_intelligence.normalized[].latency
+#     4  08_historical_intelligence[.detection].{current,previous}_timestamp
+#
+# No ordering difference exists anywhere in the report, and the raw
+# file's key order is already stable, so sorting providers, sorting
+# dict keys and making aggregate() deterministic cannot change a
+# single byte. Those measures were measured, not assumed.
+#
+# These four fields are not jitter -- they record *when the observation
+# was made*, and Evidence.timestamp feeds the freshness/TTL/age scoring
+# that the whole confidence model depends on. Flattening them at the
+# source would silently corrupt that model.
+#
+# So the wall clock is normalised in the EXPORTED ARTIFACT only. The
+# in-memory report, the SQLite history and reconip.log keep true values.
+# Default behaviour is unchanged; reproducibility is opt-in.
+_DETERMINISTIC_PLACEHOLDER = "<normalised>"
+_DETERMINISTIC_KEYS = frozenset({
+    "timestamp", "latency", "current_timestamp", "previous_timestamp",
+    # Stage J2: timeline event dates are wall-clock observation stamps
+    # like every other normalized key. The name is unique to timeline
+    # events, so no other field is affected.
+    "event_date",
+    # Stage J4: safe-validation probe time is an observation stamp.
+    # Normalized in deterministic exports so validated reports stay
+    # byte-reproducible; the database and log keep true values.
+    "checked_at",
+})
+
+
+def _normalise_clock_fields(node: Any, stats: Optional[Dict[str, int]] = None,
+                            depth: int = 0) -> Any:
+    """
+    Replace wall-clock observation fields with a fixed placeholder so an
+    exported report is byte-reproducible across runs.
+
+    Only the four keys named in _DETERMINISTIC_KEYS are touched, and only
+    at export time. `stats` accumulates a per-key count so the artifact
+    can declare what it normalised -- a normalised report must never be
+    mistaken for a raw one.
+    """
+    if stats is None:
+        stats = {}
+    if depth > 64:
+        return node
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if k in _DETERMINISTIC_KEYS:
+                stats[k] = stats.get(k, 0) + 1
+                out[k] = _DETERMINISTIC_PLACEHOLDER
+            else:
+                out[k] = _normalise_clock_fields(v, stats, depth + 1)
+        return out
+    if isinstance(node, list):
+        return [_normalise_clock_fields(v, stats, depth + 1) for v in node]
+    return node
+
+
+def _deterministic_export_enabled(config: Dict[str, Any]) -> bool:
+    try:
+        rcfg = config.get("reports", {}) if isinstance(config, dict) else {}
+        return bool(rcfg.get("deterministic", False)) and isinstance(rcfg, dict)
+    except Exception:
+        return False
+
+
 def _ensure_output_dir(config: Dict[str, Any]) -> str:
     try:
         out_dir = config.get("reports", {}).get("output_dir", "reports/") if isinstance(config, dict) else "reports/"
@@ -12547,13 +15569,41 @@ def export_json(final_report: Dict[str, Any],
     """
     Export the final report as JSON.
     The output is SIEM-compatible: flat keys, ISO timestamps, no NaN.
+
+    Stage G2: sort_keys=True makes the raw bytes order-stable for any
+    consumer, independent of dict insertion order. When
+    reports.deterministic is set, the wall-clock observation fields are
+    additionally normalised (see _normalise_clock_fields) and the
+    artifact declares what it normalised.
     """
     out_dir = _ensure_output_dir(config)
     target = final_report.get("metadata", {}).get("target", "unknown") if isinstance(final_report, dict) else "unknown"
     path = os.path.join(out_dir, _report_filename(target, "json"))
 
+    payload = final_report
+    if _deterministic_export_enabled(config) and isinstance(final_report, dict):
+        stats: Dict[str, int] = {}
+        payload = _normalise_clock_fields(final_report, stats)
+        # Make the normalisation self-describing. The marker values are
+        # fixed strings, so the artifact stays byte-reproducible.
+        try:
+            meta = payload.get("metadata")
+            meta = dict(meta) if isinstance(meta, dict) else {}
+            meta["_deterministic"] = {
+                "normalised": True,
+                "placeholder": _DETERMINISTIC_PLACEHOLDER,
+                "fields_normalised": dict(sorted(stats.items())),
+                "note": ("wall-clock observation fields replaced for "
+                         "reproducibility; true values remain in the "
+                         "database and reconip.log"),
+            }
+            payload["metadata"] = meta
+        except Exception:
+            pass
+
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(final_report, f, indent=2, default=str, ensure_ascii=False)
+        json.dump(payload, f, indent=2, sort_keys=True, default=str,
+                  ensure_ascii=False)
 
     return path
 
@@ -12766,7 +15816,7 @@ def export_html(final_report: Dict[str, Any],
     except Exception:
         pass
     parts.append("</ul>")
-    parts.append("<hr><p style='color:#888;font-size:12px;text-align:center'>X7 &bull; X7&Lambda;&dagger;&Xi;X</p>")
+    parts.append("<hr><p style='color:#888;font-size:12px;text-align:center'>RECONIP &bull; X7&Lambda;&Xi;X &bull; X7 Security Intelligence</p>")
 
     parts.append("</body></html>")
 
@@ -12881,7 +15931,7 @@ def export_markdown(final_report: Dict[str, Any],
     lines.append("")
     lines.append("---")
     lines.append("")
-    lines.append("<sub>X7 \u2022 X7\u039b\u2020\u039eX</sub>")
+    lines.append("<sub>RECONIP \u2022 X7\u039b\u039eX \u2022 X7 Security Intelligence</sub>")
     lines.append("")
 
     with open(path, "w", encoding="utf-8") as f:
@@ -12920,6 +15970,7 @@ def export_stix(final_report: Optional[Any] = None,
                     "type": "bundle",
                     "id": f"bundle--{_stix_uuid()}",
                     "spec_version": "2.1",
+                    "x_reconip_version": (final_report.get("metadata", {}) or {}).get("version", "?"),
                     "objects": [
                         {"type": "identity", "id": f"identity--{_stix_uuid()}", "spec_version": "2.1", "created": now, "modified": now, "name": "ReconIP", "identity_class": "system", "description": "Evidence-driven OSINT platform"},
                         {"type": "indicator", "id": f"indicator--{_stix_uuid()}", "spec_version": "2.1", "created": now, "modified": now, "name": f"Target: {target}", "pattern": f"[{target_type}:value = '{target}']", "pattern_type": "stix", "valid_from": now, "description": final_report.get("02_executive_summary", {}).get("headline", ""), "confidence": 0, "labels": ["reconip", "osint", "assessment"]}
@@ -12943,6 +15994,13 @@ def export_stix(final_report: Optional[Any] = None,
             "type": "bundle",
             "id": f"bundle--{_stix_uuid()}",
             "spec_version": "2.1",
+            # Stage G5 (V18): every artifact must name the tool version that
+            # produced it. A STIX custom property (spec 2.1, section on
+            # custom properties: any object may carry x_ prefixed fields)
+            # keeps provenance inside the envelope without touching the
+            # object structure any consumer parses.
+            "x_reconip_version": (final_report.get("metadata", {}) or {}).get(
+                "version", (config.get("version", "?") if isinstance(config, dict) else "?")),
             "objects": [
                 {
                     "type": "identity",
@@ -12996,7 +16054,7 @@ def export_misp(final_report: Optional[Any] = None,
                 target = final_report.get("metadata", {}).get("target", "unknown")
                 now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 target_type = "ip-src" if re.match(r"^\d+\.\d+\.\d+\.\d+$", str(target)) else "domain"
-                return {"Event": {"info": f"ReconIP assessment for {target}", "date": now.split("T")[0], "timestamp": now, "published": False, "analysis": "1", "threat_level_id": "4", "distribution": "0", "Attribute": [{"type": target_type, "value": target, "category": "Network activity", "to_ids": False, "comment": "ReconIP target"}], "Tag": [{"name": "reconip:assessment"}, {"name": "reconip:evidence-driven"}]}}
+                return {"Event": {"info": f"ReconIP assessment for {target}", "date": now.split("T")[0], "timestamp": now, "published": False, "analysis": "1", "threat_level_id": "4", "distribution": "0", "Attribute": [{"type": target_type, "value": target, "category": "Network activity", "to_ids": False, "comment": "ReconIP target"}], "Tag": [{"name": "reconip:assessment"}, {"name": "reconip:evidence-driven"}, {"name": f"reconip:version=\"{(final_report.get('metadata', {}) or {}).get('version', '?')}\""}]}}
         except Exception:
             pass
         return _export_misp_legacy(final_report if isinstance(final_report, dict) else {})
@@ -13027,6 +16085,14 @@ def export_misp(final_report: Optional[Any] = None,
                 })
         except Exception:
             pass
+        # Stage G5 (V18): the producing tool version travels as a namespaced
+        # tag, the MISP-idiomatic place for producer provenance. The tag set
+        # stays additive: existing tags are never renamed or removed.
+        try:
+            _misp_version = (final_report.get("metadata", {}) or {}).get(
+                "version", (config.get("version", "?") if isinstance(config, dict) else "?"))
+        except Exception:
+            _misp_version = "?"
         event = {
             "Event": {
                 "info": f"ReconIP assessment for {target}",
@@ -13039,12 +16105,316 @@ def export_misp(final_report: Optional[Any] = None,
                 "Attribute": attributes,
                 "Tag": [
                     {"name": "reconip:assessment"},
-                    {"name": "reconip:evidence-driven"}
+                    {"name": "reconip:evidence-driven"},
+                    {"name": f"reconip:version=\"{_misp_version}\""}
                 ]
             }
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(event, f, indent=2, default=str, ensure_ascii=False)
+        return path
+    except Exception as e:
+        raise e
+
+
+# ============================================================
+#  REPORT INTELLIGENCE ENHANCEMENT — Stage J6
+#  SARIF (GitHub Security), Graphviz DOT (infrastructure graphs),
+#  PDF (official reports via HTML->PDF, stdlib fallback).
+#  All three are read-only derivations of the final report; they
+#  never mutate it and never raise (export_all records ERROR).
+# ============================================================
+
+def _sarif_level(severity: Any) -> str:
+    try:
+        if isinstance(severity, (int, float)):
+            if severity >= 7.0:
+                return "error"
+            if severity >= 4.0:
+                return "warning"
+            return "note"
+        s = str(severity or "").upper()
+        if s in ("CRITICAL", "HIGH"):
+            return "error"
+        if s in ("MODERATE", "MEDIUM"):
+            return "warning"
+        return "note"
+    except Exception:
+        return "note"
+
+
+def export_sarif(final_report: Dict[str, Any],
+                 config: Dict[str, Any]) -> str:
+    """Export SARIF v2.1.0 for GitHub code scanning. Returns path."""
+    out_dir = _ensure_output_dir(config if isinstance(config, dict) else {})
+    target = final_report.get("metadata", {}).get("target", "unknown") \
+        if isinstance(final_report, dict) else "unknown"
+    path = os.path.join(out_dir, _report_filename(target, "sarif"))
+    try:
+        version = (final_report.get("metadata", {}) or {}).get(
+            "version", (config.get("version", "?") if isinstance(config, dict) else "?"))
+    except Exception:
+        version = "?"
+    rules: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
+    seen_rules = set()
+
+    def _add_rule(rid: str, name: str, desc: str) -> None:
+        if rid in seen_rules or not rid:
+            return
+        seen_rules.add(rid)
+        rules.append({
+            "id": rid,
+            "name": name[:64] if name else rid,
+            "shortDescription": {"text": (desc or rid)[:300]},
+            "helpUri": f"https://nvd.nist.gov/vuln/detail/{rid}" if rid.startswith("CVE-") else "https://github.com/reconip",
+        })
+
+    try:
+        vuln = final_report.get("13_vulnerability_candidates", {}) or {}
+        for c in (vuln.get("candidates", []) or []):
+            if not isinstance(c, dict):
+                continue
+            rid = str(c.get("cve") or "RECONIP/VULN-CANDIDATE")
+            val = (c.get("validation", {}) or {}).get("status", "INCONCLUSIVE")
+            desc = f"{c.get('cpe')} {c.get('affected_range')} " \
+                   f"[validation:{val}] {(c.get('description') or '')[:200]}"
+            _add_rule(rid, rid, desc)
+            results.append({
+                "ruleId": rid,
+                "level": _sarif_level(c.get("severity")),
+                "message": {"text": f"CANDIDATE {rid} on {c.get('cpe')} "
+                                    f"(validation:{val}). {c.get('description', '')[:300]}"},
+                "locations": [{"physicalLocation": {
+                    "artifactLocation": {"uri": str(target)},
+                    "region": {"startLine": 1}}}],
+                "properties": {
+                    "reconip:cpe": c.get("cpe"),
+                    "reconip:validation": val,
+                    "reconip:severity": c.get("severity"),
+                },
+            })
+    except Exception:
+        pass
+    try:
+        an = final_report.get("14_anomalies", {}) or {}
+        for a in (an.get("anomalies", []) or []):
+            if not isinstance(a, dict):
+                continue
+            rid = str(a.get("subtype") or a.get("category") or "RECONIP/ANOMALY")
+            rid = re.sub(r"[^A-Za-z0-9_/\-]+", "-", rid)[:64]
+            _add_rule(rid, rid, str(a.get("message", ""))[:300])
+            results.append({
+                "ruleId": rid,
+                "level": _sarif_level(a.get("severity")),
+                "message": {"text": str(a.get("message", ""))[:500]},
+                "locations": [{"physicalLocation": {
+                    "artifactLocation": {"uri": str(target)},
+                    "region": {"startLine": 1}}}],
+            })
+    except Exception:
+        pass
+    sarif = {
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "ReconIP",
+                "version": str(version),
+                "informationUri": "https://github.com/reconip",
+                "rules": rules,
+            }},
+            "results": results,
+        }],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(sarif, f, indent=2, default=str, ensure_ascii=False)
+    return path
+
+
+def _dot_esc(s: Any) -> str:
+    try:
+        return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"')[:120] + '"'
+    except Exception:
+        return '"?"'
+
+
+def export_dot(final_report: Dict[str, Any],
+               config: Dict[str, Any]) -> str:
+    """Export a Graphviz DOT infrastructure graph. Returns path."""
+    out_dir = _ensure_output_dir(config if isinstance(config, dict) else {})
+    target = final_report.get("metadata", {}).get("target", "unknown") \
+        if isinstance(final_report, dict) else "unknown"
+    path = os.path.join(out_dir, _report_filename(target, "dot"))
+    lines = [f'digraph {_dot_esc("reconip_" + str(target))} {{',
+             '  rankdir=LR;',
+             '  node [shape=box, style=rounded];']
+    try:
+        t = _dot_esc(target)
+        lines.append(f'  {t} [shape=ellipse, style=filled, fillcolor=lightblue];')
+        net = final_report.get("04_network_intelligence", {}) or {}
+        asn = (net.get("asn", {}) or {}).get("asn")
+        if asn:
+            lines.append(f'  {_dot_esc("asn:" + str(asn))} [label={_dot_esc("ASN " + str(asn))}];')
+            lines.append(f'  {t} -> {_dot_esc("asn:" + str(asn))} [label="belongs_to_asn"];')
+        prefix = (net.get("prefix", {}) or {}).get("cidr")
+        if prefix:
+            lines.append(f'  {_dot_esc("prefix:" + str(prefix))} [label={_dot_esc(str(prefix))}];')
+            lines.append(f'  {t} -> {_dot_esc("prefix:" + str(prefix))} [label="in_prefix"];')
+        org = (net.get("organization", {}) or {}).get("name")
+        if org:
+            lines.append(f'  {_dot_esc("org:" + str(org))} [label={_dot_esc(str(org)[:40])}];')
+            lines.append(f'  {t} -> {_dot_esc("org:" + str(org))} [label="owned_by"];')
+        dns = final_report.get("05_dns_intelligence", {}) or {}
+        analysis = dns.get("analysis", {}) or {}
+        rel = analysis.get("relationships", {}) or {}
+        for ns in (rel.get("nameservers", []) or [])[:10]:
+            lines.append(f'  {_dot_esc("ns:" + str(ns))} [label={_dot_esc(str(ns)[:40])}, shape=cylinder];')
+            lines.append(f'  {t} -> {_dot_esc("ns:" + str(ns))} [label="has_nameserver"];')
+        cert = final_report.get("06_certificate_intelligence", {}) or {}
+        live = cert.get("live_certificate") or {}
+        if isinstance(live, dict) and live.get("fingerprint_sha256"):
+            fp = str(live["fingerprint_sha256"])[:16] + "…"
+            lines.append(f'  {_dot_esc("cert:" + str(live["fingerprint_sha256"]))} [label={_dot_esc("cert " + fp)}, shape=note];')
+            lines.append(f'  {t} -> {_dot_esc("cert:" + str(live["fingerprint_sha256"]))} [label="uses_certificate"];')
+        corr = final_report.get("10_infrastructure_correlation", {}) or {}
+        for rt in (corr.get("related_targets", []) or [])[:20]:
+            lines.append(f'  {_dot_esc(str(rt))} [shape=ellipse, style=dashed];')
+            lines.append(f'  {t} -> {_dot_esc(str(rt))} [label="related_to", style=dashed];')
+        # Attack-surface ports as leaves (capped for readability).
+        attack = final_report.get("11_attack_surface", {}) or {}
+        for svc in (attack.get("services", []) or [])[:20]:
+            if not isinstance(svc, dict):
+                continue
+            lbl = f"{svc.get('port')}/{svc.get('protocol')}"
+            lines.append(f'  {_dot_esc("port:" + lbl)} [label={_dot_esc(lbl)}, shape=circle];')
+            lines.append(f'  {t} -> {_dot_esc("port:" + lbl)} [label="exposes"];')
+    except Exception:
+        pass
+    lines.append('}')
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def _minimal_pdf_bytes(title: str, lines: List[str]) -> bytes:
+    """Build a minimal valid single-font PDF (stdlib only fallback)."""
+    def _pdfesc(s: str) -> str:
+        return str(s).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    content = ["BT /F1 11 Tf 50 780 Td 14 TL"]
+    content.append(f"({ _pdfesc(title)[:120]}) Tj")
+    for ln in lines[:80]:
+        for chunk in [ln[i:i + 100] for i in range(0, len(ln), 100)] or [""]:
+            content.append(f"({ _pdfesc(chunk)}) '")
+    content.append("ET")
+    stream = "\n".join(content).encode("latin-1", errors="replace")
+    objs: List[bytes] = []
+    objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objs.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    objs.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>")
+    objs.append(b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream")
+    objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for off in offsets[1:]:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += (f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref}\n%%EOF\n").encode()
+    return bytes(out)
+
+
+def export_pdf(final_report: Dict[str, Any],
+               config: Dict[str, Any]) -> str:
+    """Export a PDF official report (HTML->PDF via weasyprint, fallback minimal).
+
+    Returns path. Never raises (export_all records ERROR on failure).
+    """
+    out_dir = _ensure_output_dir(config if isinstance(config, dict) else {})
+    target = final_report.get("metadata", {}).get("target", "unknown") \
+        if isinstance(final_report, dict) else "unknown"
+    path = os.path.join(out_dir, _report_filename(target, "pdf"))
+    # Build a printable HTML snapshot from the final report.
+    try:
+        md = final_report.get("metadata", {}) if isinstance(final_report, dict) else {}
+        ex = final_report.get("02_executive_summary", {}) if isinstance(final_report, dict) else {}
+        an = final_report.get("14_anomalies", {}) if isinstance(final_report, dict) else {}
+        vuln = final_report.get("13_vulnerability_candidates", {}) or {}
+        html_parts = ["<!DOCTYPE html><html><head><meta charset='utf-8'>",
+                      f"<title>ReconIP Report — {target}</title>",
+                      "<style>body{font-family:sans-serif;margin:2em;color:#111}"
+                      "h1,h2{color:#003366}table{border-collapse:collapse;width:100%}"
+                      "th,td{border:1px solid #999;padding:6px;text-align:left}"
+                      "th{background:#eee}</style></head><body>",
+                      f"<h1>ReconIP Intelligence Report — {target}</h1>",
+                      f"<p>Generated: {md.get('generated_at', '')}<br>"
+                      f"Version: {md.get('version', '')}<br>"
+                      f"Classification: {md.get('classification', '')}<br>"
+                      f"Headline: {ex.get('headline', '')}</p>",
+                      "<h2>Scores</h2><table><tr><th>Score</th><th>Value</th></tr>"]
+        for k, v in ((ex.get("scores", {}) or {}).items()):
+            html_parts.append(f"<tr><td>{k}</td><td>{v}</td></tr>")
+        html_parts.append("</table><h2>Vulnerability candidates</h2>"
+                          "<table><tr><th>CVE</th><th>CPE</th><th>Severity</th><th>Validation</th></tr>")
+        for c in (vuln.get("candidates", []) or [])[:50]:
+            if not isinstance(c, dict):
+                continue
+            html_parts.append(
+                f"<tr><td>{c.get('cve', '')}</td><td>{c.get('cpe', '')}</td>"
+                f"<td>{c.get('severity', '')}</td>"
+                f"<td>{(c.get('validation', {}) or {}).get('status', '')}</td></tr>")
+        html_parts.append("</table><h2>Anomalies</h2><table>"
+                          "<tr><th>Category</th><th>Severity</th><th>Message</th></tr>")
+        for a in (an.get("anomalies", []) or [])[:100]:
+            if not isinstance(a, dict):
+                continue
+            html_parts.append(
+                f"<tr><td>{a.get('category', '')}</td><td>{a.get('severity', '')}</td>"
+                f"<td>{a.get('message', '')}</td></tr>")
+        html_parts.append("</table><hr><p>RECONIP \u2022 X7\u039b\u039eX \u2014 evidence-driven report. "
+                          "Candidates are not confirmations.</p></body></html>")
+        html_doc = "\n".join(html_parts)
+    except Exception:
+        html_doc = f"<html><body><h1>ReconIP {target}</h1></body></html>"
+    # Preferred: weasyprint HTML -> PDF.
+    try:
+        from weasyprint import HTML as _WPHTML  # type: ignore
+        _WPHTML(string=html_doc).write_pdf(path)
+        return path
+    except Exception:
+        pass
+    # Fallback: reportlab if present.
+    try:
+        from reportlab.lib.pagesizes import A4  # type: ignore
+        from reportlab.platypus import SimpleDocTemplate, Paragraph  # type: ignore
+        from reportlab.lib.styles import getSampleStyleSheet  # type: ignore
+        styles = getSampleStyleSheet()
+        doc = SimpleDocTemplate(path, pagesize=A4)
+        story = [Paragraph(f"ReconIP Intelligence Report — {target}", styles["Title"]),
+                 Paragraph(f"Generated {md.get('generated_at', '')} "
+                           f"Version {md.get('version', '')}", styles["Normal"]),
+                 Paragraph(str(ex.get("headline", "")), styles["Normal"])]
+        doc.build(story)
+        return path
+    except Exception:
+        pass
+    # Last resort: minimal stdlib PDF (always valid, text-only).
+    try:
+        title = f"ReconIP Intelligence Report — {target}"
+        flat = [f"Target: {target}",
+                f"Generated: {md.get('generated_at', '')}",
+                f"Headline: {ex.get('headline', '')}"]
+        for c in (vuln.get("candidates", []) or [])[:20]:
+            if isinstance(c, dict):
+                flat.append(f"{c.get('cve')} {(c.get('validation', {}) or {}).get('status', '')}")
+        with open(path, "wb") as f:
+            f.write(_minimal_pdf_bytes(title, flat))
         return path
     except Exception as e:
         raise e
@@ -13069,6 +16439,10 @@ def export_all(final_report: Dict[str, Any],
         "markdown": export_markdown,
         "stix":     export_stix,
         "misp":     export_misp,
+        # Stage J6: SARIF (GitHub Security), DOT (graphs), PDF (reports).
+        "sarif":    export_sarif,
+        "dot":      export_dot,
+        "pdf":      export_pdf,
     }
 
     paths: Dict[str, str] = {}
@@ -13531,18 +16905,138 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip cross-target correlation in batch mode."
     )
+    parser.add_argument(
+        "--correlate-graph",
+        action="store_true",
+        help="Stage J3: in batch mode, print the cross-target "
+             "shared-infrastructure graph as JSON and exit."
+    )
 
-    # Output
+    # Output (Stage J6: repeatable --format; sarif/dot/pdf added)
     parser.add_argument(
         "--format",
-        choices=["json", "html", "markdown", "csv", "stix", "misp", "all"],
+        dest="format",
+        action="append",
+        choices=["json", "html", "markdown", "csv", "stix", "misp",
+                 "sarif", "dot", "pdf", "all"],
         default=None,
-        help="Output format. Default: from config."
+        help="Output format (repeatable: --format sarif --format dot). "
+             "Default: from config."
     )
     parser.add_argument(
         "--output-dir",
         default=None,
         help="Override report output directory."
+    )
+
+    # Stage J5: alerting & watch mode
+    parser.add_argument(
+        "--watch",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="Stage J5: rescan every SECONDS seconds until interrupted. "
+             "Alerts are emitted on every change."
+    )
+    parser.add_argument(
+        "--watch-count",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Stage J5: stop after N watch iterations (default: infinite)."
+    )
+    parser.add_argument(
+        "--compare-with",
+        dest="compare_with",
+        default=None,
+        metavar="DATE",
+        help="Stage J5: compare the fresh scan against the snapshot "
+             "stored at DATE (YYYY-MM-DD prefix match) and print alerts."
+    )
+    parser.add_argument(
+        "--alert-file",
+        dest="alert_file",
+        default=None,
+        metavar="PATH",
+        help="Stage J5: append human-readable alerts to PATH."
+    )
+    parser.add_argument(
+        "--alert-webhook",
+        dest="alert_webhook",
+        default=None,
+        metavar="URL",
+        help="Stage J5: POST alerts as JSON to URL."
+    )
+    parser.add_argument(
+        "--alert-email",
+        dest="alert_email",
+        default=None,
+        metavar="ADDR",
+        help="Stage J5: send alerts to ADDR (localhost SMTP; "
+             "fail-soft with a log line when unavailable)."
+    )
+
+    # Phase K1: API server mode
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Phase K1: run as an HTTP server (same engine as --api) "
+             "and serve scan endpoints until interrupted."
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        metavar="PORT",
+        help="Phase K1: TCP port for --server (overrides config)."
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        metavar="HOST",
+        help="Phase K1: bind address for --server (overrides config)."
+    )
+
+    # Phase K2: multi-target orchestration
+    parser.add_argument(
+        "--filter",
+        default=None,
+        metavar="EXPR",
+        help='Phase K2: only report targets matching EXPR, e.g. '
+             '"threat > 50". Fields: threat, coverage, anomalies, '
+             'ports, threat_confidence. Ops: >, >=, <, <=, ==, != '
+             'joined with and/or.'
+    )
+    parser.add_argument(
+        "--report-only-alerts",
+        dest="report_only_alerts",
+        action="store_true",
+        help="Phase K2: only write reports for targets whose scan "
+             "produced change alerts (vs the previous snapshot)."
+    )
+
+    # Phase K3: continuous monitoring
+    parser.add_argument(
+        "--schedule",
+        default=None,
+        metavar="CRON",
+        help='Phase K3: rescan on a 5-field cron schedule, e.g. '
+             '"0 */6 * * *". First cycle runs immediately.'
+    )
+    parser.add_argument(
+        "--alert-on-change",
+        dest="alert_on_change",
+        action="store_true",
+        help="Phase K3: with --schedule, only notify when a cycle "
+             "detects a change (otherwise a summary is sent each cycle)."
+    )
+    parser.add_argument(
+        "--notify-webhook",
+        dest="notify_webhook",
+        default=None,
+        metavar="URL",
+        help="Phase K3: POST monitoring notifications as JSON to URL "
+             "(in addition to --alert-webhook when both are given)."
     )
 
     # Verbosity
@@ -13553,6 +17047,12 @@ def build_parser() -> argparse.ArgumentParser:
     # Behavior
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--provider", default=None, help="Comma-separated provider list.")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Emit byte-reproducible reports: wall-clock "
+                             "observation fields (timestamp, latency, "
+                             "history anchors) are replaced with a fixed "
+                             "placeholder in the exported artifact. The "
+                             "database and reconip.log keep true values.")
     parser.add_argument("--profile", choices=KNOWN_PROFILES, default=None,
                         help="Execution profile: quick, standard, deep, forensic.")
     parser.add_argument(
@@ -13569,6 +17069,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--list-providers",
         action="store_true",
         help="List all providers with their enabled state and remediation path."
+    )
+    parser.add_argument(
+        "--warm-cache",
+        action="store_true",
+        help="Stage H4: fetch the shared bulk blocklists into the cache "
+             "and exit. No target required."
+    )
+    parser.add_argument(
+        "--prefetch",
+        nargs="+",
+        metavar="TARGET",
+        default=None,
+        help="Stage H4: run scans for the given targets to populate "
+             "caches (reports are written as usual), then exit."
+    )
+    parser.add_argument(
+        "--benchmark",
+        metavar="TARGET",
+        default=None,
+        help="Stage H5: run recon N times against TARGET and print "
+             "min/max/avg/stddev per stage."
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=10,
+        help="Stage H5: benchmark iterations (default: 10)."
     )
     parser.add_argument(
         "--no-display",
@@ -13591,14 +17118,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api", action="store_true")
     parser.add_argument("--api-host", default=None)
     parser.add_argument("--api-port", type=int, default=None)
-    parser.add_argument("--metrics", action="store_true")
+    parser.add_argument("--metrics", action="store_true",
+                        help="Phase K4: print Prometheus metrics exposition "
+                             "and exit.")
     parser.add_argument("--health", action="store_true")
     parser.add_argument("--allow-private", action="store_true")
     parser.add_argument("--no-db", action="store_true")
     parser.add_argument("--timeout", type=int, default=None)
 
     # Version
-    parser.add_argument("--version", action="version", version="ReconIP v42.1")
+    parser.add_argument("--version", action="version", version="ReconIP v2.0")
 
     return parser
 
@@ -13628,10 +17157,27 @@ def _apply_cli_overrides(config: Dict[str, Any],
         if getattr(args, "output_dir", None):
             config.setdefault("reports", {})["output_dir"] = args.output_dir
         fmt = getattr(args, "format", None)
-        if fmt and fmt != "all":
-            config.setdefault("reports", {})["formats"] = [fmt]
-        if fmt == "all":
-            config.setdefault("reports", {})["formats"] = ["json", "html", "markdown", "csv", "stix", "misp"]
+        # Stage J6: --format is repeatable (append) and accepts
+        # comma-separated lists; a plain string stays backward compatible.
+        fmts: List[str] = []
+        if isinstance(fmt, (list, tuple)):
+            for entry in fmt:
+                for part in str(entry).split(","):
+                    part = part.strip()
+                    if part:
+                        fmts.append(part)
+        elif isinstance(fmt, str) and fmt:
+            for part in fmt.split(","):
+                part = part.strip()
+                if part:
+                    fmts.append(part)
+        if fmts:
+            if "all" in fmts:
+                config.setdefault("reports", {})["formats"] = [
+                    "json", "html", "markdown", "csv", "stix", "misp",
+                    "sarif", "dot", "pdf"]
+            else:
+                config.setdefault("reports", {})["formats"] = fmts
         provider = getattr(args, "provider", None)
         if provider:
             enabled = [p.strip() for p in provider.split(",") if p.strip()]
@@ -13644,6 +17190,10 @@ def _apply_cli_overrides(config: Dict[str, Any],
                         continue
         if getattr(args, "no_cache", False):
             config.setdefault("cache", {})["enabled"] = False
+        # Stage G2: byte-reproducible JSON artifacts. Opt-in; the default
+        # export keeps true observation timestamps.
+        if getattr(args, "deterministic", False):
+            config.setdefault("reports", {})["deterministic"] = True
     except Exception:
         pass
 
@@ -13846,6 +17396,1133 @@ def batch_process(targets: List[str],
     }
 
 
+# Heuristic confidence for shared-infrastructure relationships
+# (Stage J3). The codebase's own correlation notes already rank a
+# shared certificate above shared nameservers above a shared ASN
+# ("a stronger signal of shared ownership"); these fixed weights
+# encode that ranking. Exposure weights, not verdicts.
+_GRAPH_RELATIONSHIP_CONFIDENCE = {
+    "certificate": 0.85,
+    "nameserver": 0.6,
+    "asn": 0.4,
+}
+
+
+def build_correlation_graph(batch_result: Dict[str, Any],
+                            config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Cross-target shared-infrastructure graph (Stage J3).
+
+    Reads each successful target's final report: live certificate
+    fingerprint (06), NS records (05 evidence), ASN (04). Entities
+    used by fewer than two targets are not shared and are omitted.
+    Every shared entity yields all target pairs with the
+    type-weighted confidence above. Deterministic (sorted throughout).
+    Never raises -- malformed targets are skipped.
+    """
+    cert_users: Dict[str, List[str]] = {}
+    ns_users: Dict[str, List[str]] = {}
+    asn_users: Dict[int, List[str]] = {}
+    try:
+        results = (batch_result or {}).get("results", {}) or {}
+    except Exception:
+        results = {}
+    for target, report in results.items():
+        try:
+            if not isinstance(report, dict):
+                continue
+            if report.get("status") == "FAILED":
+                continue
+            final = report.get("final_report", {}) or {}
+            if not isinstance(final, dict):
+                continue
+            try:
+                t = str(target)
+            except Exception:
+                continue
+            # Live certificate fingerprint.
+            try:
+                live = ((final.get("06_certificate_intelligence", {}) or {})
+                        .get("live_certificate", {})) or {}
+                fp = str(live.get("fingerprint_sha256") or "").strip().lower()
+                if fp:
+                    cert_users.setdefault(fp, [])
+                    if t not in cert_users[fp]:
+                        cert_users[fp].append(t)
+            except Exception:
+                pass
+            # Nameserver records.
+            try:
+                evs = ((final.get("05_dns_intelligence", {}) or {})
+                       .get("evidence", [])) or []
+                for ev in evs:
+                    if not isinstance(ev, dict):
+                        continue
+                    meta = ev.get("metadata", {}) or {}
+                    if meta.get("record_type") != "NS":
+                        continue
+                    ns = str(ev.get("normalized_value") or "").strip().lower()
+                    if ns:
+                        ns_users.setdefault(ns, [])
+                        if t not in ns_users[ns]:
+                            ns_users[ns].append(t)
+            except Exception:
+                pass
+            # ASN as a number (brief shape uses 15169, not "AS15169").
+            try:
+                asn_raw = (((final.get("04_network_intelligence", {}) or {})
+                            .get("asn", {})) or {}).get("asn") or ""
+                digits = re.sub(r"\D", "", str(asn_raw))
+                if digits:
+                    asn = int(digits)
+                    asn_users.setdefault(asn, [])
+                    if t not in asn_users[asn]:
+                        asn_users[asn].append(t)
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    certificates = [{"fingerprint": fp, "used_by": sorted(users)}
+                    for fp, users in sorted(cert_users.items())
+                    if len(users) >= 2]
+    nameservers = [{"ns": ns, "used_by": sorted(users)}
+                   for ns, users in sorted(ns_users.items())
+                   if len(users) >= 2]
+    asns = [{"asn": asn, "used_by": sorted(users)}
+            for asn, users in sorted(asn_users.items())
+            if len(users) >= 2]
+
+    relationships: List[Dict[str, Any]] = []
+    for entry in certificates:
+        for a, b in _target_pairs(entry["used_by"]):
+            relationships.append({"pair": [a, b], "shared": "certificate",
+                                  "confidence": _GRAPH_RELATIONSHIP_CONFIDENCE["certificate"]})
+    for entry in nameservers:
+        for a, b in _target_pairs(entry["used_by"]):
+            relationships.append({"pair": [a, b], "shared": "nameserver",
+                                  "confidence": _GRAPH_RELATIONSHIP_CONFIDENCE["nameserver"]})
+    for entry in asns:
+        for a, b in _target_pairs(entry["used_by"]):
+            relationships.append({"pair": [a, b], "shared": "asn",
+                                  "confidence": _GRAPH_RELATIONSHIP_CONFIDENCE["asn"]})
+    try:
+        relationships.sort(key=lambda r: (r.get("pair", []),
+                                          r.get("shared", "")))
+    except Exception:
+        pass
+    return {
+        "shared_infrastructure": {
+            "certificates": certificates,
+            "nameservers": nameservers,
+            "asns": asns,
+        },
+        "suspicious_relationships": relationships,
+    }
+
+
+def _target_pairs(users: List[str]) -> List[List[str]]:
+    """All unordered target pairs, each sorted (Stage J3)."""
+    try:
+        ordered = sorted(users)
+    except Exception:
+        return []
+    pairs = []
+    for i in range(len(ordered)):
+        for j in range(i + 1, len(ordered)):
+            pairs.append([ordered[i], ordered[j]])
+    return pairs
+
+
+def _target_pairs(users: List[str]) -> List[List[str]]:
+    """All unordered target pairs, each sorted (Stage J3)."""
+    try:
+        ordered = sorted(users)
+    except Exception:
+        return []
+    pairs = []
+    for i in range(len(ordered)):
+        for j in range(i + 1, len(ordered)):
+            pairs.append([ordered[i], ordered[j]])
+    return pairs
+
+
+# ============================================================
+#  ALERTING & WATCH MODE — Stage J5
+#  Change detection over snapshots (cert, DNS, threat score,
+#  subdomains, ports). Read-only diffs; emission is fail-soft and
+#  never aborts a scan. Email uses localhost SMTP when available
+#  and degrades to a log line otherwise.
+# ============================================================
+_ALERT_TYPES = ("certificate_change", "dns_change", "threat_increase",
+                "new_subdomain", "new_port")
+
+
+def _snapshot_db_path(config: Dict[str, Any]) -> str:
+    try:
+        hcfg = (config.get("history", {}) if isinstance(config, dict) else {}) or {}
+        return hcfg.get("db_path", "reconip.db") or "reconip.db"
+    except Exception:
+        return "reconip.db"
+
+
+def load_snapshot_at(target: str, spec: str,
+                     config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Load the snapshot for target matching DATE spec (Stage J5).
+
+    spec is a timestamp prefix (e.g. "2026-09-01" matches any snapshot
+    whose stored timestamp starts with it). The newest match wins.
+    Returns the parsed snapshot dict with _timestamp, or None.
+    Never raises.
+    """
+    try:
+        db_path = _snapshot_db_path(config)
+        rows = _load_snapshot_history(target, db_path)
+        if not rows:
+            return None
+        want = str(spec or "").strip()
+        if not want:
+            return None
+        cands = [r for r in rows if str(r.get("timestamp", "")).startswith(want)]
+        if not cands:
+            # Also accept a bare date inside an ISO timestamp.
+            cands = [r for r in rows if want in str(r.get("timestamp", ""))]
+        if not cands:
+            return None
+        best = sorted(cands, key=lambda r: str(r.get("timestamp", "")))[-1]
+        data = best.get("data", {}) or {}
+        if not isinstance(data, dict):
+            data = {}
+        data = dict(data)
+        data["_timestamp"] = best.get("timestamp")
+        return data
+    except Exception:
+        return None
+
+
+def compute_alerts(previous: Optional[Dict[str, Any]],
+                   current_snapshot: Dict[str, Any],
+                   target: str = "") -> List[Dict[str, Any]]:
+    """Diff two snapshots into J5 alerts. Never raises.
+
+    previous: snapshot dict (with _timestamp) or None (first observation).
+    current_snapshot: fresh snapshot dict.
+    Returns a list of {type, severity, message, old, new, ...}.
+    """
+    alerts: List[Dict[str, Any]] = []
+    try:
+        cur = current_snapshot if isinstance(current_snapshot, dict) else {}
+        prev = previous if isinstance(previous, dict) else None
+        if prev is None:
+            return alerts
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def _mk(atype: str, severity: str, message: str,
+                old: Any = None, new: Any = None) -> Dict[str, Any]:
+            return {"type": atype, "severity": severity, "target": target,
+                    "message": message, "old": old, "new": new,
+                    "timestamp": ts}
+
+        # 1. Certificate change (fingerprint or issuer).
+        try:
+            pc = (prev.get("certificate", {}) or {})
+            cc = (cur.get("certificate", {}) or {})
+            if pc.get("fingerprint_sha256") != cc.get("fingerprint_sha256") and \
+                    (pc.get("fingerprint_sha256") or cc.get("fingerprint_sha256")):
+                alerts.append(_mk(
+                    "certificate_change", "high",
+                    f"Certificate changed ({(pc.get('issuer_cn') or '?')} -> "
+                    f"{(cc.get('issuer_cn') or '?')})",
+                    pc.get("fingerprint_sha256"), cc.get("fingerprint_sha256")))
+            elif pc.get("issuer_cn") != cc.get("issuer_cn") and \
+                    (pc.get("issuer_cn") or cc.get("issuer_cn")):
+                alerts.append(_mk(
+                    "certificate_change", "high",
+                    f"Certificate issuer changed ({pc.get('issuer_cn')} -> "
+                    f"{cc.get('issuer_cn')})",
+                    pc.get("issuer_cn"), cc.get("issuer_cn")))
+        except Exception:
+            pass
+
+        # 2. DNS record change (any type added/removed/modified).
+        try:
+            pdns = prev.get("dns", {}) or {}
+            cdns = cur.get("dns", {}) or {}
+            for rtype in sorted(set(pdns) | set(cdns)):
+                old = sorted({str(v) for v in (pdns.get(rtype) or [])})
+                new = sorted({str(v) for v in (cdns.get(rtype) or [])})
+                if old != new:
+                    added = [v for v in new if v not in old]
+                    removed = [v for v in old if v not in new]
+                    detail = []
+                    if added:
+                        detail.append("added " + ", ".join(added[:5]))
+                    if removed:
+                        detail.append("removed " + ", ".join(removed[:5]))
+                    alerts.append(_mk(
+                        "dns_change", "moderate",
+                        f"DNS {rtype} changed ({'; '.join(detail) or 'modified'})",
+                        old, new))
+        except Exception:
+            pass
+
+        # 3. Threat score increase.
+        try:
+            po = ((prev.get("threat", {}) or {}).get("observed_threat_score"))
+            co = ((cur.get("threat", {}) or {}).get("observed_threat_score"))
+            if isinstance(po, (int, float)) and isinstance(co, (int, float)) \
+                    and co > po:
+                sev = "high" if (co - po) >= 20 else "moderate"
+                alerts.append(_mk(
+                    "threat_increase", sev,
+                    f"Threat score increased {po} -> {co}", po, co))
+        except Exception:
+            pass
+
+        # 4. New subdomain discovered.
+        try:
+            pdom = {str(d).lower() for d in (prev.get("domains", []) or [])}
+            cdom = {str(d).lower() for d in (cur.get("domains", []) or [])}
+            psub = {str(d).lower() for d in (prev.get("subdomains", []) or [])} \
+                if "subdomains" in prev else None
+            csub = {str(d).lower() for d in (cur.get("subdomains", []) or [])} \
+                if "subdomains" in cur else None
+            new_dom = sorted(cdom - pdom)
+            for d in new_dom:
+                alerts.append(_mk("new_subdomain", "low",
+                                  f"New subdomain discovered: {d}", None, d))
+            if psub is not None and csub is not None:
+                for d in sorted(csub - psub):
+                    if d not in {a.get("new") for a in alerts}:
+                        alerts.append(_mk("new_subdomain", "low",
+                                          f"New subdomain discovered: {d}", None, d))
+        except Exception:
+            pass
+
+        # 5. New port opened (skipped when the baseline predates ports).
+        try:
+            if "ports" in prev and "ports" in cur:
+                po2 = {int(p) for p in (prev.get("ports", []) or [])}
+                co2 = {int(p) for p in (cur.get("ports", []) or [])}
+                for p in sorted(co2 - po2):
+                    alerts.append(_mk("new_port", "moderate",
+                                      f"New port opened: {p}", None, p))
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return alerts
+
+
+def emit_alerts(alerts: List[Dict[str, Any]], target: str = "",
+                alert_file: Optional[str] = None,
+                webhook: Optional[str] = None,
+                email: Optional[str] = None) -> Dict[str, Any]:
+    """Deliver alerts to file / webhook / email. Never raises.
+
+    Returns {"delivered": n, "file": path|None, "webhook": status, "email": status}.
+    """
+    out: Dict[str, Any] = {"delivered": 0, "file": None,
+                           "webhook": "skipped", "email": "skipped"}
+    try:
+        alerts = [a for a in (alerts or []) if isinstance(a, dict)]
+        out["delivered"] = len(alerts)
+        if not alerts:
+            return out
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # File: one human-readable line per alert.
+        if alert_file:
+            try:
+                parent = os.path.dirname(os.path.abspath(alert_file))
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(alert_file, "a", encoding="utf-8") as f:
+                    for a in alerts:
+                        f.write(f"{ts} [{a.get('severity', 'info')}] "
+                                f"{target} {a.get('type')}: {a.get('message')}\n")
+                out["file"] = alert_file
+            except Exception as e:
+                log.warning(f"alert file failed ({alert_file}): {e}")
+                out["file"] = f"ERROR: {e}"
+        # Webhook: POST to one URL or a list (Phase K3 merges
+        # --alert-webhook and --notify-webhook). Fail-soft per URL.
+        _hooks: List[str] = []
+        try:
+            if isinstance(webhook, (list, tuple)):
+                _hooks = [str(u).strip() for u in webhook if str(u or "").strip()]
+            elif str(webhook or "").strip():
+                _hooks = [str(webhook).strip()]
+        except Exception:
+            _hooks = []
+        if _hooks:
+            statuses: List[str] = []
+            for _url in _hooks:
+                try:
+                    payload = {"tool": "ReconIP", "target": target,
+                               "timestamp": ts, "alerts": alerts}
+                    resp = requests.post(_url, json=payload, timeout=10)
+                    statuses.append(f"{_url} HTTP {resp.status_code}")
+                    if resp.status_code >= 400:
+                        log.warning(f"alert webhook HTTP {resp.status_code} ({_url})")
+                except Exception as e:
+                    log.warning(f"alert webhook failed ({_url}): {e}")
+                    statuses.append(f"{_url} ERROR: {e}")
+            out["webhook"] = "; ".join(statuses)
+        # Email: localhost SMTP, fail-soft.
+        if email:
+            try:
+                import smtplib as _smtp
+                from email.message import EmailMessage as _EM
+                addrs = [a.strip() for a in str(email).split(",") if a.strip()]
+                msg = _EM()
+                msg["Subject"] = f"ReconIP alerts for {target} ({len(alerts)})"
+                msg["From"] = "reconip@localhost"
+                msg["To"] = ", ".join(addrs)
+                body = "\n".join(
+                    f"- [{a.get('severity')}] {a.get('type')}: {a.get('message')}"
+                    for a in alerts)
+                msg.set_content(f"ReconIP alerts for {target} at {ts}:\n\n{body}\n")
+                with _smtp.SMTP("localhost", timeout=10) as s:
+                    s.send_message(msg)
+                out["email"] = f"sent to {', '.join(addrs)}"
+            except Exception as e:
+                log.warning(f"alert email failed (localhost SMTP): {e}. "
+                            f"Alerts for {email} were kept in the log/file only.")
+                out["email"] = f"ERROR: {e}"
+    except Exception as e:
+        log.debug(f"emit_alerts: {e}")
+    return out
+
+
+def maybe_emit_post_scan_alerts(target: str, recon_out: Dict[str, Any],
+                                config: Dict[str, Any],
+                                args: argparse.Namespace) -> None:
+    """Emit J5 alerts after a normal (non-watch) scan when channels set.
+
+    Diffs the just-stored snapshot against its predecessor. Silent when
+    no alert channel is configured or when there is no baseline yet.
+    Never raises.
+    """
+    try:
+        if not getattr(args, "alert_file", None) and \
+                not getattr(args, "alert_webhook", None) and \
+                not getattr(args, "notify_webhook", None) and \
+                not getattr(args, "alert_email", None):
+            return
+        if not isinstance(recon_out, dict):
+            return
+        try:
+            current = _extract_snapshot_fields(recon_out)
+        except Exception:
+            return
+        try:
+            previous = load_previous_snapshot(target, _snapshot_db_path(config))
+        except Exception:
+            previous = None
+        if previous is None:
+            return
+        try:
+            alerts = compute_alerts(previous, current, target)
+        except Exception:
+            return
+        if not alerts:
+            return
+        try:
+            emit_alerts(alerts, target,
+                        getattr(args, "alert_file", None),
+                        _channel_webhooks(args),
+                        getattr(args, "alert_email", None))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _post_scan_alerts_for(target: str, recon_out: Dict[str, Any],
+                            config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Change alerts for one finished scan vs its previous snapshot.
+
+    Returns [] when there is no baseline yet or nothing changed.
+    Pure computation: no channels touched. Never raises.
+    """
+    try:
+        if not isinstance(recon_out, dict):
+            return []
+        try:
+            current = _extract_snapshot_fields(recon_out)
+        except Exception:
+            return []
+        try:
+            previous = load_previous_snapshot(target, _snapshot_db_path(config))
+        except Exception:
+            previous = None
+        if previous is None:
+            return []
+        try:
+            return compute_alerts(previous, current, target) or []
+        except Exception:
+            return []
+    except Exception:
+        return []
+
+
+# ============================================================
+#  RESULT FILTERING — Phase K2 (multi-target orchestration)
+#  --filter "threat > 50" keeps only matching targets in scope for
+#  the batch listing and summary. Pure post-processing: every target
+#  is still scanned, and scan failures still drive the exit code.
+#  Pipeline report files on disk are the raw record and are left
+#  untouched; the filter scopes what is *reported*.
+# ============================================================
+_FILTER_FIELDS = ("threat", "coverage", "anomalies", "ports",
+                  "threat_confidence")
+_FILTER_CLAUSE_RE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|==|!=|>|<)\s*"
+    r"([0-9]+(?:\.[0-9]+)?)\s*$")
+
+
+def _filter_value(recon_out: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """Numeric filter fields for one recon result. Never raises."""
+    vals: Dict[str, Optional[float]] = {f: None for f in _FILTER_FIELDS}
+    try:
+        if not isinstance(recon_out, dict):
+            return vals
+        ti = recon_out.get("threat_intelligence", {}) or {}
+        if isinstance(ti, dict):
+            try:
+                v = ti.get("observed_threat_score")
+                vals["threat"] = float(v) if v is not None else None
+            except Exception:
+                pass
+            try:
+                v = ti.get("threat_confidence")
+                vals["threat_confidence"] = float(v) if v is not None else None
+            except Exception:
+                pass
+        sc = (recon_out.get("intelligence_scoring", {}) or {}).get("summary", {}) or {}
+        if isinstance(sc, dict):
+            try:
+                v = sc.get("coverage")
+                vals["coverage"] = float(v) if v is not None else None
+            except Exception:
+                pass
+        an = recon_out.get("anomaly_intelligence", {}) or {}
+        if isinstance(an, dict):
+            try:
+                vals["anomalies"] = float(len(an.get("anomalies", []) or []))
+            except Exception:
+                pass
+        ai = recon_out.get("attack_surface_intelligence", {}) or {}
+        if isinstance(ai, dict):
+            try:
+                vals["ports"] = float(ai.get("service_count", 0) or 0)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return vals
+
+
+def parse_result_filter(expr: str) -> List[List[Tuple[str, str, float]]]:
+    """Parse `--filter EXPR` into OR-groups of AND-clauses.
+
+    Grammar: clause (and clause)* (or clause (and clause)*)* where
+    clause is `field op number`. `and` binds tighter than `or`.
+    Raises ValueError with a human message on any syntax error.
+    """
+    try:
+        text = str(expr or "").strip()
+    except Exception:
+        text = ""
+    if not text:
+        raise ValueError("Empty --filter expression.")
+    groups: List[List[Tuple[str, str, float]]] = []
+    try:
+        or_parts = re.split(r"\s+[Oo][Rr]\s+", text)
+        for part in or_parts:
+            and_parts = re.split(r"\s+[Aa][Nn][Dd]\s+", part)
+            clauses: List[Tuple[str, str, float]] = []
+            for raw in and_parts:
+                m = _FILTER_CLAUSE_RE.match(raw)
+                if not m:
+                    raise ValueError(
+                        f"Bad clause {raw!r}. Expected "
+                        f"`field op number`, e.g. `threat > 50`.")
+                field, op, num = m.group(1), m.group(2), m.group(3)
+                if field not in _FILTER_FIELDS:
+                    raise ValueError(
+                        f"Unknown field {field!r}. "
+                        f"Fields: {', '.join(_FILTER_FIELDS)}.")
+                try:
+                    clauses.append((field, op, float(num)))
+                except Exception:
+                    raise ValueError(f"Bad number {num!r}.")
+            if not clauses:
+                raise ValueError("Empty --filter expression.")
+            groups.append(clauses)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Invalid --filter expression: {e}")
+    if not groups:
+        raise ValueError("Empty --filter expression.")
+    return groups
+
+
+def result_matches_filter(recon_out: Dict[str, Any],
+                          parsed: List[List[Tuple[str, str, float]]]) -> bool:
+    """True when the result satisfies the parsed filter. Never raises."""
+    try:
+        vals = _filter_value(recon_out)
+        for group in parsed or []:
+            ok = True
+            for field, op, num in group:
+                v = vals.get(field)
+                if v is None:
+                    ok = False
+                    break
+                try:
+                    if op == ">" and not (v > num): ok = False
+                    elif op == ">=" and not (v >= num): ok = False
+                    elif op == "<" and not (v < num): ok = False
+                    elif op == "<=" and not (v <= num): ok = False
+                    elif op == "==" and not (v == num): ok = False
+                    elif op == "!=" and not (v != num): ok = False
+                except Exception:
+                    ok = False
+                if not ok:
+                    break
+            if ok:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def scope_batch_results(batch_result: Dict[str, Any],
+                        config: Dict[str, Any],
+                        filter_parsed: Optional[
+                            List[List[Tuple[str, str, float]]]] = None,
+                        only_alerts: bool = False
+                        ) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+    """Split batch results into an in-scope view plus exclusion notes.
+
+    Failures always stay visible (never filtered out). Stats are
+    recomputed for the in-scope set; the original total travels in
+    stats["filtered_from"]. Never raises.
+    """
+    try:
+        results = (batch_result.get("results", {})
+                   if isinstance(batch_result, dict) else {}) or {}
+    except Exception:
+        results = {}
+    in_scope: Dict[str, Any] = {}
+    excluded: List[Dict[str, str]] = []
+    try:
+        for target, rep in results.items():
+            try:
+                if not isinstance(rep, dict) or rep.get("status") == "FAILED":
+                    in_scope[target] = rep
+                    continue
+                if filter_parsed is not None and not result_matches_filter(
+                        rep, filter_parsed):
+                    excluded.append({"target": target, "reason": "filter"})
+                    continue
+                if only_alerts and not _post_scan_alerts_for(
+                        target, rep, config):
+                    excluded.append({"target": target, "reason": "no-alerts"})
+                    continue
+                in_scope[target] = rep
+            except Exception:
+                try:
+                    in_scope[target] = rep
+                except Exception:
+                    pass
+    except Exception:
+        in_scope, excluded = dict(results), []
+    try:
+        ok = sum(1 for r in in_scope.values()
+                 if isinstance(r, dict) and r.get("status") != "FAILED")
+        base_stats = (batch_result.get("stats", {})
+                      if isinstance(batch_result, dict) else {}) or {}
+        stats = dict(base_stats) if isinstance(base_stats, dict) else {}
+        stats.update({"total": len(in_scope), "ok": ok,
+                      "failed": len(in_scope) - ok,
+                      "filtered_from": len(results)})
+    except Exception:
+        stats = {"total": len(in_scope), "ok": 0,
+                 "failed": 0, "filtered_from": len(results)}
+    try:
+        scoped_targets = [t for t in (batch_result.get("targets", []) or [])
+                          if t in in_scope]
+    except Exception:
+        scoped_targets = sorted(in_scope)
+    return ({"targets": scoped_targets, "results": in_scope,
+             "stats": stats}, excluded)
+
+
+def run_compare_with(targets: List[str], spec: str,
+                     config: Dict[str, Any],
+                     args: argparse.Namespace) -> int:
+    """Scan each target once and compare against the DATE snapshot (J5).
+
+    Prints a JSON document {target: {baseline, alerts, detection}} and
+    forwards alerts to any configured channels. Returns exit code.
+    """
+    try:
+        results: Dict[str, Any] = {}
+        rc = 0
+        for target in targets:
+            try:
+                with _progress_context(config, total_stages=13,
+                                       stage_name=f"Scanning {target}") as prog:
+                    rep = _process_single_target(target, config, args,
+                                                 progress=prog)
+            except Exception as e:
+                results[target] = {"error": str(e)}
+                rc = 2
+                continue
+            if not isinstance(rep, dict) or rep.get("status") == "FAILED":
+                results[target] = {"error": (rep or {}).get("error", "scan failed")}
+                rc = 2
+                continue
+            try:
+                baseline = load_snapshot_at(target, spec, config)
+            except Exception:
+                baseline = None
+            try:
+                current = _extract_snapshot_fields(rep)
+            except Exception:
+                current = {}
+            if baseline is None:
+                results[target] = {
+                    "baseline": None,
+                    "alerts": [],
+                    "note": f"No snapshot for {target} at '{spec}'.",
+                }
+                continue
+            try:
+                comparison = historical_compare(current, baseline, config)
+                detection = change_detection(comparison, config)
+            except Exception as e:
+                comparison, detection = {}, {"error": str(e)}
+            try:
+                alerts = compute_alerts(baseline, current, target)
+            except Exception:
+                alerts = []
+            try:
+                emit_alerts(alerts, target,
+                            getattr(args, "alert_file", None),
+                            _channel_webhooks(args),
+                            getattr(args, "alert_email", None))
+            except Exception:
+                pass
+            results[target] = {
+                "baseline_timestamp": baseline.get("_timestamp"),
+                "alerts": alerts,
+                "detection": detection,
+            }
+            if alerts:
+                rc = 2
+        print(json.dumps(results, indent=2, default=str))
+        return rc
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+        return 2
+
+
+def run_watch_mode(targets: List[str], interval: int,
+                   config: Dict[str, Any],
+                   args: argparse.Namespace) -> int:
+    """Rescan targets every `interval` seconds, emitting alerts (J5).
+
+    Each iteration diffs the fresh snapshot against the previous
+    iteration's snapshot (in-memory) so rapid changes are caught even
+    within one process lifetime. Stops on Ctrl+C or after
+    --watch-count iterations. Returns exit code.
+    """
+    try:
+        interval = max(1, int(interval))
+    except Exception:
+        interval = 3600
+    try:
+        max_iter = getattr(args, "watch_count", None)
+        max_iter = int(max_iter) if max_iter else None
+    except Exception:
+        max_iter = None
+    prev_snaps: Dict[str, Dict[str, Any]] = {}
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            for target in targets:
+                try:
+                    with _progress_context(
+                            config, total_stages=13,
+                            stage_name=f"Watch [{iteration}] {target}") as prog:
+                        rep = _process_single_target(target, config, args,
+                                                     progress=prog)
+                except Exception as e:
+                    log.warning(f"watch {target}: scan failed: {e}")
+                    continue
+                if not isinstance(rep, dict) or rep.get("status") == "FAILED":
+                    continue
+                try:
+                    cur = _extract_snapshot_fields(rep)
+                except Exception:
+                    continue
+                prev = prev_snaps.get(target)
+                if prev is None:
+                    # Seed from the stored history so the first watch
+                    # iteration compares against the last real scan, not
+                    # against itself (which would always be silent).
+                    try:
+                        db_path = _snapshot_db_path(config)
+                        rows = _load_snapshot_history(target, db_path)
+                        if len(rows) >= 2:
+                            prev = dict(rows[-2].get("data", {}) or {})
+                    except Exception:
+                        prev = None
+                try:
+                    alerts = compute_alerts(prev, cur, target) if prev else []
+                except Exception:
+                    alerts = []
+                if alerts:
+                    try:
+                        res = emit_alerts(
+                            alerts, target,
+                            getattr(args, "alert_file", None),
+                            _channel_webhooks(args),
+                            getattr(args, "alert_email", None))
+                        print(f"[watch] {target}: {len(alerts)} alert(s) "
+                              f"(file={res.get('file')} webhook={res.get('webhook')} "
+                              f"email={res.get('email')})")
+                    except Exception:
+                        pass
+                else:
+                    print(f"[watch] {target}: no changes.")
+                prev_snaps[target] = cur
+            if max_iter is not None and iteration >= max_iter:
+                break
+            try:
+                time.sleep(interval)
+            except KeyboardInterrupt:
+                print("\n[watch] interrupted.")
+                break
+    except KeyboardInterrupt:
+        print("\n[watch] interrupted.")
+    return 0
+
+
+def _channel_webhooks(args: argparse.Namespace) -> List[str]:
+    """All configured webhook URLs (J5 --alert-webhook + K3 --notify-webhook).
+
+    Deduped, order-preserving. Never raises.
+    """
+    try:
+        urls: List[str] = []
+        for key in ("alert_webhook", "notify_webhook"):
+            try:
+                raw = getattr(args, key, None)
+            except Exception:
+                raw = None
+            if isinstance(raw, (list, tuple)):
+                for u in raw:
+                    u = str(u or "").strip()
+                    if u and u not in urls:
+                        urls.append(u)
+            elif str(raw or "").strip():
+                u = str(raw).strip()
+                if u not in urls:
+                    urls.append(u)
+        return urls
+    except Exception:
+        return []
+
+
+# ============================================================
+#  CRON SCHEDULING — Phase K3 (continuous monitoring)
+#  Minimal 5-field cron (minute hour dom month dow) in stdlib:
+#  `*`, `*/n`, `a,b`, `a-b`, `a-b/n`. First cycle runs immediately;
+#  later cycles fire on cron boundaries. No new dependencies.
+# ============================================================
+def _parse_cron_field(expr: str, lo: int, hi: int, name: str) -> Set[int]:
+    """Expand one cron field to a set of ints. Raises ValueError."""
+    try:
+        text = str(expr or "").strip()
+    except Exception:
+        text = ""
+    if not text:
+        raise ValueError(f"Empty {name} field in --schedule.")
+    values: Set[int] = set()
+
+    def _add(v: int) -> None:
+        if v < lo or v > hi:
+            raise ValueError(
+                f"{name} value {v} out of range [{lo}-{hi}].")
+        values.add(v)
+
+    try:
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                raise ValueError(f"Empty entry in {name} field.")
+            step = 1
+            if "/" in part:
+                base, _, step_s = part.partition("/")
+                try:
+                    step = int(step_s)
+                except Exception:
+                    raise ValueError(
+                        f"Bad step {step_s!r} in {name} field.")
+                if step < 1:
+                    raise ValueError(
+                        f"Bad step {step_s!r} in {name} field.")
+                part = base.strip()
+            if part == "*":
+                for v in range(lo, hi + 1, step):
+                    _add(v)
+            elif "-" in part:
+                a_s, _, b_s = part.partition("-")
+                try:
+                    a, b = int(a_s), int(b_s)
+                except Exception:
+                    raise ValueError(
+                        f"Bad range {part!r} in {name} field.")
+                if a > b:
+                    raise ValueError(
+                        f"Reversed range {part!r} in {name} field.")
+                for v in range(a, b + 1, step):
+                    _add(v)
+            elif part == "":
+                raise ValueError(f"Empty entry in {name} field.")
+            else:
+                try:
+                    base_v = int(part)
+                except Exception:
+                    raise ValueError(
+                        f"Bad value {part!r} in {name} field.")
+                if step == 1:
+                    _add(base_v)
+                else:
+                    for v in range(base_v, hi + 1, step):
+                        _add(v)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Invalid {name} field: {e}")
+    if not values:
+        raise ValueError(f"Empty {name} field in --schedule.")
+    return values
+
+
+def _parse_cron(expr: str) -> Tuple[Set[int], Set[int], Set[int],
+                                   Set[int], Set[int]]:
+    """Parse a 5-field cron expression. Raises ValueError."""
+    try:
+        parts = str(expr or "").strip().split()
+    except Exception:
+        parts = []
+    if len(parts) != 5:
+        raise ValueError(
+            f"--schedule needs 5 fields "
+            f"(minute hour dom month dow), got {len(parts)}.")
+    return (
+        _parse_cron_field(parts[0], 0, 59, "minute"),
+        _parse_cron_field(parts[1], 0, 23, "hour"),
+        _parse_cron_field(parts[2], 1, 31, "day-of-month"),
+        _parse_cron_field(parts[3], 1, 12, "month"),
+        _parse_cron_field(parts[4], 0, 7, "day-of-week"),
+    )
+
+
+def _cron_next(expr: str,
+               from_dt: Optional[datetime] = None) -> datetime:
+    """Next fire time strictly after from_dt (minute granularity).
+
+    Searches forward at most ~366 days. Raises ValueError on a bad
+    expression, RuntimeError when nothing fires within a year.
+    """
+    mins, hours, doms, months, dows = _parse_cron(expr)
+    try:
+        base = from_dt or datetime.now(timezone.utc)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+    except Exception:
+        base = datetime.now(timezone.utc)
+    cand = base.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    for _ in range(366 * 24 * 60):
+        try:
+            dow = cand.isoweekday() % 7  # Sunday == 0, like cron
+            if (cand.minute in mins and cand.hour in hours
+                    and cand.day in doms and cand.month in months
+                    and (dow in dows or (dow == 0 and 7 in dows)
+                         or (cand.isoweekday() == 7 and 7 in dows))):
+                return cand
+        except Exception:
+            pass
+        cand += timedelta(minutes=1)
+    raise RuntimeError("No cron fire time within a year.")
+
+
+def run_schedule_mode(targets: List[str], cron_expr: str,
+                      config: Dict[str, Any],
+                      args: argparse.Namespace) -> int:
+    """Rescan targets on a cron schedule, notifying on change (Phase K3).
+
+    The first cycle runs immediately; later cycles fire on cron
+    boundaries. Every cycle scans (batch, parallel) and writes the
+    normal report files. With --alert-on-change only cycles that
+    detect a change notify; otherwise a per-cycle summary is also
+    sent to the file/webhook channels. Stops on Ctrl+C or after
+    --watch-count cycles. Returns exit code.
+    """
+    try:
+        _parse_cron(cron_expr)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    try:
+        max_cycles = getattr(args, "watch_count", None)
+        max_cycles = int(max_cycles) if max_cycles else None
+    except Exception:
+        max_cycles = None
+    try:
+        only_on_change = bool(getattr(args, "alert_on_change", False))
+    except Exception:
+        only_on_change = False
+    try:
+        batch_cfg = config.get("batch", {}) if isinstance(config, dict) else {}
+    except Exception:
+        batch_cfg = {}
+    if not isinstance(batch_cfg, dict):
+        batch_cfg = {}
+    try:
+        workers = int(getattr(args, "workers", None)
+                      or batch_cfg.get("max_workers", 4))
+    except Exception:
+        workers = 4
+    try:
+        hard = int(batch_cfg.get("max_workers_hard_limit", 32))
+    except Exception:
+        hard = 32
+    workers = max(1, min(workers, hard))
+
+    cycle = 0
+    try:
+        while True:
+            cycle += 1
+            started = datetime.now(timezone.utc)
+            print(f"[schedule] cycle {cycle} "
+                  f"({started.strftime('%Y-%m-%dT%H:%M:%SZ')}, "
+                  f"{len(targets)} target(s), workers={workers})")
+            try:
+                with _progress_context(
+                        config, total_stages=13,
+                        stage_name=f"Scheduled cycle {cycle}") as prog:
+                    batch_result = batch_process(targets, config, args,
+                                                 workers=workers,
+                                                 progress=prog)
+            except Exception as e:
+                log.warning(f"schedule cycle {cycle} failed: {e}")
+                batch_result = {"targets": list(targets), "results": {},
+                                "stats": {"total": len(targets), "ok": 0,
+                                          "failed": len(targets)}}
+            # Export every successful target (the record), then diff.
+            changed: Dict[str, List[Dict[str, Any]]] = {}
+            ok_count = 0
+            try:
+                results = (batch_result.get("results", {})
+                           if isinstance(batch_result, dict) else {}) or {}
+            except Exception:
+                results = {}
+            for target, rep in results.items():
+                try:
+                    if not isinstance(rep, dict) or rep.get("status") == "FAILED":
+                        continue
+                    ok_count += 1
+                    try:
+                        final_report = rep.get("final_report", {})
+                        if final_report:
+                            try:
+                                local_config = _deep_copy_config(config)
+                                _apply_cli_overrides(local_config, args)
+                            except Exception:
+                                local_config = config
+                            rep["export_paths"] = export_all(
+                                final_report, local_config)
+                    except Exception as e:
+                        log.debug(f"schedule export {target}: {e}")
+                    try:
+                        alerts = _post_scan_alerts_for(target, rep, config)
+                    except Exception:
+                        alerts = []
+                    if alerts:
+                        changed[target] = alerts
+                except Exception:
+                    continue
+            print(f"[schedule] cycle {cycle} done: "
+                  f"{ok_count}/{len(targets)} OK, "
+                  f"{len(changed)} target(s) changed.")
+            # Notify.
+            try:
+                webhooks = _channel_webhooks(args)
+                alert_file = getattr(args, "alert_file", None)
+                email = getattr(args, "alert_email", None)
+                if changed:
+                    for target, alerts in changed.items():
+                        try:
+                            emit_alerts(alerts, target, alert_file,
+                                        webhooks, email)
+                        except Exception:
+                            pass
+                if not only_on_change:
+                    summary_line = (
+                        f"cycle {cycle}: {ok_count}/{len(targets)} OK, "
+                        f"{len(changed)} changed")
+                    if alert_file:
+                        try:
+                            parent = os.path.dirname(
+                                os.path.abspath(alert_file))
+                            if parent:
+                                os.makedirs(parent, exist_ok=True)
+                            with open(alert_file, "a",
+                                       encoding="utf-8") as f:
+                                f.write(f"{started.strftime('%Y-%m-%dT%H:%M:%SZ')} "
+                                        f"[info] schedule {summary_line}\n")
+                        except Exception as e:
+                            log.warning(f"schedule summary file failed: {e}")
+                    for _url in webhooks:
+                        try:
+                            requests.post(_url, json={
+                                "tool": "ReconIP", "cycle": cycle,
+                                "timestamp": started.strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ"),
+                                "summary": summary_line,
+                                "changed": sorted(changed)}, timeout=10)
+                        except Exception as e:
+                            log.warning(
+                                f"schedule summary webhook failed ({_url}): {e}")
+            except Exception as e:
+                log.debug(f"schedule notify: {e}")
+            if max_cycles is not None and cycle >= max_cycles:
+                break
+            # Sleep until the next cron boundary (interruptible).
+            try:
+                nxt = _cron_next(cron_expr)
+                while True:
+                    now = datetime.now(timezone.utc)
+                    if now >= nxt:
+                        break
+                    time.sleep(min(30, max(1, (nxt - now).total_seconds())))
+            except KeyboardInterrupt:
+                print("\n[schedule] interrupted.")
+                break
+    except KeyboardInterrupt:
+        print("\n[schedule] interrupted.")
+    return 0
+
+
 def batch_correlate(batch_result: Dict[str, Any],
                     config: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -14013,6 +18690,92 @@ def export_batch_summary(summary: Dict[str, Any],
 
 
 # ============================================================
+#  STAGE FAILURE ISOLATION (Stage G1, v49.1)
+# ============================================================
+# recon() runs 13 intelligence stages. Every stage must be able to
+# fail on its own without aborting the scan: a dead DNS resolver
+# must not cost the operator the certificate, threat and
+# infrastructure sections.
+#
+# Two properties are guaranteed here:
+#   1. Any stage exception is recorded in out["_stage_failures"],
+#      which is always present (possibly empty) and is emitted in
+#      the `-o json` payload.
+#   2. The final report is still generated from whatever sections
+#      did succeed.
+#
+# Stage keys match the progress labels so an operator can line the
+# failure list up against the bar they just watched.
+STAGE_DNS = "01/13 DNS Intelligence"
+STAGE_THREAT = "02/13 Threat Intelligence"
+STAGE_CERT = "03/13 Certificate"
+STAGE_PDNS = "04/13 Passive DNS"
+STAGE_INFRA = "05/13 Infrastructure"
+STAGE_HISTORY = "06/13 History"
+STAGE_CORRELATION = "07/13 Correlation"
+STAGE_ATTACK_SURFACE = "08/13 Attack Surface"
+STAGE_TECHNOLOGY = "09/13 Technology"
+STAGE_VULNERABILITY = "10/13 Vulnerability"
+STAGE_ANOMALY = "11/13 Anomaly"
+STAGE_CONFIDENCE = "12/13 Confidence"
+STAGE_SCORING = "13/13 Scoring"
+STAGE_CORE = "core-scoring"
+STAGE_REPORT = "report"
+
+
+def _record_stage_failure(out: Dict[str, Any], stage: str, exc: BaseException) -> None:
+    """
+    Append one stage failure to out["_stage_failures"] and log it.
+
+    Never raises: the recorder must not be able to turn a handled
+    section error into a scan abort. Logged at WARNING (not DEBUG) so
+    a degraded section is visible at the default INFO level instead
+    of vanishing silently.
+
+    The recorded error is redacted through redact() because stage
+    exceptions can embed provider URLs that carry credentials.
+    """
+    try:
+        if not isinstance(out, dict):
+            return
+        failures = out.get("_stage_failures")
+        if not isinstance(failures, list):
+            failures = []
+            out["_stage_failures"] = failures
+        try:
+            message = str(exc)
+        except Exception:
+            message = "<unprintable exception>"
+        try:
+            message = redact(message)
+        except Exception:
+            pass
+        try:
+            etype = type(exc).__name__
+        except Exception:
+            etype = "Exception"
+        failures.append({"stage": stage, "error": message, "type": etype})
+        try:
+            log.warning(f"Stage failed [{stage}]: {etype}: {message}")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _stage_failure_count(out: Dict[str, Any]) -> int:
+    """Number of recorded stage failures (0 when clean/unavailable)."""
+    try:
+        if isinstance(out, dict):
+            failures = out.get("_stage_failures")
+            if isinstance(failures, list):
+                return len(failures)
+    except Exception:
+        pass
+    return 0
+
+
+# ============================================================
 #  RECON (MAIN FLOW) — v21.3 with Phase 2
 # ============================================================
 def recon(target, enable_db=True, parallel=None, progress=None):
@@ -14026,6 +18789,9 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         parallel = "--parallel" in sys.argv
     t0 = time.time()
     out = {"input": target, "timestamp": now(), "type": "ip", "module_statuses": {}}
+    # Stage G1: always present so callers can assert on it, and so a
+    # clean scan is distinguishable from a scan that never recorded.
+    out["_stage_failures"] = []
     try:
         ipaddress.ip_address(target)
         ip, domain = target, None
@@ -14049,8 +18815,31 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         progress = _NoopProgress()
     progress.start("01/13 DNS Intelligence")
 
+    # Stage G5: the collector fan-out is the first thing a scan runs, and
+    # it was the one place in recon() still left unguarded. A dead resolver
+    # or a geo provider raising here used to abort the entire scan before
+    # a report existed, which is exactly what Stage G1 set out to prevent
+    # for the other 13 stages. Each collector now degrades to the neutral
+    # value its caller already handles, and names itself in
+    # _stage_failures so the operator can see which source went dark.
+    def _collect(label, stage, fn, *a, **kw):
+        default = kw.pop("_default", ([], MS.SKIPPED.value))
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            log.debug(f"{label}: {e}")
+            _record_stage_failure(out, stage, e)
+            return default
+
     if parallel:
-        res = collect_parallel(ip, domain)
+        try:
+            res = collect_parallel(ip, domain)
+        except Exception as e:
+            log.debug(f"collect_parallel: {e}")
+            _record_stage_failure(out, STAGE_CORE, e)
+            res = {}
+        if not isinstance(res, dict):
+            res = {}
         geo_evs, geo_st = res.get("geo", ([], MS.SKIPPED.value))
         asn_evs, asn_st = res.get("asn", ([], MS.SKIPPED.value))
         rdap_evs, rdap_st = res.get("rdap", ([], MS.SKIPPED.value))
@@ -14058,12 +18847,44 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         cert_res = res.get("cert", ([], MS.SKIPPED.value, {"records": {}}))
         threat_res = res.get("threat", ([], MS.SKIPPED.value))
     else:
-        geo_evs, geo_st = collect_geo(ip)
-        asn_evs, asn_st = collect_asn(ip)
-        rdap_evs, rdap_st = collect_rdap(ip)
-        dns_evs, dns_st = collect_dns(ip, domain=domain)
-        cert_res = collect_certs(domain or ip)
-        threat_res = collect_threat(ip)
+        # Stage H1: the six collectors are independent (each writes its
+        # own result variables and reads only ip/domain/config), so they
+        # run concurrently -- total latency bounded by the slowest, not
+        # the sum. Each worker is the same guarded _collect() call, and
+        # results rejoin in fixed collector order, so the downstream
+        # `evs` concatenation is ordered exactly as the old sequential
+        # block produced it.
+        _fanout = [
+            ("geo", STAGE_INFRA, collect_geo, (ip,), {}),
+            ("asn", STAGE_INFRA, collect_asn, (ip,), {}),
+            ("rdap", STAGE_INFRA, collect_rdap, (ip,), {}),
+            ("dns", STAGE_DNS, collect_dns, (ip,), {"domain": domain}),
+            ("certs", STAGE_CERT, collect_certs, (domain or ip,), {},
+             ([], MS.SKIPPED.value, {"records": {}})),
+            ("threat", STAGE_THREAT, collect_threat, (ip,), {}),
+        ]
+        _gathered: Dict[str, Any] = {}
+        with ThreadPoolExecutor(max_workers=len(_fanout),
+                                thread_name_prefix="reconip-collect") as _cex:
+            _futures = {}
+            for _spec in _fanout:
+                _label, _stage, _fn, _args, _kwargs = _spec[:5]
+                _default = _spec[5] if len(_spec) > 5 else ([], MS.SKIPPED.value)
+                _futures[_cex.submit(_collect, _label, _stage, _fn,
+                                     *_args, **_kwargs,
+                                     _default=_default)] = _label
+            for _fut in as_completed(_futures):
+                _label = _futures[_fut]
+                try:
+                    _gathered[_label] = _fut.result()
+                except Exception as _e:
+                    _gathered[_label] = ([], MS.SKIPPED.value)
+        geo_evs, geo_st = _gathered.get("geo", ([], MS.SKIPPED.value))
+        asn_evs, asn_st = _gathered.get("asn", ([], MS.SKIPPED.value))
+        rdap_evs, rdap_st = _gathered.get("rdap", ([], MS.SKIPPED.value))
+        dns_evs, dns_st = _gathered.get("dns", ([], MS.SKIPPED.value))
+        cert_res = _gathered.get("certs", ([], MS.SKIPPED.value, {"records": {}}))
+        threat_res = _gathered.get("threat", ([], MS.SKIPPED.value))
 
     # v21.6 FIX: ASN dedup by source PRIORITY (not weight)
     # Priority: RIPE(100) > BGPView(90) > WHOIS(85) > bgp.he.net(50)
@@ -14117,7 +18938,28 @@ def recon(target, enable_db=True, parallel=None, progress=None):
             ))
         except Exception:
             pass
-        dns_intel = dns_analyze(combined_dns_evs, CFG)
+        # Stage I4: CT SANs feed subdomain enumeration. The cert unpack
+        # below runs after this block, so read the fan-out tuple
+        # directly (cert_res is already in scope). Records hold CertRec
+        # objects (or plain dicts); extract defensively.
+        _ct_sans: List[str] = []
+        try:
+            _ci = cert_res[2] if isinstance(cert_res, (list, tuple)) and len(cert_res) == 3 else {}
+            _recs = (_ci.get("records", {}) if isinstance(_ci, dict) else {}) or {}
+            for _rec in _recs.values():
+                try:
+                    _sans = (getattr(_rec, "sans", None)
+                             if not isinstance(_rec, dict)
+                             else _rec.get("sans", [])) or []
+                    for _s in _sans:
+                        if _s and _s not in _ct_sans:
+                            _ct_sans.append(str(_s))
+                except Exception:
+                    continue
+        except Exception:
+            _ct_sans = []
+        dns_intel = dns_analyze(combined_dns_evs, CFG, target=target,
+                                cert_sans=_ct_sans)
         out["dns_intelligence"] = {
             "evidence": [ev.to_dict() for ev in combined_dns_evs],
             "analysis": dns_intel
@@ -14129,6 +18971,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
                 evs.append(ev)
     except Exception as e:
         log.debug(f"dns intelligence: {e}")
+        _record_stage_failure(out, STAGE_DNS, e)
         out["dns_intelligence"] = {"evidence": [], "analysis": {}}
         out["dns_collect_evidence"] = []
 
@@ -14140,8 +18983,22 @@ def recon(target, enable_db=True, parallel=None, progress=None):
     threat_obs, threat_st = threat_res if len(threat_res) == 2 \
         else ([], MS.SKIPPED.value)
     progress.next("02/13 Threat Intelligence")
-    threat_agg = agg_threat(threat_obs)
-    evs += threat_evs(ip, threat_obs)
+    # Stage G1: agg_threat()/threat_evs() run unguarded upstream; seed a
+    # neutral aggregate so a provider-aggregation fault degrades the threat
+    # section instead of killing the scan.
+    try:
+        threat_agg = agg_threat(threat_obs)
+    except Exception as e:
+        log.debug(f"threat aggregate: {e}")
+        _record_stage_failure(out, STAGE_THREAT, e)
+        threat_agg = {"score": 0.0, "classification": "UNAVAILABLE",
+                      "coverage": 0.0, "providers": [], "positive": 0,
+                      "explanation": "threat aggregation unavailable"}
+    try:
+        evs += threat_evs(ip, threat_obs)
+    except Exception as e:
+        log.debug(f"threat evidence: {e}")
+        _record_stage_failure(out, STAGE_THREAT, e)
     out["module_statuses"]["threat"] = threat_st
     out["phase_i"] = threat_agg
 
@@ -14162,6 +19019,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         out["stage3_threat_evidences"] = [e.to_dict() for e in stage3_threat_evs]
     except Exception as e:
         log.debug(f"stage3 providers: {e}")
+        _record_stage_failure(out, STAGE_THREAT, e)
         stage3_threat_evs = []
         out["stage3_threat_evidences"] = []
 
@@ -14250,26 +19108,51 @@ def recon(target, enable_db=True, parallel=None, progress=None):
             out["data_confidence"] = 0.0
     except Exception as e:
         log.debug(f"stage4 aggregate: {e}")
+        _record_stage_failure(out, STAGE_THREAT, e)
         out["threat_intelligence"] = {}
         out["data_confidence"] = 0.0
 
-    out["scan_status"] = agg_scan_status(out["module_statuses"])
-    anycast = ip in CFG["geo_validation"]["anycast_ips"]
-    cs = conflict_report(evs, anycast=anycast)
-    trusted = build_trusted(evs, cs, anycast)
+    # Stage G1: derived values consumed by every later stage. Seed neutral
+    # defaults BEFORE computing, so that a mid-block failure keeps whatever
+    # was already computed and only leaves the remainder defaulted. The
+    # shapes mirror each helper's own no-data return.
+    cs = []
+    trusted = {}
+    threat_dim = SD(0.0, "UNKNOWN", [])
+    infra_dim = SD(0.0, "UNKNOWN", [])
+    dc = SD(0.0, "UNKNOWN", [])
+    cov = {"coverage": 0.0, "intended": 0, "successful": 0,
+           "not_configured": 0, "failed": 0}
+    eq = SD(0.0, "UNKNOWN", [])
+    ac = {"label": "Low", "reasons": ["stage isolation fallback"]}
+    fa = {}
+    ents = {}
+    rels = []
+    ni = {}
+    anycast = False
+    try:
+        out["scan_status"] = agg_scan_status(out["module_statuses"])
+        anycast = ip in CFG["geo_validation"]["anycast_ips"]
+        cs = conflict_report(evs, anycast=anycast)
+        trusted = build_trusted(evs, cs, anycast)
 
-    threat_dim = threat_score([e for e in evs if e.data_type == "threat"],
-                              phase_i=threat_agg)
-    infra_dim = infra_risk(ip, trusted, evs)
-    dc = _data_confidence_legacy(evs, trusted, cs, None)
-    cov = coverage({}, phase_i=threat_agg)
-    eq = evidence_quality(evs, cs)
-    ac = assess_confidence(threat_dim, infra_dim, dc, cov, eq, cs)
-    fa = final_assess(threat_dim, infra_dim, dc, cov, ac, cs, anycast)
+        threat_dim = threat_score([e for e in evs if e.data_type == "threat"],
+                                  phase_i=threat_agg)
+        infra_dim = infra_risk(ip, trusted, evs)
+        dc = _data_confidence_legacy(evs, trusted, cs, None)
+        cov = coverage({}, phase_i=threat_agg)
+        eq = evidence_quality(evs, cs)
+        ac = assess_confidence(threat_dim, infra_dim, dc, cov, eq, cs)
+        fa = final_assess(threat_dim, infra_dim, dc, cov, ac, cs, anycast)
 
-    ents = build_entities(evs, ip)
-    rels = build_rels(ents, evs, ip)
-    ni = network_intel(ip, domain, evs, trusted, cert_ci)
+        ents = build_entities(evs, ip)
+        rels = build_rels(ents, evs, ip)
+        ni = network_intel(ip, domain, evs, trusted, cert_ci)
+    except Exception as e:
+        # A failure here would previously abort the entire scan before any
+        # report existed. Degrade to the seeded defaults and carry on.
+        log.debug(f"core scoring: {e}")
+        _record_stage_failure(out, STAGE_CORE, e)
 
     # Stage 7: Certificate Intelligence 2.0 — v34 (single source of truth)
     progress.next("03/13 Certificate")
@@ -14277,6 +19160,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         cert_intel = certificate_intelligence(target, CFG)
     except Exception as e:
         log.debug(f"certificate intelligence: {e}")
+        _record_stage_failure(out, STAGE_CERT, e)
         cert_intel = {"live_certificate": None, "ct_certificates": [],
                       "correlation": {}, "metadata": [], "relationships": {},
                       "anomalies": [], "summary": {}}
@@ -14301,6 +19185,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         pdns_intel = passive_dns_intelligence(target, CFG)
     except Exception as e:
         log.debug(f"passive dns intelligence: {e}")
+        _record_stage_failure(out, STAGE_PDNS, e)
         pdns_intel = {"evidence": [], "timeline": [],
                       "stats": {"total_domains": 0, "active_count": 0,
                                 "historical_count": 0, "unknown_count": 0,
@@ -14318,17 +19203,60 @@ def recon(target, enable_db=True, parallel=None, progress=None):
                       "related_domains": [], "anomalies": [], "summary": {}}
 
     # Stage 6: Infrastructure Intelligence — v33.1
+    #
+    # Stage H1: infra_profile() and the Passive OSINT enrichment below it
+    # are independent (infra reads target/config only and writes
+    # out["infrastructure_intelligence"]; enrichment reads evs/trusted
+    # and writes ni[...] keys), so they run concurrently -- bounded by
+    # the slower instead of the sum. Either may still fail soft exactly
+    # as before; failures rejoin in fixed order.
     progress.next("05/13 Infrastructure")
+    _infra_future = None
+    _infra_ex = None
     try:
-        infra = infra_profile(target, CFG)
-        out["infrastructure_intelligence"] = infra
+        _infra_ex = ThreadPoolExecutor(max_workers=1,
+                                       thread_name_prefix="reconip-infra")
+        _infra_future = _infra_ex.submit(infra_profile, target, CFG)
     except Exception as e:
-        log.debug(f"infra profile: {e}")
+        log.debug(f"infra submit: {e}")
+        _record_stage_failure(out, STAGE_INFRA, e)
         out["infrastructure_intelligence"] = {"status": "FAILED", "reason": str(e), "ip": ip}
+        _infra_ex = None
 
     # Passive OSINT enrichment (v21.2) — B4 fix with public resolver / anycast check
+    #
+    # Stage H1: the three enrichment fetches are independent HTTP calls,
+    # so they run concurrently (one worker each) instead of stacking
+    # their timeouts. Results rejoin by key, and the downstream
+    # anycast-filter + normalize steps run exactly as before on the
+    # joined values. A hung enrichment source is bounded by its own
+    # HTTP timeout, not by the sum of all three.
+    #
+    # Runs concurrently with the infra_profile() future above.
     try:
-        rev_raw = PassiveOSINT.hackertarget_reverse_ip(ip)
+        def _fetch_osint(kind, ip):
+            try:
+                if kind == "rev":
+                    return PassiveOSINT.hackertarget_reverse_ip(ip)
+                if kind == "otx":
+                    return PassiveOSINT.otx_passive_dns(ip)
+                return PassiveOSINT.internetdb(ip)
+            except Exception:
+                return [] if kind != "idb" else {}
+        osint_results: Dict[str, Any] = {}
+        with ThreadPoolExecutor(max_workers=3,
+                                thread_name_prefix="reconip-osint") as _osint_ex:
+            _osint_futures = {
+                _osint_ex.submit(_fetch_osint, kind, ip): kind
+                for kind in ("rev", "otx", "idb")
+            }
+            for _fut in as_completed(_osint_futures):
+                _kind = _osint_futures[_fut]
+                try:
+                    osint_results[_kind] = _fut.result()
+                except Exception:
+                    osint_results[_kind] = [] if _kind != "idb" else {}
+        rev_raw = osint_results.get("rev", [])
         # Determine ASN for anycast check
         asn_val = ""
         try:
@@ -14342,18 +19270,34 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         rev_filtered, rev_note = filter_reverse_ip(rev_raw or [], ip, CFG.get("public_resolvers"), CFG.get("anycast_asns"), asn_val)
         rev = rev_filtered
         ni["reverse_ip_note"] = rev_note
-        otx_pd_raw = PassiveOSINT.otx_passive_dns(ip)
+        otx_pd_raw = osint_results.get("otx", [])
         # B2: normalize OTX results immediately to avoid identical date bug
         otx_pd = normalize_passive_dns(otx_pd_raw) if otx_pd_raw else []
-        idb = PassiveOSINT.internetdb(ip)
+        idb = osint_results.get("idb", {}) or {}
         ni["reverse_ip"] = rev
         ni["passive_dns_otx"] = otx_pd
         ni["internetdb"] = idb
     except Exception as e:
         log.debug(f"passive osint: {e}")
+        _record_stage_failure(out, STAGE_INFRA, e)
         ni["reverse_ip"] = []
         ni["passive_dns_otx"] = []
         ni["internetdb"] = {}
+
+    # Rejoin the infrastructure future (Stage H1 concurrency above).
+    if _infra_future is not None:
+        try:
+            infra = _infra_future.result()
+            out["infrastructure_intelligence"] = infra
+        except Exception as e:
+            log.debug(f"infra profile: {e}")
+            _record_stage_failure(out, STAGE_INFRA, e)
+            out["infrastructure_intelligence"] = {"status": "FAILED", "reason": str(e), "ip": ip}
+        finally:
+            try:
+                _infra_ex.shutdown(wait=False)
+            except Exception:
+                pass
 
     # PHASE 2 — Deep OSINT (v21.3)
     try:
@@ -14384,6 +19328,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
 
     except Exception as e:
         log.debug(f"phase2: {e}")
+        _record_stage_failure(out, STAGE_INFRA, e)
         ni.setdefault("subdomains", {"subdomains": [], "sources": {}, "total": 0})
         ni.setdefault("typosquatting", [])
         ni.setdefault("ct_deep", {})
@@ -14401,6 +19346,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
             asn_nums)
     except Exception as e:
         log.debug(f"phase3: {e}")
+        _record_stage_failure(out, STAGE_INFRA, e)
         out["phase3"] = {"enabled": False, "error": str(e)}
 
     # Stage 2: Evidence Engine — build traceable evidence store (v31)
@@ -14465,6 +19411,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
                 evidence_store.setdefault(ev.source, []).append(ev.to_dict())
     except Exception as e:
         log.debug(f"threat evidence: {e}")
+        _record_stage_failure(out, STAGE_THREAT, e)
         pass
     # Stage 3: merge new provider evidences (v32) — reliability, error_rate, confidence
     try:
@@ -14475,38 +19422,101 @@ def recon(target, enable_db=True, parallel=None, progress=None):
                 evidence_store.setdefault(ev.source, []).append(ev.to_dict())
     except Exception as e:
         log.debug(f"stage3 merge: {e}")
+        _record_stage_failure(out, STAGE_THREAT, e)
         pass
     # Stage 2: ensure every field traceable — add evidence_engine and keep legacy evidence for compat
-    out.update({
-        "anycast": anycast,
-        "evidence": evidence_flat,  # v31 Evidence objects (source, timestamp, value, normalized_value, confidence, freshness, status, metadata)
-        "evidence_legacy": [e.to_dict() if hasattr(e, 'to_dict') else str(e) for e in evs],
-        "evidence_engine": evidence_store,
-        "conflicts": [asdict(c) for c in cs],
-        "trusted": {k: asdict(v) for k, v in trusted.items()},
-        "entities": [asdict(e) for e in ents.values()],
-        "relationships": [asdict(r) for r in rels],
-        "network_intelligence": ni,
-        "certificate_intelligence": _merged_cert_intel,
-        "passive_dns_intelligence": pdns_intel,
-        "phase_b": {
-            "threat": {"score": threat_dim.score,
-                       "classification": threat_dim.classification,
-                       "factors": [asdict(f) for f in threat_dim.factors]},
-            "infrastructure": {"score": infra_dim.score,
-                                "classification": infra_dim.classification,
-                                "factors": [asdict(f) for f in infra_dim.factors]},
-            "data_confidence": {"score": dc.score,
-                                 "classification": dc.classification,
-                                 "factors": [asdict(f) for f in dc.factors]},
-            "coverage": cov,
-            "evidence_quality": {"score": eq.score,
-                                  "classification": eq.classification},
-            "assessment_confidence": ac,
-            "final_assessment": fa,
-        },
-        "execution_time": round(time.time() - t0, 2),
-    })
+    # Stage G1: this block performs ~8 asdict()/to_dict() conversions over
+    # attacker-influenced data. One non-dataclass anywhere here used to
+    # abort the scan after all collection had completed. Degrade instead.
+    try:
+        out.update({
+            "anycast": anycast,
+            "evidence": evidence_flat,  # v31 Evidence objects (source, timestamp, value, normalized_value, confidence, freshness, status, metadata)
+            "evidence_legacy": [e.to_dict() if hasattr(e, 'to_dict') else str(e) for e in evs],
+            "evidence_engine": evidence_store,
+            "conflicts": [asdict(c) for c in cs],
+            "trusted": {k: asdict(v) for k, v in trusted.items()},
+            "entities": [asdict(e) for e in ents.values()],
+            "relationships": [asdict(r) for r in rels],
+            "network_intelligence": ni,
+            "certificate_intelligence": _merged_cert_intel,
+            "passive_dns_intelligence": pdns_intel,
+            "phase_b": {
+                "threat": {"score": threat_dim.score,
+                           "classification": threat_dim.classification,
+                           "factors": [asdict(f) for f in threat_dim.factors]},
+                "infrastructure": {"score": infra_dim.score,
+                                    "classification": infra_dim.classification,
+                                    "factors": [asdict(f) for f in infra_dim.factors]},
+                "data_confidence": {"score": dc.score,
+                                     "classification": dc.classification,
+                                     "factors": [asdict(f) for f in dc.factors]},
+                "coverage": cov,
+                "evidence_quality": {"score": eq.score,
+                                      "classification": eq.classification},
+                "assessment_confidence": ac,
+                "final_assessment": fa,
+            },
+            "execution_time": round(time.time() - t0, 2),
+        })
+    except Exception as e:
+        log.debug(f"phase_b assembly: {e}")
+        _record_stage_failure(out, STAGE_CORE, e)
+        # Minimal, schema-preserving fallback: keep the keys downstream
+        # stages and the report generator read, with neutral values.
+        try:
+            out.setdefault("anycast", anycast)
+            out["evidence"] = evidence_flat
+            out["evidence_legacy"] = [e.to_dict() if hasattr(e, "to_dict") else str(e)
+                                      for e in evs]
+            out["evidence_engine"] = evidence_store
+            out["conflicts"] = []
+            out["trusted"] = {}
+            out["entities"] = []
+            out["relationships"] = []
+            out["network_intelligence"] = ni if isinstance(ni, dict) else {}
+            out.setdefault("certificate_intelligence", _merged_cert_intel)
+            out.setdefault("passive_dns_intelligence", pdns_intel)
+            out["phase_b"] = {
+                "threat": {"score": threat_dim.score,
+                           "classification": threat_dim.classification,
+                           "factors": [asdict(f) for f in threat_dim.factors]},
+                "infrastructure": {"score": infra_dim.score,
+                                   "classification": infra_dim.classification,
+                                   "factors": [asdict(f) for f in infra_dim.factors]},
+                "data_confidence": {"score": dc.score,
+                                    "classification": dc.classification,
+                                    "factors": [asdict(f) for f in dc.factors]},
+                "coverage": cov,
+                "evidence_quality": {"score": eq.score,
+                                      "classification": eq.classification},
+                "assessment_confidence": ac,
+                "final_assessment": fa,
+            }
+            out["execution_time"] = round(time.time() - t0, 2)
+        except Exception:
+            pass
+
+    # Stage J1: subdomain enumeration. Runs after phase_b assembly
+    # (all intel sections present on both the main and fallback paths)
+    # and before history snapshotting. Stores into dns_intelligence
+    # for the section-05 passthrough. Enrichment-grade: any fault
+    # yields the zero shape with a debug line, never a stage failure
+    # (a wordlist timeout must not fail a scan).
+    try:
+        _subenum = enumerate_subdomains_full(target, out, CFG)
+        if not isinstance(_subenum, dict):
+            _subenum = {"total": 0, "sources": {},
+                        "interesting": [], "details": []}
+    except Exception as _e:
+        log.debug(f"subdomain enumeration: {_e}")
+        _subenum = {"total": 0, "sources": {},
+                    "interesting": [], "details": []}
+    try:
+        if isinstance(out.get("dns_intelligence"), dict):
+            out["dns_intelligence"]["subdomains_enum"] = _subenum
+    except Exception:
+        pass
 
     # Stage 9: Historical Intelligence — v35 (single source of truth)
     progress.next("06/13 History")
@@ -14515,6 +19525,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         history_intel = historical_intelligence(target, out, CFG)
     except Exception as e:
         log.debug(f"historical intelligence: {e}")
+        _record_stage_failure(out, STAGE_HISTORY, e)
         history_intel = {"enabled": True, "status": "ERROR",
                          "message": str(e), "changes": [], "total_changes": 0}
     if not isinstance(history_intel, dict):
@@ -14529,6 +19540,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         correlation = correlate([out], [target], CFG)
     except Exception as e:
         log.debug(f"correlation engine: {e}")
+        _record_stage_failure(out, STAGE_CORRELATION, e)
         correlation = {"enabled": True, "graph": {"nodes": [], "edges": [], "index": {}, "stats": {}},
                        "shared": {}, "related_targets": [], "notes": [], "summary": {}}
     if not isinstance(correlation, dict):
@@ -14543,6 +19555,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         as_intel = attack_surface(target, out, CFG)
     except Exception as e:
         log.debug(f"attack surface: {e}")
+        _record_stage_failure(out, STAGE_ATTACK_SURFACE, e)
         as_intel = {"enabled": True, "services": [], "service_count": 0,
                     "sensitive_services": [], "sensitive_count": 0,
                     "by_protocol": {}, "by_service": {}, "ports": [],
@@ -14565,6 +19578,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         tech_intel = technology_intelligence(out, CFG)
     except Exception as e:
         log.debug(f"technology intelligence: {e}")
+        _record_stage_failure(out, STAGE_TECHNOLOGY, e)
         tech_intel = {"enabled": True, "results": [], "by_class": {},
                       "summary": {"services_analyzed": 0, "technologies_identified": 0,
                                   "ok": 0, "insufficient_evidence": 0, "unknown": 0,
@@ -14583,6 +19597,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         vuln_intel = vulnerability_candidates(out, CFG)
     except Exception as e:
         log.debug(f"vulnerability intelligence: {e}")
+        _record_stage_failure(out, STAGE_VULNERABILITY, e)
         vuln_intel = {"enabled": True, "candidates": [], "cpes_built": [],
                       "summary": {"technologies_analyzed": 0, "cpes_built": 0,
                                   "candidates": 0,
@@ -14609,6 +19624,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         anomaly_intel = anomaly_report(out, CFG)
     except Exception as e:
         log.debug(f"anomaly engine: {e}")
+        _record_stage_failure(out, STAGE_ANOMALY, e)
         anomaly_intel = {"enabled": True, "checks_executed": [],
                          "checks_executed_count": 0, "total_anomalies": 0,
                          "by_severity": {}, "by_category": {}, "anomalies": [],
@@ -14627,6 +19643,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         confidence = confidence_engine(out, CFG)
     except Exception as e:
         log.debug(f"confidence engine: {e}")
+        _record_stage_failure(out, STAGE_CONFIDENCE, e)
         confidence = {"enabled": False, "error": str(e)}
     if not isinstance(confidence, dict):
         confidence = {"enabled": False, "error": "invalid result"}
@@ -14646,6 +19663,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         scoring = compute_scores(out, CFG)
     except Exception as e:
         log.debug(f"scoring engine: {e}")
+        _record_stage_failure(out, STAGE_SCORING, e)
         scoring = {"enabled": False, "error": str(e)}
     if not isinstance(scoring, dict):
         scoring = {"enabled": False, "error": "invalid result"}
@@ -14656,6 +19674,7 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         out["cache_intelligence"] = _section_cache(out, CFG)
     except Exception as e:
         log.debug(f"cache intelligence: {e}")
+        _record_stage_failure(out, STAGE_CORE, e)
         out["cache_intelligence"] = {"enabled": False, "error": str(e)}
 
     # Stage 17: Final Intelligence Report — v42 (18 sections + exports)
@@ -14665,11 +19684,13 @@ def recon(target, enable_db=True, parallel=None, progress=None):
         final_report = generate_report(target, out, CFG)
     except Exception as e:
         log.debug(f"report generation: {e}")
+        _record_stage_failure(out, STAGE_REPORT, e)
         final_report = {"metadata": _report_metadata(target, CFG), "error": str(e)}
     try:
         export_paths = export_all(final_report, CFG)
     except Exception as e:
         log.debug(f"report export: {e}")
+        _record_stage_failure(out, STAGE_REPORT, e)
         export_paths = {}
     out["final_report"] = final_report
     out["export_paths"] = export_paths
@@ -14704,6 +19725,28 @@ def recon(target, enable_db=True, parallel=None, progress=None):
                 log.error(f"persist: {e}")
         except Exception as e:
             log.error(f"db outer: {e}")
+    # Stage G1: surface degradation once, at a level the operator sees.
+    # A partial scan must never look like a clean one.
+    try:
+        _nfail = _stage_failure_count(out)
+        if _nfail:
+            _stages = sorted({str(f.get("stage", "?")) for f in out.get("_stage_failures", [])
+                              if isinstance(f, dict)})
+            log.warning(
+                f"Scan completed with {_nfail} section failure(s) "
+                f"({len(_stages)} distinct stage(s)): {', '.join(_stages)}. "
+                f"Report generated from the sections that succeeded; "
+                f"see _stage_failures in the JSON output."
+            )
+    except Exception:
+        pass
+    # Phase K4: observability — record the finished scan (counters only,
+    # never affects the result). Covers CLI, batch, watch, schedule and
+    # API jobs: recon() is the single choke point.
+    try:
+        metrics_record_scan(out)
+    except Exception:
+        pass
     return out
 
 # ============================================================
@@ -14798,6 +19841,25 @@ class APIHandler(BaseHTTPRequestHandler):
                                              for n, h in _health.items()}})
                 return
             if method == "GET" and path == "/metrics":
+                # Phase K4: Prometheus exposition when asked for text,
+                # legacy JSON otherwise (backward compatible).
+                try:
+                    _accept = s.headers.get("Accept", "") or ""
+                except Exception:
+                    _accept = ""
+                if "text/plain" in _accept:
+                    try:
+                        _body = render_prometheus().encode()
+                    except Exception:
+                        _body = b"# no metrics\n"
+                    s.send_response(200)
+                    s.send_header("Content-Type",
+                                  "text/plain; version=0.0.4")
+                    s.send_header("Content-Length", str(len(_body)))
+                    s.send_header("X-Content-Type-Options", "nosniff")
+                    s.end_headers()
+                    s.wfile.write(_body)
+                    return
                 s._send(200, {"jobs": len(JOBS),
                               "cache": CACHE.stats() if CACHE else {},
                               "providers": len(_health)})
@@ -14817,20 +19879,50 @@ class APIHandler(BaseHTTPRequestHandler):
                 if length > PN["max_body_bytes"]:
                     s._send(413, {"error": {"code": "too_large"}}); return
                 body = json.loads(s.rfile.read(length).decode() or "{}")
-                if "target" in body:
-                    t, _ = validate_target(body["target"],
-                                            allow_private=PN["allow_private_targets"])
-                    jid = spawn_job(t)
-                    s._send(202, {"job_id": jid}); return
-                if "targets" in body:
-                    if len(body["targets"]) > PN["max_batch"]:
-                        s._send(400, {"error": {"code": "batch_too_large"}}); return
-                    ids = [spawn_job(validate_target(
-                        t, allow_private=PN["allow_private_targets"])[0])
-                        for t in body["targets"]]
-                    s._send(202, {"job_ids": ids, "count": len(ids)}); return
+                # Phase K1: invalid targets are a 400 (client error), not a
+                # 500 — a SOC caller must be able to tell them apart.
+                try:
+                    if "target" in body:
+                        t, _ = validate_target(body["target"],
+                                                allow_private=PN["allow_private_targets"])
+                        jid = spawn_job(t)
+                        s._send(202, {"job_id": jid}); return
+                    if "targets" in body:
+                        if len(body["targets"]) > PN["max_batch"]:
+                            s._send(400, {"error": {"code": "batch_too_large"}}); return
+                        ids = [spawn_job(validate_target(
+                            t, allow_private=PN["allow_private_targets"])[0])
+                            for t in body["targets"]]
+                        s._send(202, {"job_ids": ids, "count": len(ids)}); return
+                except (SecurityError, ValueError) as _ve:
+                    s._send(400, {"error": {"code": "invalid_target",
+                                            "message": str(_ve)}}); return
                 s._send(400, {"error": {"code": "invalid_request"}}); return
             if method == "GET" and path.startswith("/scan/"):
+                # Phase K1: GET /scan/{id}/report — full scan report.
+                # Returns the final report plus export paths when the job
+                # is COMPLETED, the job state otherwise, 404 when unknown.
+                rest = path[len("/scan/"):].strip("/")
+                parts = rest.split("/")
+                if len(parts) == 2 and parts[1] == "report":
+                    jid = parts[0]
+                    with JOBS_LOCK:
+                        j = JOBS.get(jid)
+                        if not j:
+                            s._send(404, {"error": {"code": "not_found"}}); return
+                        resp = {"job_id": jid,
+                                "state": j.get("state"),
+                                "target": j.get("target"),
+                                "started_at": j.get("started_at"),
+                                "finished_at": j.get("finished_at"),
+                                "error": j.get("error"),
+                                "report": None,
+                                "export_paths": None}
+                        if j.get("state") == "COMPLETED" and isinstance(
+                                j.get("result"), dict):
+                            resp["report"] = j["result"].get("final_report")
+                            resp["export_paths"] = j["result"].get("export_paths")
+                    s._send(200, resp); return
                 jid = path.split("/")[-1]
                 with JOBS_LOCK:
                     j = JOBS.get(jid)
@@ -14860,6 +19952,67 @@ def start_api(host=None, port=None):
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     log.info(f"API on http://{h}:{p}")
     return httpd
+
+
+# ============================================================
+#  SERVER MODE — Phase K1 (SOC-ready HTTP service)
+#  `python3 reconip.py --server --port 8080`
+#  Endpoints: POST /scan, GET /scan/{id}, GET /scan/{id}/report,
+#  GET /health (+ /metrics, /providers). Auth and rate limiting
+#  reuse phase_m, exactly like the legacy --api engine.
+# ============================================================
+def run_server_mode(args: argparse.Namespace,
+                    config: Dict[str, Any]) -> int:
+    """Start the HTTP server and block until interrupted. Never raises."""
+    try:
+        host = (getattr(args, "host", None)
+                or getattr(args, "api_host", None)
+                or PM.get("host", "127.0.0.1"))
+    except Exception:
+        host = "127.0.0.1"
+    try:
+        port = (getattr(args, "port", None)
+                or getattr(args, "api_port", None)
+                or PM.get("port", 8787))
+        port = int(port)
+    except Exception:
+        port = 8787
+    # SOC footgun guard: with require_auth and no tokens every request
+    # is a 401. Warn loudly instead of serving a dead endpoint, but
+    # keep serving — the operator may be mounting tokens mid-run.
+    try:
+        if PM.get("require_auth", True) and not _resolve_tokens():
+            env_var = PM.get("token_env_var", "RECONIP_API_TOKEN")
+            log.warning(
+                f"Server auth is ON but no tokens are configured "
+                f"(env {env_var} empty, phase_m.tokens empty). "
+                f"All requests will return 401 until a token is set, "
+                f"or set phase_m.require_auth: false for open access.")
+    except Exception:
+        pass
+    try:
+        httpd = start_api(host, port)
+    except OSError as e:
+        print(f"Error: cannot bind {host}:{port}: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Error: server failed to start: {e}", file=sys.stderr)
+        return 1
+    print(f"{C.OK}API running on "
+          f"http://{httpd.server_address[0]}:{httpd.server_address[1]}{C.RST}")
+    print("Endpoints: POST /scan | GET /scan/{id} | "
+          "GET /scan/{id}/report | GET /health")
+    print("Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    try:
+        httpd.shutdown()
+    except Exception:
+        pass
+    return 0
 
 # ============================================================
 #  PROFESSIONAL TEXT RENDERER (v21.3 — with Phase 2 sections)
@@ -16136,16 +21289,25 @@ def _setup_logging(config: Dict[str, Any]) -> None:
         if _RICH_AVAILABLE and _RICH_LOG_AVAILABLE and display_enabled:
             # RichHandler with its own (stderr) console: logs stay off
             # stdout, which is reserved for machine-readable output.
+            # The console= argument is what actually delivers stderr --
+            # RichHandler's default Console writes to stdout, so `-o json`
+            # was unparseable (a WARNING line preceded the JSON object).
             # show_path MUST stay False: internal file paths are not
             # operator information. No custom formatter: RichHandler
             # renders [LEVEL] + message; file handler keeps the full
             # timestamped format with secret redaction.
+            try:
+                _log_console = Console(stderr=True, force_terminal=None,
+                                       soft_wrap=False)
+            except Exception:
+                _log_console = None
             console_handler = RichHandler(
                 show_time=False,
                 show_level=True,
                 show_path=False,
                 markup=False,
                 rich_tracebacks=False,
+                console=_log_console,
             )
         else:
             # Plain fallback: stderr, one line per record.
@@ -16770,7 +21932,15 @@ def _score_bar(value: float, config: Dict[str, Any],
 
 
 def _score_style(value: float, config: Dict[str, Any]) -> str:
-    """Severity color for a 0–100 score (Stage B3)."""
+    """
+    Severity color for a 0–100 score (Stage B3, semantics v53.1).
+
+    Semantic mapping (display-only; thresholds unchanged):
+      >= 80 danger (red)     — VERY_HIGH / CRITICAL
+      >= 60 danger (red)     — HIGH
+      >= 40 warning (yellow) — MODERATE
+      else  success (green)  — LOW / VERY_LOW (low risk = safe)
+    """
     palette = Palette(config)
     try:
         v = float(value)
@@ -16779,14 +21949,20 @@ def _score_style(value: float, config: Dict[str, Any]) -> str:
     if v >= 80:
         return palette.get("danger")
     if v >= 60:
-        return palette.get("warning")
+        return palette.get("danger")
     if v >= 40:
-        return palette.get("primary")
-    return palette.get("muted")
+        return palette.get("warning")
+    return palette.get("success")
 
 
 def _score_label_from_value(value: float, config: Dict[str, Any]) -> "Text":
-    """Severity label for a 0–100 score (Stage B3)."""
+    """
+    Severity label for a 0–100 score (Stage B3, semantics v53.1).
+
+    Display-only: thresholds unchanged (80/60/40/20).
+    Colors follow the semantic system — green LOW, yellow MODERATE,
+    red HIGH/VERY_HIGH. UNKNOWN stays dim, never green.
+    """
     palette = Palette(config)
     try:
         v = float(value)
@@ -16795,18 +21971,23 @@ def _score_label_from_value(value: float, config: Dict[str, Any]) -> "Text":
     if v >= 80:
         label, color = "VERY_HIGH", palette.get("danger")
     elif v >= 60:
-        label, color = "HIGH", palette.get("warning")
+        label, color = "HIGH", palette.get("danger")
     elif v >= 40:
-        label, color = "MODERATE", palette.get("primary")
+        label, color = "MODERATE", palette.get("warning")
     elif v >= 20:
-        label, color = "LOW", palette.get("muted")
+        label, color = "LOW", palette.get("success")
     else:
-        label, color = "VERY_LOW", palette.get("muted")
+        label, color = "VERY_LOW", palette.get("success")
     return Text(label, style=color)
 
 
 def _assessment_style(label: Any, config: Dict[str, Any]) -> str:
-    """Style for an assessment confidence label (Stage B3)."""
+    """
+    Style for an assessment confidence label (Stage B3, semantics v53.1).
+
+    Confidence is a self-assessment, not a severity: VERY_LOW means
+    "uncertain", not "dangerous", so it renders dim — never red.
+    """
     palette = Palette(config)
     if not isinstance(label, str):
         return palette.get("muted")
@@ -16818,7 +21999,7 @@ def _assessment_style(label: Any, config: Dict[str, Any]) -> str:
     if ll == "LOW":
         return palette.get("muted")
     if ll == "VERY_LOW":
-        return palette.get("danger")
+        return palette.get("muted")
     return palette.get("muted")
 
 
@@ -16892,9 +22073,60 @@ def _render_02_executive_summary(report, config):
         body.add_row(Text(""))
         body.add_row(score_table)
         body.add_row(Text(""))
+        # ---- Anomalies + action (derived live from the report, never hardcoded) ----
+        try:
+            _an = (report.get("14_anomalies", {}) or {}) if isinstance(report, dict) else {}
+            _by_sev = (_an.get("by_severity", {}) or {}) if isinstance(_an, dict) else {}
+            if not isinstance(_by_sev, dict):
+                _by_sev = {}
+            _n_high = int(_by_sev.get("HIGH", 0) or 0)
+            _n_mod = int(_by_sev.get("MODERATE", 0) or 0)
+            _n_low = int(_by_sev.get("LOW", 0) or 0)
+        except Exception:
+            _n_high = _n_mod = _n_low = 0
+        try:
+            _threat_v = float(scores.get("threat", 0) or 0)
+        except Exception:
+            _threat_v = 0.0
+        try:
+            _exposure_v = float(scores.get("exposure", 0) or 0)
+        except Exception:
+            _exposure_v = 0.0
+        _anomaly_line = Text.assemble(
+            ("Anomalies  ", palette.get("muted")),
+            (str(_n_high), _sev_style("high", config)),
+            (" HIGH / ", palette.get("muted")),
+            (str(_n_mod), _sev_style("moderate", config)),
+            (" MODERATE / ", palette.get("muted")),
+            (str(_n_low), _sev_style("low", config)),
+            (" LOW", palette.get("muted")),
+        )
+        body.add_row(_anomaly_line)
+        # Action is a display hint derived from live values, not a verdict.
+        if _n_high > 0 or _threat_v >= 60 or _exposure_v >= 60:
+            _action = Text.assemble(
+                ("ACTION  ", palette.get("muted")),
+                ("\u2192 Manual review recommended", palette.get("warning")),
+            )
+        elif _n_mod > 0 or _threat_v >= 40 or _exposure_v >= 40:
+            _action = Text.assemble(
+                ("ACTION  ", palette.get("muted")),
+                ("\u2192 Validate in context", palette.get("highlight")),
+            )
+        else:
+            _action = Text.assemble(
+                ("ACTION  ", palette.get("muted")),
+                ("\u2192 No immediate action \u2014 validate in context", palette.get("muted")),
+            )
+        body.add_row(_action)
+        body.add_row(Text(""))
         body.add_row(Text.assemble(
             ("▸ ", palette.get("accent")),
             (str(headline), palette.get("highlight")),
+        ))
+        body.add_row(Text(
+            "Score \u2260 verdict. Confidence \u2260 accuracy. UNKNOWN \u2260 SAFE.",
+            style=palette.get("muted"),
         ))
 
         return section(2, "EXECUTIVE SUMMARY", body, config)
@@ -17454,7 +22686,12 @@ def _render_07_passive_dns(report, config):
 
 
 def _sev_style(sev: Any, config: Dict[str, Any]) -> str:
-    """Severity color for a change severity (Stage B4)."""
+    """
+    Severity color for a change severity (Stage B4, semantics v53.1).
+
+    Semantic system: red critical/high, yellow moderate, green low,
+    dim informational/unknown. Display-only; severities unchanged.
+    """
     palette = Palette(config)
     s = str(sev).lower()
     if s == "critical":
@@ -17464,7 +22701,7 @@ def _sev_style(sev: Any, config: Dict[str, Any]) -> str:
     if s == "moderate":
         return palette.get("warning")
     if s == "low":
-        return palette.get("muted")
+        return palette.get("success")
     return palette.get("muted")
 
 
@@ -17579,6 +22816,36 @@ def _render_08_history(report, config):
         else:
             body.add_row(Text("No changes detected since previous snapshot.",
                               style=palette.get("success")))
+
+        # ---- Evolution timeline (Stage J2) ----
+        try:
+            timeline = hist.get("timeline", []) or []
+            if not isinstance(timeline, list):
+                timeline = []
+            timeline = [e for e in timeline if isinstance(e, dict)]
+        except Exception:
+            timeline = []
+        if timeline:
+            body.add_row(Text(""))
+            body.add_row(Text("Evolution timeline",
+                              style=palette.get("highlight")))
+            for ev in timeline[-15:]:
+                try:
+                    month = str(ev.get("event_date", "") or "")[:7]
+                    text = str(ev.get("event", "") or "")
+                except Exception:
+                    continue
+                if text:
+                    body.add_row(Text.assemble(
+                        (month + "  " if month else "", palette.get("muted")),
+                        (text, palette.get("value") or palette.get("highlight")),
+                    ))
+            if len(timeline) > 15:
+                body.add_row(Text(f"+{len(timeline) - 15} earlier events",
+                                  style=palette.get("muted")))
+        else:
+            body.add_row(Text("No infrastructure changes recorded yet.",
+                              style=palette.get("muted")))
 
         return section(8, "HISTORICAL INTELLIGENCE", body, config)
     except Exception as e:
@@ -17696,21 +22963,45 @@ def _render_09_threat(report, config):
             not_config = []
 
         if failed or not_config:
+            # Show names honestly: a failed provider is evidence of a gap,
+            # never silently counted. Names are display-only (report keeps detail).
+            def _names(items: Any, limit: int = 4) -> str:
+                try:
+                    vals = []
+                    for x in (items or []):
+                        if isinstance(x, dict):
+                            vals.append(str(x.get("source") or x.get("provider") or x))
+                        else:
+                            vals.append(str(x))
+                    vals = [v for v in vals if v and v != _MISSING]
+                    if not vals:
+                        return ""
+                    shown = ", ".join(vals[:limit])
+                    if len(vals) > limit:
+                        shown += f" (+{len(vals) - limit} more)"
+                    return f": {shown}"
+                except Exception:
+                    return ""
             failure_line = Text.assemble(
-                ("Failures  ", palette.get("muted")),
+                ("[!] ", palette.get("danger") if failed else palette.get("muted")),
                 (f"{len(failed)} failed", palette.get("danger") if failed else palette.get("muted")),
+                ((_names(failed), palette.get("muted"))),
                 ("   ", ""),
                 (f"{len(not_config)} not configured",
                  palette.get("warning") if not_config else palette.get("muted")),
-                ("   ", ""),
-                ("(absence of data ≠ absence of threat)",
-                 palette.get("muted")),
+                ((_names(not_config), palette.get("muted"))),
+            )
+            failure_note = Text(
+                "Provider failures remain part of the evidence/limitations model. "
+                "Absence of data \u2260 absence of threat.",
+                style=palette.get("muted"),
             )
         else:
             failure_line = Text.assemble(
                 ("Failures  ", palette.get("muted")),
-                ("none", palette.get("success")),
+                ("[\u2713] none", palette.get("success")),
             )
+            failure_note = Text("", style=palette.get("muted"))
 
         body = Table.grid(padding=(0, 0))
         body.add_column()
@@ -17718,6 +23009,8 @@ def _render_09_threat(report, config):
         body.add_row(Text(""))
         body.add_row(provider_table)
         body.add_row(failure_line)
+        if failed or not_config:
+            body.add_row(failure_note)
 
         return section(9, "THREAT INTELLIGENCE", body, config)
     except Exception as e:
@@ -18339,7 +23632,7 @@ def _render_14_anomalies(report, config):
         else:
             cat_line = Text("")
 
-        # ---- Anomaly table (top 10) ----
+        # ---- Anomaly table (top 10, full messages — never truncated) ----
         table = Table(
             show_header=True,
             header_style=palette.get("muted"),
@@ -18349,7 +23642,8 @@ def _render_14_anomalies(report, config):
         )
         table.add_column("Severity", no_wrap=True)
         table.add_column("Category", style=palette.get("muted"), no_wrap=True)
-        table.add_column("Message", style=palette.get("value") or "")
+        table.add_column("Message", style=palette.get("value") or "",
+                         no_wrap=False, overflow="fold", max_width=64)
         table.add_column("Conf", justify="right", no_wrap=True)
 
         for a in anomalies[:10]:
@@ -18362,9 +23656,9 @@ def _render_14_anomalies(report, config):
             except (TypeError, ValueError):
                 conf_s = _MISSING
             table.add_row(
-                Text(str(sev), style=_sev_style(str(sev).lower(), config)),
+                Text(f"[{str(sev)}]", style=_sev_style(str(sev).lower(), config)),
                 str(a.get("category", _MISSING)),
-                str(a.get("message", ""))[:80],
+                str(a.get("message", "") or _MISSING),
                 conf_s,
             )
 
@@ -18468,7 +23762,13 @@ def _render_15_evidence(report, config):
 def _style_label(label: Any, config: Dict[str, Any]) -> "Text":
     """
     Style a score label (VERY_LOW / LOW / MODERATE / HIGH / VERY_HIGH).
-    Accepts a plain label or an existing Text (Stage B5).
+    Accepts a plain label or an existing Text (Stage B5, semantics v53.1).
+
+    NOTE: the only caller is Section 16 (CONFIDENCE), where the label
+    describes confidence — not risk. Low confidence means "uncertain",
+    not "safe", so LOW/VERY_LOW render dim (neutral), never green.
+    Risk labels in Section 02 use _score_label_from_value (green LOW).
+    Display-only.
     """
     palette = Palette(config)
     try:
@@ -18478,11 +23778,9 @@ def _style_label(label: Any, config: Dict[str, Any]) -> "Text":
     if s == "VERY_HIGH":
         return Text(s, style=palette.get("danger"))
     if s == "HIGH":
-        return Text(s, style=palette.get("warning"))
+        return Text(s, style=palette.get("danger"))
     if s == "MODERATE":
-        return Text(s, style=palette.get("primary"))
-    if s == "LOW":
-        return Text(s, style=palette.get("muted"))
+        return Text(s, style=palette.get("warning"))
     return Text(s, style=palette.get("muted"))
 
 
@@ -18532,7 +23830,17 @@ def _render_16_confidence(report, config):
                 continue
             s = _to_float(score)
             value_0_100 = s * 100.0
-            bar = _score_bar(value_0_100, config)
+            # Neutral fill (not risk-colored): confidence measures how much
+            # the tool knows, not how dangerous the target is. Display-only.
+            try:
+                _v = max(0.0, min(100.0, float(value_0_100)))
+            except Exception:
+                _v = 0.0
+            _filled = max(0, min(10, int(round(_v / 100.0 * 10))))
+            bar = Text.assemble(
+                ("\u2588" * _filled, palette.get("primary")),
+                ("\u2591" * (10 - _filled), palette.get("muted")),
+            )
             lbl = entry.get("label") or _score_label_from_value(value_0_100, config)
             table.add_row(label, f"{s:.2f}", bar, _style_label(lbl, config))
 
@@ -18788,6 +24096,13 @@ def _render_banner(config: Dict[str, Any]) -> Optional["Panel"]:
 
         tagline_plain = f"{tagline}  •  {version}"
         short_plain = f"{tool_name}  •  {version}"
+        try:
+            _sig = (identity.get("operator_signature")
+                    or DEFAULT_SIGNATURE)
+        except Exception:
+            _sig = DEFAULT_SIGNATURE
+        if not str(_sig or "").strip():
+            _sig = DEFAULT_SIGNATURE
 
         # Total content width decides the layout. The tagline counts:
         # a fitting art with a cropping tagline is still truncation.
@@ -18799,10 +24114,13 @@ def _render_banner(config: Dict[str, Any]) -> Optional["Panel"]:
                 (str(version), palette.get("highlight")),
             )
             tagline_text.no_wrap = True
+            sig_text = Text(str(_sig), style=palette.get("muted"))
+            sig_text.no_wrap = True
 
             content = Text.assemble(
                 art_text, "\n\n",
-                tagline_text,
+                tagline_text, "\n",
+                sig_text,
             )
             content.no_wrap = True
 
@@ -19065,19 +24383,22 @@ def _render_footer(config: Dict[str, Any]) -> Optional["Text"]:
             version = "v?"
         tagline = identity.get("tagline") or DEFAULT_TAGLINE
         operator_name = identity.get("operator_name")
-        operator_signature = identity.get("operator_signature")
+        try:
+            operator_signature = (identity.get("operator_signature")
+                                  or DEFAULT_SIGNATURE)
+        except Exception:
+            operator_signature = DEFAULT_SIGNATURE
+        if not str(operator_signature or "").strip():
+            operator_signature = DEFAULT_SIGNATURE
 
         parts: List[Tuple[str, str]] = []
-        parts.append((f"  {tool_name}", palette.get("accent")))
+        parts.append((f"  {tool_name} {version}", palette.get("highlight")))
         parts.append(("  •  ", palette.get("muted")))
-        parts.append((str(version), palette.get("highlight")))
+        parts.append((str(operator_signature), palette.get("accent")))
         parts.append(("  •  ", palette.get("muted")))
         parts.append((str(tagline), palette.get("muted")))
 
-        # Phase D will fill these in.
-        if operator_signature:
-            parts.append(("  •  ", palette.get("muted")))
-            parts.append((str(operator_signature), palette.get("primary")))
+        # Operator attribution only when explicitly configured (Phase D).
         if operator_name:
             parts.append(("  —  ", palette.get("muted")))
             parts.append((str(operator_name), palette.get("value") or ""))
@@ -19097,13 +24418,10 @@ def _render_footer(config: Dict[str, Any]) -> Optional["Text"]:
             _plain_len = 0
         if _plain_len > _fwidth:
             short_parts: List[Tuple[str, str]] = [
-                (f"  {tool_name}", palette.get("accent")),
+                (f"  {tool_name} {version}", palette.get("highlight")),
                 ("  •  ", palette.get("muted")),
-                (str(version), palette.get("highlight")),
+                (str(operator_signature), palette.get("accent")),
             ]
-            if operator_signature:
-                short_parts.append(("  •  ", palette.get("muted")))
-                short_parts.append((str(operator_signature), palette.get("primary")))
             if operator_name:
                 short_parts.append(("  —  ", palette.get("muted")))
                 short_parts.append((str(operator_name), palette.get("value") or ""))
@@ -19136,21 +24454,25 @@ def _render_reports_summary(paths: Dict[str, str],
             padding=(0, 1),
             expand=False,
         )
+        table.add_column("Status", no_wrap=True)
         table.add_column("Format", style=palette.get("accent"), no_wrap=True)
-        table.add_column("Path", style=palette.get("value") or "")
+        table.add_column("Path", style=palette.get("value") or "",
+                         no_wrap=False, overflow="fold")
 
         # Stable order
-        order = ["json", "html", "markdown", "csv", "stix", "misp"]
+        order = ["json", "html", "markdown", "csv", "stix", "misp",
+                 "sarif", "dot", "pdf"]
         seen = set()
+        ok_mark = Text("[\u2713]", style=palette.get("success"))
         for fmt in order:
             if fmt in paths:
-                table.add_row(fmt.upper(), str(paths[fmt]))
+                table.add_row(ok_mark, fmt.upper(), str(paths[fmt]))
                 seen.add(fmt)
         # Any remaining formats not in the canonical order
         for fmt, path in paths.items():
             if fmt in seen:
                 continue
-            table.add_row(str(fmt).upper(), str(path))
+            table.add_row(ok_mark, str(fmt).upper(), str(path))
 
         body = Table.grid(padding=(0, 0))
         body.add_column()
@@ -19466,6 +24788,209 @@ def test_providers(target: str, config: Dict[str, Any]) -> int:
     return 0 if failed == 0 else 2
 
 
+# ============================================================
+#  CACHE WARMING / PREFETCH / BENCHMARK (Stage H4, H5)
+# ============================================================
+_WARM_CACHE_LISTS = (
+    ("feodo", "https://feodotracker.abuse.ch/downloads/ipblocklist.json",
+     (3, 8), 1800),
+    ("sslbl", "https://sslbl.abuse.ch/blacklist/sslipblacklist.json",
+     (3, 8), 3600),
+    ("cins", "http://cinsscore.com/list/ci-badguys.txt",
+     (3, 8), 3600),
+    ("spamhaus_drop", "https://www.spamhaus.org/drop/drop.txt",
+     (3, 8), 3600),
+)
+
+
+def run_warm_cache(config: Dict[str, Any]) -> int:
+    """
+    Stage H4 --warm-cache: fetch the shared bulk blocklists into the
+    cache and exit. No target required: these lists are
+    target-independent, so one dummy execution warms every later scan.
+    Returns an exit code (0 = all warm, 2 = failures).
+    """
+    if not isinstance(config, dict):
+        config = {}
+    ok = failed = 0
+    for name, url, timeout, ttl in _WARM_CACHE_LISTS:
+        t0 = time.monotonic()
+        try:
+            try:
+                _hit = cache_get(f"blocklist:{name}", config)
+                was_cached = isinstance(_hit, dict) and _hit.get("status") == "FRESH"
+            except Exception:
+                was_cached = False
+            text = _fetch_blocklist(name, url, timeout, ttl)
+        except Exception as e:
+            print(f"[warm-cache] {name}: ERROR {e}")
+            failed += 1
+            continue
+        dt = time.monotonic() - t0
+        if text is None:
+            print(f"[warm-cache] {name}: FAILED ({dt:.1f}s)")
+            failed += 1
+        else:
+            ok += 1
+            print(f"[warm-cache] {name}: "
+                  f"{'cached' if was_cached else 'fetched'} "
+                  f"({dt:.1f}s, {len(text)} bytes)")
+    print(f"warm-cache: {ok} ok, {failed} failed")
+    return 0 if failed == 0 else 2
+
+
+def run_prefetch(targets: List[str], config: Dict[str, Any],
+                 args: Any = None) -> int:
+    """
+    Stage H4 --prefetch: run scans for the given targets to populate
+    caches, then exit. Each target goes through the normal recon()
+    pipeline -- caches, history and report files are produced exactly
+    as a scan would produce them; only display is suppressed.
+    Returns an exit code (0 = all ok, 2 = failures).
+    """
+    if not isinstance(config, dict):
+        config = {}
+    try:
+        wanted = load_targets(list(targets or []), None, config)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    if not wanted:
+        print("Error: --prefetch requires at least one target.",
+              file=sys.stderr)
+        return 1
+    ok = failed = 0
+    for target in wanted:
+        t0 = time.monotonic()
+        try:
+            res = recon(target)
+            dt = time.monotonic() - t0
+        except Exception as e:
+            print(f"[prefetch] {target}: ERROR {e}")
+            failed += 1
+            continue
+        if not isinstance(res, dict) or res.get("status") == "FAILED" \
+                or res.get("scan_status") == "FAILED":
+            print(f"[prefetch] {target}: FAILED ({dt:.1f}s)")
+            failed += 1
+        else:
+            ok += 1
+            print(f"[prefetch] {target}: ok ({dt:.1f}s)")
+    print(f"prefetch: {ok} ok, {failed} failed")
+    return 0 if failed == 0 else 2
+
+
+_BENCHMARK_FUNCS = (
+    ("01/13 DNS", "collect_dns"),
+    ("01/13 DNS", "dns_collect"),
+    ("02/13 Threat", "collect_threat"),
+    ("02/13 Threat", "run_providers"),
+    ("03/13 Certificate", "collect_certs"),
+    ("03/13 Certificate", "certificate_intelligence"),
+    ("04/13 Passive DNS", "passive_dns_intelligence"),
+    ("05/13 Infrastructure", "infra_profile"),
+    ("06/13 History", "historical_intelligence"),
+    ("07/13 Correlation", "correlate"),
+    ("08/13 Attack Surface", "attack_surface"),
+    ("09/13 Technology", "technology_intelligence"),
+    ("10/13 Vulnerability", "vulnerability_candidates"),
+    ("11/13 Anomaly", "anomaly_report"),
+    ("12/13 Confidence", "confidence_engine"),
+    ("13/13 Scoring", "compute_scores"),
+)
+
+
+def run_benchmark(target: str, config: Dict[str, Any], args: Any = None,
+                  iterations: int = 10) -> int:
+    """
+    Stage H5 --benchmark: run recon() N times with per-stage timing and
+    print min/max/avg/stddev for each stage plus the recon total.
+    Returns 0 (measurement never fails the run; stage faults are timed
+    like everything else).
+    """
+    import statistics as _statistics
+    if not isinstance(config, dict):
+        config = {}
+    try:
+        wanted = load_targets([target], None, config)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    if not wanted:
+        print("Error: --benchmark requires exactly one target.",
+              file=sys.stderr)
+        return 1
+    tgt = wanted[0]
+    try:
+        iters = max(1, int(iterations))
+    except Exception:
+        iters = 10
+    try:
+        _profile = ((config.get("_applied_profile", {}) or {})
+                    .get("name") or "default")
+    except Exception:
+        _profile = "default"
+    saved: Dict[str, Any] = {}
+    for _label, _fname in _BENCHMARK_FUNCS:
+        try:
+            _fn = globals().get(_fname)
+        except Exception:
+            _fn = None
+        if callable(_fn):
+            saved[_fname] = _fn
+    samples: Dict[str, List[float]] = {fname: [] for fname in saved}
+    totals: List[float] = []
+    try:
+        for _i in range(iters):
+            per: Dict[str, float] = {}
+            originals: Dict[str, Any] = {}
+            for fname, fn in saved.items():
+                def wrap(*a, _f=fn, _n=fname, **k):
+                    _t0 = time.monotonic()
+                    try:
+                        return _f(*a, **k)
+                    finally:
+                        per[_n] = per.get(_n, 0.0) + (time.monotonic() - _t0)
+                originals[fname] = fn
+                globals()[fname] = wrap
+            try:
+                _t0 = time.monotonic()
+                recon(tgt)
+                totals.append(time.monotonic() - _t0)
+            finally:
+                for fname, fn in originals.items():
+                    globals()[fname] = fn
+            for fname in saved:
+                samples[fname].append(per.get(fname, 0.0))
+    finally:
+        for fname, fn in saved.items():
+            try:
+                globals()[fname] = fn
+            except Exception:
+                pass
+    print(f"Benchmark: {tgt} x{iters} (profile: {_profile})")
+    print(f"{'stage':<24} {'step':<30} {'min':>8} {'max':>8} "
+          f"{'avg':>8} {'stddev':>8}  (seconds)")
+    for label, fname in _BENCHMARK_FUNCS:
+        if fname not in samples:
+            continue
+        vals = samples[fname] or [0.0]
+        mn = min(vals)
+        mx = max(vals)
+        avg = _statistics.mean(vals)
+        sd = _statistics.pstdev(vals) if len(vals) > 1 else 0.0
+        print(f"{label:<24} {fname:<30} {mn:8.3f} {mx:8.3f} "
+              f"{avg:8.3f} {sd:8.3f}")
+    if totals:
+        mn = min(totals)
+        mx = max(totals)
+        avg = _statistics.mean(totals)
+        sd = _statistics.pstdev(totals) if len(totals) > 1 else 0.0
+        print(f"{'total':<24} {'recon':<30} {mn:8.3f} {mx:8.3f} "
+              f"{avg:8.3f} {sd:8.3f}")
+    return 0
+
+
 def main() -> int:
     global INTEL_DB
     parser = build_parser()
@@ -19496,6 +25021,12 @@ def main() -> int:
             config.setdefault("display", {})["show_progress"] = False
         if getattr(args, "no_display", False):
             config.setdefault("display", {})["show_progress"] = False
+        # Stage G2: must be applied AFTER _sync_global_config(). recon()
+        # exports through the module-global CFG, and _sync_global_config
+        # shares the nested "reports" dict by reference, so mutating it here
+        # is what makes the flag reach export_json() for single targets.
+        if getattr(args, "deterministic", False):
+            config.setdefault("reports", {})["deterministic"] = True
     except Exception:
         pass
 
@@ -19598,6 +25129,17 @@ def main() -> int:
     except Exception as e:
         log.debug(f"cache init: {e}")
 
+    # ---- Stage H4/H5 modes (cache warming, prefetch, benchmark) ----
+    # After cache init (warm-cache writes the cache) and before the
+    # normal scan flow. Each mode exits with its own code.
+    if getattr(args, "warm_cache", False):
+        return run_warm_cache(config)
+    if getattr(args, "prefetch", None):
+        return run_prefetch(getattr(args, "prefetch", []), config, args)
+    if getattr(args, "benchmark", None):
+        return run_benchmark(getattr(args, "benchmark"), config, args,
+                             getattr(args, "iterations", 10))
+
     # Apply global CLI overrides
     try:
         if getattr(args, "verbose", False):
@@ -19652,20 +25194,21 @@ def main() -> int:
                          indent=2, default=str))
         return 0
     if getattr(args, "metrics", False):
-        print(json.dumps({"jobs": len(JOBS),
-                          "cache": CACHE.stats() if CACHE else {},
-                          "providers_health": len(_health)}, indent=2))
-        return 0
-    if getattr(args, "api", False):
-        httpd = start_api(args.api_host, args.api_port)
-        print(f"{C.OK}API running on "
-              f"http://{httpd.server_address[0]}:{httpd.server_address[1]}{C.RST}")
-        print("Ctrl+C to stop.")
+        # Phase K4: Prometheus exposition text (scrape-ready).
         try:
-            while True: time.sleep(1)
-        except KeyboardInterrupt:
-            httpd.shutdown()
+            print(render_prometheus(), end="")
+        except Exception as e:
+            print(f"metrics failed: {e}", file=sys.stderr)
+            return 2
         return 0
+    # Phase K1: server mode. --server is the documented entry point;
+    # --api is preserved as a legacy alias with identical behavior.
+    if getattr(args, "server", False) or getattr(args, "api", False):
+        try:
+            return run_server_mode(args, config)
+        except Exception as e:
+            logging.error(f"server failed: {e}")
+            return 1
 
     # Load targets (positional + file, dedup + validate)
     try:
@@ -19694,6 +25237,38 @@ def main() -> int:
             run_single(t, getattr(args, "output", "text"), getattr(args, "report", None), getattr(args, "report_file", None))
         return 0
 
+    # Stage J5: compare-with and watch modes (before single/batch split).
+    # Both reuse the normal pipeline; reports are still written.
+    if getattr(args, "compare_with", None):
+        try:
+            return run_compare_with(targets, str(getattr(args, "compare_with")),
+                                    config, args)
+        except Exception as e:
+            logging.error(f"compare-with failed: {e}")
+            return 2
+    # Phase K3: cron schedule mode (mutually exclusive with --watch).
+    if getattr(args, "schedule", None) and \
+            getattr(args, "watch", None) is not None:
+        print("Error: --schedule and --watch are mutually exclusive.",
+              file=sys.stderr)
+        return 2
+    if getattr(args, "watch", None) is not None:
+        try:
+            return run_watch_mode(targets, getattr(args, "watch"),
+                                  config, args)
+        except Exception as e:
+            logging.error(f"watch failed: {e}")
+            return 2
+    if getattr(args, "schedule", None):
+        try:
+            return run_schedule_mode(targets, str(getattr(args, "schedule")),
+                                     config, args)
+        except Exception as e:
+            logging.error(f"schedule failed: {e}")
+            return 2
+
+    # Determine mode
+
     # Determine mode
     try:
         batch_cfg = config.get("batch", {}) if isinstance(config, dict) else {}
@@ -19704,6 +25279,15 @@ def main() -> int:
     batch_enabled = batch_cfg.get("enabled", True)
 
     if len(targets) == 1 and not getattr(args, "batch", False):
+        # Phase K2: fail fast on a bad --filter (before burning a scan).
+        _single_fparsed = None
+        if getattr(args, "filter", None):
+            try:
+                _single_fparsed = parse_result_filter(
+                    str(getattr(args, "filter")))
+            except ValueError as _fe0:
+                print(f"Error: {_fe0}", file=sys.stderr)
+                return 2
         # Single-target mode (v42 behavior preserved via _process_single_target)
         _scan_start = time.time()
         with _progress_context(config, total_stages=13,
@@ -19725,6 +25309,33 @@ def main() -> int:
             except Exception:
                 pass
             return 2
+        # Phase K2: single-target scope (filter / report-only-alerts).
+        # The pipeline already wrote its files (the raw record); scoping
+        # decides what is displayed/reported from this invocation.
+        # (_single_fparsed was validated before the scan.)
+        try:
+            _fexpr = getattr(args, "filter", None)
+            if _fexpr:
+                _fparsed = _single_fparsed
+                if _fparsed is None:
+                    try:
+                        _fparsed = parse_result_filter(str(_fexpr))
+                    except ValueError as _fe:
+                        print(f"Error: {_fe}", file=sys.stderr)
+                        return 2
+                if not result_matches_filter(result, _fparsed):
+                    print(f"Target {targets[0]} scanned OK but is out of scope "
+                          f"for --filter {_fexpr!r} (pipeline files retained).")
+                    return 0
+            if getattr(args, "report_only_alerts", False):
+                if not _post_scan_alerts_for(targets[0], result, config):
+                    print(f"Target {targets[0]} scanned OK with no change alerts "
+                          f"(--report-only-alerts; pipeline files retained).")
+                    return 0
+        except SystemExit:
+            raise
+        except Exception as _e:
+            logging.debug(f"filter scope: {_e}")
         # Legacy display flags
         try:
             if getattr(args, "report", None):
@@ -19779,6 +25390,11 @@ def main() -> int:
                             print(render_text(result))
         except Exception as e:
             logging.error(f"Display failed: {e}")
+        # Stage J5: post-scan alerts on normal single-target runs.
+        try:
+            maybe_emit_post_scan_alerts(targets[0], result, config, args)
+        except Exception:
+            pass
         # Legacy --export print
         try:
             if getattr(args, "export", None) == "stix":
@@ -19794,15 +25410,23 @@ def main() -> int:
         return 3
 
     # Batch mode
+    # Phase K2: fail fast on a bad --filter (before burning N scans).
+    _batch_fparsed = None
+    if getattr(args, "filter", None):
+        try:
+            _batch_fparsed = parse_result_filter(str(getattr(args, "filter")))
+        except ValueError as _fe0b:
+            print(f"Error: {_fe0b}", file=sys.stderr)
+            return 2
     workers = getattr(args, "workers", None) or batch_cfg.get("max_workers", 4)
     try:
         workers = int(workers)
     except Exception:
         workers = 4
     try:
-        hard = int(batch_cfg.get("max_workers_hard_limit", 16))
+        hard = int(batch_cfg.get("max_workers_hard_limit", 32))
     except Exception:
-        hard = 16
+        hard = 32
     # Legacy --parallel maps to default batch workers when --workers unset
     if getattr(args, "parallel", False) and getattr(args, "workers", None) is None:
         workers = int(batch_cfg.get("max_workers", 4))
@@ -19824,6 +25448,41 @@ def main() -> int:
             pass
         batch_result = batch_process(targets, config, args, workers=workers,
                                      progress=_bprogress)
+
+    # Phase K2: scope the batch view (filter / report-only-alerts).
+    # Failures always stay visible; the exit code below still reflects
+    # the UNSCOPED scan health so failures can never be filtered away.
+    try:
+        unfiltered_failed = int((batch_result.get("stats", {}) or {}).get(
+            "failed", 0))
+    except Exception:
+        unfiltered_failed = 0
+    if getattr(args, "filter", None) or getattr(args, "report_only_alerts", False):
+        # (_batch_fparsed was validated before the scans; re-parse here
+        # only as a fallback that cannot fail.)
+        _fparsed2 = _batch_fparsed
+        if _fparsed2 is None and getattr(args, "filter", None):
+            try:
+                _fparsed2 = parse_result_filter(str(getattr(args, "filter")))
+            except ValueError as _fe2:
+                print(f"Error: {_fe2}", file=sys.stderr)
+                return 2
+        _only_alerts = bool(getattr(args, "report_only_alerts", False))
+        try:
+            batch_result, _excluded = scope_batch_results(
+                batch_result, config, _fparsed2, _only_alerts)
+        except Exception as _e2:
+            logging.debug(f"filter scope: {_e2}")
+            _excluded = []
+        if _excluded and not getattr(args, "quiet", False):
+            try:
+                print(f"[filter] {len(_excluded)} target(s) out of scope "
+                      f"(pipeline files retained): "
+                      + ", ".join(sorted(
+                          f"{e.get('target')} ({e.get('reason')})"
+                          for e in _excluded))[:400])
+            except Exception:
+                pass
 
     # Cross-target correlation
     batch_corr = {"enabled": False}
@@ -19864,6 +25523,20 @@ def main() -> int:
     except Exception as e:
         logging.exception(f"summary failed: {e}")
         summary = {"error": str(e)}
+    # Phase K2: record the reporting scope in the summary.
+    try:
+        if isinstance(summary, dict) and (
+                getattr(args, "filter", None)
+                or getattr(args, "report_only_alerts", False)):
+            summary["scope"] = {
+                "filter": getattr(args, "filter", None),
+                "report_only_alerts": bool(
+                    getattr(args, "report_only_alerts", False)),
+                "shown": len((batch_result.get("results", {}) or {})),
+                "scanned": len(targets),
+            }
+    except Exception:
+        pass
     try:
         summary_path = export_batch_summary(summary, config)
     except Exception as e:
@@ -19882,8 +25555,36 @@ def main() -> int:
         except Exception:
             pass
 
+    # Stage J5: post-scan alerts for batch targets with channels set.
     try:
-        return 0 if batch_result["stats"]["failed"] == 0 else 2
+        if getattr(args, "alert_file", None) or getattr(args, "alert_webhook", None) \
+                or getattr(args, "notify_webhook", None) \
+                or getattr(args, "alert_email", None):
+            for _t, _rep in (batch_result.get("results", {}) or {}).items():
+                try:
+                    if isinstance(_rep, dict) and _rep.get("status") != "FAILED":
+                        maybe_emit_post_scan_alerts(_t, _rep, config, args)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # Stage J3: cross-target infrastructure graph. The flag explicitly
+    # requests the document, so it prints even in quiet mode.
+    if getattr(args, "correlate_graph", False):
+        try:
+            graph_doc = build_correlation_graph(batch_result, config)
+            print(json.dumps(graph_doc, indent=2, default=str))
+        except Exception as e:
+            logging.error(f"correlation graph failed: {e}")
+
+    try:
+        # Phase K2: unfiltered health — failures count even when scoped out.
+        try:
+            _failed = unfiltered_failed
+        except NameError:
+            _failed = int((batch_result.get("stats", {}) or {}).get("failed", 0))
+        return 0 if _failed == 0 else 2
     except Exception:
         return 0
 
